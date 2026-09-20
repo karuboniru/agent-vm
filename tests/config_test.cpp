@@ -144,7 +144,11 @@ int main() {
         reject({"--no-config", "--mount", "src=" + home + ",dst=/run"}, "runtime path protected");
         reject({"--no-config", "--mount", "src=" + home + ",dst=relative"}, "relative target refused");
         reject({"--no-config", "--mount", "src=" + home + ",dst=" + cwd}, "explicit duplicate default target refused");
-        reject({"--no-config", "--mount", "src=" + home + ",dst=/data", "--mount", "src=" + home + ",dst=/data/new"}, "nested target cannot create host path");
+        parse({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--mount", "src=" + home + ",dst=/data/new,ro"});
+        parse({"--no-config", "--mount", "src=" + home + "/file,dst=/data/new/deep/file,ro", "--mount", "src=" + home + ",dst=/data,rw"});
+        parse({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--tmpfs", "target=/data/new/cache"});
+        reject({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--mount", "src=" + home + ",dst=/data/link/new"}, "creation cannot traverse symlinks");
+        reject({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--mount", "src=" + home + ",dst=/data/file/new"}, "creation cannot traverse files");
         check(!fs::exists(root / "home/new"), "validation never creates a host mount point");
         parse({"--no-config", "--mount", "src=" + home + ",dst=/data", "--mount", "src=" + home + ",dst=/data/existing"});
         check(true, "existing nested target accepted");

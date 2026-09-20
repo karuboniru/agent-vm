@@ -371,7 +371,7 @@ void check_target(const std::string& target, const char* kind, bool bind = false
             fail(std::string(kind) + " target overlaps a reserved guest path: " + target);
     }
 }
-void check_existing_target(const MountSpec& parent, const std::string& target, bool want_directory) {
+void check_existing_target(const MountSpec& parent, const std::string& target, bool want_directory, bool allow_create = false) {
     fs::path relative = fs::path(target).lexically_relative(parent.target);
     fs::path physical(parent.source);
     for (const auto& component : relative) {
@@ -379,6 +379,9 @@ void check_existing_target(const MountSpec& parent, const std::string& target, b
         physical /= component;
         std::error_code error;
         auto status = fs::symlink_status(physical, error);
+        if (allow_create && !parent.read_only &&
+            (error == std::errc::no_such_file_or_directory || (!error && status.type() == fs::file_type::not_found)))
+            return; // Launch creates missing mountpoints; validation stays read-only.
         if (error || status.type() == fs::file_type::not_found)
             fail("nested mount/mask target does not exist in shared source; refusing to create host path: " + physical.string());
         if (fs::is_symlink(status)) fail("nested mount/mask target traverses a source symlink: " + physical.string());
@@ -648,7 +651,7 @@ void validate_spec(const RunSpec& spec) {
         if (auto parent = nearest_mount(spec, mount.target, false)) {
             auto tmpfs = nearest_tmpfs(spec, mount.target, false);
             if (!tmpfs || tmpfs->target.size() < parent->target.size())
-                check_existing_target(*parent, mount.target, fs::is_directory(status));
+                check_existing_target(*parent, mount.target, fs::is_directory(status), true);
         }
     }
     if (spec.tmpfs.size() > 65536) fail("too many tmpfs mounts");
@@ -668,7 +671,7 @@ void validate_spec(const RunSpec& spec) {
         if (auto mount = nearest_mount(spec, tmpfs.target, true)) {
             auto parent = nearest_tmpfs(spec, tmpfs.target, false);
             if (!parent || parent->target.size() < mount->target.size())
-                check_existing_target(*mount, tmpfs.target, true);
+                check_existing_target(*mount, tmpfs.target, true, true);
         }
         for (const auto& mask : spec.mask_targets)
             if (paths_overlap(tmpfs.target, mask)) fail("tmpfs target overlaps a masked target: " + tmpfs.target);

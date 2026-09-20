@@ -73,7 +73,7 @@ host 不再提供承载 guest 临时文件的 tmpfs。它生成最多 1 MiB 的�
 - `/dev/root`：最小启动根，包含 helper、描述文件、只读 `/usr`、生成的 `/etc` 和 guest 内核挂载所需的空目录。
 - `/.agent-vm/exports`：只包含已 confinement 的文件/目录对象。条目用 `/N/root` 或 `/N/file` 引用对象，完整目标路径放在描述中。
 
-tag 可以用路径形式，但每个目标一个设备会耗尽 libkrun 1.19 的 IRQ。固定两个设备配合对象路径避免这个限制，也避免长目标路径超过 tag 长度上限。guest helper 在独立 mount namespace 内创建本地 tmpfs 根和内建临时目录，再将用户 bind 与自定义 tmpfs 合并按先祖先、后后代的顺序安装；不在宿主共享目录里创建挂载点。它保留 libkrun init 已挂载的 guest proc/sys/dev，卸载对象目录的 staging 挂载，随后 `pivot_root` 并断开 bootstrap。PID 1 保留启动 namespace，DHCP resolver 文件在两个视图中引用同一份受限私有文件。
+tag 可以用路径形式，但每个目标一个设备会耗尽 libkrun 1.19 的 IRQ。固定两个设备配合对象路径避免这个限制，也避免长目标路径超过 tag 长度上限。guest helper 在独立 mount namespace 内创建本地 tmpfs 根和内建临时目录，再将用户 bind 与自定义 tmpfs 合并按先祖先、后后代的顺序安装；允许在可写宿主共享目录里创建缺失的挂载点。它保留 libkrun init 已挂载的 guest proc/sys/dev，卸载对象目录的 staging 挂载，随后 `pivot_root` 并断开 bootstrap。PID 1 保留启动 namespace，DHCP resolver 文件在两个视图中引用同一份受限私有文件。
 
 guest 最终视图如下：
 
@@ -110,7 +110,7 @@ VMM 需要 `/dev/kvm`，libkrun 1.19 的内建文件后端需要 `/proc/self/fd`
 
 配置和命令行先合并成 MountPlan，再执行；mask 是最终 deny 规则，CLI 新增挂载不能隐式取消 mask。
 
-父子挂载的模式独立：允许 ro 父挂载下配置 rw 子挂载，也允许 rw 父挂载下配置 ro 子挂载。父挂载的 ro 属性递归约束其树，但单独声明的子挂载按各自模式生效。用户 bind 与自定义 tmpfs 可以交替嵌套，统一按先祖先、后后代的顺序安装，与配置或命令行中的声明顺序无关。最近父层为共享挂载时，嵌套目标必须已存在于该父层对应的源树中，文件/目录类型与子挂载源匹配，且路径各级不得经过 symlink；最近父层为 tmpfs 时，可在私有树内创建子挂载点。不在宿主共享目录内创建挂载点。因此只读共享 home 可以保留默认可写 CWD。
+父子挂载的模式独立：允许 ro 父挂载下配置 rw 子挂载，也允许 rw 父挂载下配置 ro 子挂载。父挂载的 ro 属性递归约束其树，但单独声明的子挂载按各自模式生效。用户 bind 与自定义 tmpfs 可以交替嵌套，统一按先祖先、后后代的顺序安装，与配置或命令行中的声明顺序无关。最近父层为共享挂载时，嵌套目标的文件/目录类型须与子挂载源匹配，且路径各级不得经过 symlink；可写父层允许启动时创建缺失的挂载点，只读父层要求目标已存在；最近父层为 tmpfs 时，可在私有树内创建子挂载点。可写共享中创建的挂载点在退出后保留；配置校验与 plan 不创建路径。因此只读共享 home 可以保留默认可写 CWD。
 
 自定义 tmpfs 可以覆盖共享源中已有且路径各级均无 symlink 的目录，包括 ro 共享目录。host 为 tmpfs 建立私有 staging 树，在其中创建子挂载占位文件或目录并安装显式子挂载，导出前将 staging 骨架锁为只读，保留显式 rw bind 子挂载的写权限。被覆盖的原宿主子树不会通过底层导出暴露，也不修改宿主源目录或 ownership。guest 先装配内建 tmpfs，再按祖先优先顺序混合安装用户 bind 和自定义 tmpfs。tmpfs 自身写入只占 guest RAM，退出后丢弃；其中显式 rw bind 子挂载仍写入对应宿主源。
 
@@ -132,7 +132,7 @@ tmpfs target 重复或与 bind target 相同时拒绝，等于或包含内建 `/
 3. 安装普通挂载，对每个来源映射计算 mask 的相对位置，再用只读空目录或空文件覆盖。
 4. 检查所有重叠挂载与别名，锁定 mount tree，最后关闭未遮蔽源路径的 FD。
 
-不得为创建 mountpoint 或 mask 占位文件而修改用户的宿主目录。已有路径可直接覆盖；不存在的 mask 是一条持续策略：只要共享源仍可能被宿主修改，就需提供隔离的 overlay/投影视图预留遮挡，或明确拒绝该组合，不能当作成功的 no-op。ro bind 也受此约束，因为它不阻止宿主在真实源目录新建 `.ssh`；只有不共享其祖先、真正不可变快照等可证明条件才能例外。
+仅允许在可写共享目录中创建缺失的 mountpoint；不得为 mask 创建宿主占位文件。已有路径可直接覆盖；不存在的 mask 是一条持续策略：只要共享源仍可能被宿主修改，就需提供隔离的 overlay/投影视图预留遮挡，或明确拒绝该组合，不能当作成功的 no-op。ro bind 也受此约束，因为它不阻止宿主在真实源目录新建 `.ssh`；只有不共享其祖先、真正不可变快照等可证明条件才能例外。
 
 路径 mask 保护可达路径，不是数据溯源或内容防泄漏。已经位于其他共享路径的硬链接、复制内容，以及运行前已泄漏的 FD，不会因为遮住 `.ssh` 自动消失。源文件系统的其他挂载别名也要进入规划检测；无法确认的冲突应拒绝，而非声称绝对隐藏。
 
@@ -333,7 +333,7 @@ GUEST_PROBE_PASS
 
 - 已实现 CLI/TOML/plan/doctor、namespace/FHS/UID、挂载与 mask、passt、TCP/UDP 发布、Unix stream socket relay 与 SSH agent 别名、guest 降权、信号/退出码/终端管理。
 - VMM 先以精简环境重新 exec，再进入 namespace，避免宿主原始环境及配置解析内存残留在 VMM 地址空间中。启动前关闭非白名单 FD、清空 capability sets，并安装 seccomp denylist。
-- 同一源目录的多个声明挂载均安装 mask；mountinfo 校验拒绝未覆盖的 bind 别名、`/usr` 的可写别名、runtime 的别名暴露。父子挂载模式独立，允许 ro 父挂载下的 rw 子挂载，以及 bind/tmpfs 交替嵌套；最近父层为共享挂载时，嵌套目标必须已存在于该源树中，类型匹配且无 symlink；最近父层为 tmpfs 时，在私有树中准备挂载点。缺失的 mask 和需要在宿主创建嵌套挂载点的请求不支持，启动失败，不悄悄放行。
+- 同一源目录的多个声明挂载均安装 mask；mountinfo 校验拒绝未覆盖的 bind 别名、`/usr` 的可写别名、runtime 的别名暴露。父子挂载模式独立，允许 ro 父挂载下的 rw 子挂载，以及 bind/tmpfs 交替嵌套；最近父层为共享挂载时，嵌套目标须类型匹配且无 symlink，可写父层允许创建缺失目标，只读父层要求目标已存在；最近父层为 tmpfs 时，在私有树中准备挂载点。缺失的 mask 和需要在只读共享中创建嵌套挂载点的请求不支持，启动失败，不悄悄放行。
 - 固定 control vsock 始终启用，TSI 显式关闭；network none 不运行 passt。内核可能自带无路由的 dummy0，验收关注无外部 NIC/路由/TSI，以及 guest 本地 loopback 可用。
 - libkrun 1.19 Unix backend 在 HUP 与 IN 同时发生时可能丢失尾部数据。因此 socket 内部通道使用 DATA/EOF/ACK，控制通道也等待 ACK 后才关闭；对外保留正常字节流和半关闭语义。
 - `tests/config_test.cpp` 覆盖解析和策略；`tests/network_test.cpp` 覆盖并发/背压/半关闭/非法帧/清理；`tests/sandbox_test.cpp --integration` 验证切根、FD 清理、权限、mask 和真实 bind 别名负测；两份 Python integration 脚本通过真实 VM 验证核心功能与网络/SSH。

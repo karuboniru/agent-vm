@@ -148,11 +148,15 @@ static void nested_mount_modes_test() {
     require(!fs::exists(fixture.source / "denied") && !fs::exists(grandchild / "denied"), "read-only source changed");
     require(fs::is_empty(fixture.root), "nested mounts leaked to supervisor");
 
-    for (bool parent_ro : {false, true}) {
+    for (bool parent_ro : {true, false}) {
         s.mounts = {{fixture.source.string(), "/work", parent_ro},
                     {child.string(), "/work/absent", !parent_ro}};
-        require(child_status([&] { fixture.enter(s); }) != 0, "missing mixed-mode nested target was accepted");
-        require(!fs::exists(fixture.source / "absent"), "missing mixed-mode mountpoint created on host");
+        const int status = child_status([&] {
+            fixture.enter(s);
+            require(read_file("/work/absent/created") == "child", "new target did not mount child");
+        });
+        require(parent_ro ? status != 0 : status == 0, "missing target did not respect parent mode");
+        require(fs::exists(fixture.source / "absent") == !parent_ro, "mountpoint creation did not respect parent mode");
     }
     std::cout << "nested mount modes passed\n";
 }
@@ -283,11 +287,11 @@ static void integration_test() {
         }
     }) == 0, "target mask above an exported child failed");
 
-    // A missing nested mountpoint must fail without creating a host directory.
+    // Writable shared parents create missing mountpoints during launch.
     s = fixture.run_spec();
     s.mounts.push_back({(fixture.source / "nested").string(), "/work/absent", false});
-    require(child_status([&] { fixture.enter(s); }) != 0, "missing nested target was accepted");
-    require(!fs::exists(fixture.source / "absent"), "nested target created on host");
+    require(child_status([&] { fixture.enter(s); }) == 0, "missing writable nested target was rejected");
+    require(fs::is_directory(fixture.source / "absent"), "nested target not created on host");
     s = fixture.run_spec();
     s.mask_sources = {(fixture.source / "future-secret").string()};
     require(child_status([&] { fixture.enter(s); }) != 0, "nonexistent shared mask was accepted");

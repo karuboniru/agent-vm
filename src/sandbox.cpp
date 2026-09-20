@@ -106,8 +106,8 @@ void proc_write(const char* path, const std::string& value) {
     if (fd.fd < 0) fail(path);
     write_all(fd.fd, value.data(), value.size());
 }
-// Only called before any untrusted/shared trees are installed. openat2 is still
-// used at every step so even internal path collisions fail rather than follow.
+// Resolve every component without symlinks, including when creating mountpoints
+// inside an explicitly writable shared tree.
 void make_dirs(int root, const std::string& path, mode_t final_mode = 0755) {
     check_absolute(path);
     std::string accumulated;
@@ -584,7 +584,8 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
 
     bind_fd(root.fd, usr.fd, "/usr", true, true);
     // Private tmpfs staging provides mountpoints for explicit bind children.
-    // Never create a placeholder when the effective parent is a host share.
+    // Writable shares also permit missing mountpoints; read-only shares require
+    // existing targets. The kernel enforces the backing filesystem permissions.
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto& layer = layers[i];
         const Layer* parent = nullptr;
@@ -592,9 +593,9 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
             if (within(layer.target, layers[j].target)) parent = &layers[j];
         if (!parent) {
             placeholder(root.fd, layer.target, layer.tmpfs || layer.bind->directory);
-        } else if (parent->tmpfs) {
-            Fd private_parent = target_fd(root.fd, parent->target);
-            placeholder(private_parent.fd, layer.target.substr(parent->target.size()),
+        } else if (parent->tmpfs || !parent->bind->spec.read_only) {
+            Fd writable_parent = target_fd(root.fd, parent->target);
+            placeholder(writable_parent.fd, layer.target.substr(parent->target.size()),
                         layer.tmpfs || layer.bind->directory);
         }
         if (layer.bind) {

@@ -399,6 +399,21 @@ print('nested-modes-ok')
           (writable / "output").read_text() == "leaf" and not (home / "denied").exists() and
           not (locked / "denied").exists(), "nested ro/rw mounts preserve each explicit mode in guest and host")
 
+    child_source = base / "new-child"
+    child_source.mkdir()
+    (child_source / "payload").write_text("mounted")
+    out, _ = run(["python3", "-c", """import pathlib
+assert pathlib.Path('/created/deep/child/payload').read_text() == 'mounted'
+assert pathlib.Path('/created/deep/file').read_text() == 'mounted'
+pathlib.Path('/created/cache/output').write_text('temporary')
+"""], ["--mount", f"src={child_source},dst=/created/deep/child,ro",
+        "--mount", f"src={child_source}/payload,dst=/created/deep/file,ro",
+        "--tmpfs", "target=/created/cache",
+        "--mount", f"src={work},dst=/created,rw"])
+    check((work / "deep/child").is_dir() and (work / "deep/file").is_file() and
+          (work / "cache").is_dir() and not (work / "cache/output").exists(),
+          "writable parents create directory, file and tmpfs mountpoints before guest mounts")
+
     out, _ = run(["python3", "-c", """import pathlib,socket,json
 s=socket.socket();s.bind(('127.0.0.1',0));s.listen()
 c=socket.socket();c.settimeout(2);c.connect(s.getsockname());a,_=s.accept();c.sendall(b'local')
