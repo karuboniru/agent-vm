@@ -134,7 +134,16 @@ void create_file(int root, const std::string& path, const std::string& data, mod
 }
 void placeholder(int root, const std::string& path, bool directory) {
     if (directory) { make_dirs(root, path); return; }
-    create_file(root, path, "");
+    const auto p = std::filesystem::path(path);
+    make_dirs(root, p.parent_path().string());
+    Fd parent = target_fd(root, p.parent_path().string());
+    Fd fd(openat(parent.fd, p.filename().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644));
+    if (fd.fd < 0 && errno != EEXIST) fail("create mount placeholder " + path);
+    // Explicit binds may cover generated /etc files. Never truncate an existing
+    // target or follow a symlink, and require a matching regular-file target.
+    Fd target = target_fd(root, path);
+    if (!S_ISREG(info(target.fd).st_mode))
+        throw std::runtime_error("file target is not a regular file: " + path);
 }
 void attributes(int root, const std::string& path, uint64_t attrs, bool recursive) {
     Fd fd = target_fd(root, path);
@@ -344,7 +353,9 @@ void reject_mount_alias_conflicts(const RunSpec& spec, const std::vector<std::st
             if (overlaps(usr, mask))
                 throw std::runtime_error("source mask overlaps an implicit /usr filesystem alias");
 }
-bool forbidden_target(const std::string& path) {
+bool forbidden_target(const std::string& path, bool bind = false) {
+    if (bind && path != "/etc" && within(path, "/etc") &&
+        !within(path, "/etc/resolv.conf")) return false;
     for (const char* protected_path : {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
                                        "/bin", "/sbin", "/lib", "/lib64", "/run", "/ipc"})
         if (within(path, protected_path) || within(protected_path, path)) return true;
@@ -388,7 +399,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     for (const auto& m : spec.mounts) {
         check_absolute(m.source);
         check_absolute(m.target);
-        if (forbidden_target(m.target)) throw std::runtime_error("mount overlaps protected target: " + m.target);
+        if (forbidden_target(m.target, true)) throw std::runtime_error("mount overlaps protected target: " + m.target);
         if (!m.read_only && (within(m.source, "/usr") || within("/usr", m.source)))
             throw std::runtime_error("host /usr must remain read-only through every mount alias");
         if (within(root_dir, m.source) || within(ipc_dir, m.source) || within(spec_file, m.source))

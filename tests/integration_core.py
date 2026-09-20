@@ -338,6 +338,46 @@ print('private-masks-ok')
     out, _ = run(["python3", "-c", "import os,json\nr=[]\nfor p in ['/new-root-file','/etc/new-file','/usr/new-file']:\n try: open(p,'w');r.append(0)\n except OSError as e:r.append(e.errno)\nprint(json.dumps(r))"])
     check(all(e in (errno.EROFS, errno.EACCES) for e in json.loads(out)), "root, /etc and /usr reject writes")
 
+    etc_source = base / "etc-source"
+    etc_source.mkdir()
+    (etc_source / "machine-id").write_text("0123456789abcdef0123456789abcdef\n")
+    (etc_source / "hostname").write_text("custom-hostname\n")
+    (etc_source / "writable").write_text("before")
+    etc_config = base / "etc.toml"
+    etc_config.write_text(f"""[[mounts]]
+source = "{etc_source / 'machine-id'}"
+target = "/etc/machine-id"
+mode = "ro"
+[[mounts]]
+source = "{etc_source / 'hostname'}"
+target = "/etc/hostname"
+mode = "ro"
+[[mounts]]
+source = "{etc_source / 'writable'}"
+target = "/etc/custom/writable"
+mode = "rw"
+[[mounts]]
+source = "{etc_source}"
+target = "/etc/custom"
+mode = "ro"
+""")
+    out, _ = run(["python3", "-c", """
+from pathlib import Path
+import errno
+assert Path('/etc/machine-id').read_text() == '0123456789abcdef0123456789abcdef\\n'
+assert Path('/etc/hostname').read_text() == 'custom-hostname\\n'
+assert Path('/etc/custom/machine-id').read_text() == Path('/etc/machine-id').read_text()
+for p in ['/etc/machine-id', '/etc/hostname', '/etc/custom/machine-id']:
+    try: open(p, 'w')
+    except OSError as e: assert e.errno in (errno.EROFS, errno.EACCES), e
+    else: raise AssertionError(p + ' is writable')
+Path('/etc/custom/writable').write_text('after')
+assert Path('/etc/resolv.conf').exists()
+print('etc-binds-ok')
+"""], config=etc_config)
+    check(out.strip() == "etc-binds-ok" and (etc_source / "writable").read_text() == "after",
+          "TOML etc binds support new files, generated-file overrides, directories and nested ro/rw modes")
+
     # Default rw CWD can be an exception within a ro home, with further
     # explicit ro/rw exceptions below it. Supply mounts in reverse depth order.
     locked = work / "locked"

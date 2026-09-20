@@ -361,10 +361,12 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
 }
 const std::vector<std::string> reserved = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
                                          "/bin", "/sbin", "/lib", "/lib64", "/run", "/ipc"};
-void check_target(const std::string& target, const char* kind) {
+void check_target(const std::string& target, const char* kind, bool bind = false) {
     if (target.empty() || target[0] != '/' || normalize(target) != target)
         fail(std::string(kind) + " target must be a normalized absolute path: " + target);
     for (const auto& path : reserved) {
+        if (bind && path == "/etc" && target != path && path_within(target, path) &&
+            !path_within(target, "/etc/resolv.conf")) continue;
         if (path_within(target, path) || path_within(path, target))
             fail(std::string(kind) + " target overlaps a reserved guest path: " + target);
     }
@@ -631,7 +633,7 @@ void validate_spec(const RunSpec& spec) {
         fail("workdir overlaps a private runtime path: " + spec.cwd);
     std::set<std::string> targets;
     for (const auto& mount : spec.mounts) {
-        check_target(mount.target, "mount");
+        check_target(mount.target, "mount", true);
         if (!targets.insert(mount.target).second) fail("duplicate mount target: " + mount.target + "; remove one mount or disable the default CWD/home mount");
         if (mount.source.empty() || mount.source[0] != '/' || normalize(mount.source) != mount.source)
             fail("mount source must be a normalized absolute path: " + mount.source);

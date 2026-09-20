@@ -130,6 +130,13 @@ int main() {
         parse({"--no-config", "--mask-target", "/private/missing"});
         check(true, "private target mask can be created in generated root");
 
+        for (const auto& mode : {"ro", "rw"}) {
+            auto etc = parse({"--no-config", "--cwd-mode", "none", "--mount",
+                              "src=" + home + ",dst=/etc/custom," + mode});
+            check(etc.spec.mounts.size() == 1, "explicit /etc subtree bind accepted");
+        }
+        for (const auto& target : {"/etc", "/etc/resolv.conf", "/etc/resolv.conf/child"})
+            reject({"--no-config", "--mount", "src=" + home + ",dst=" + target}, "generated etc root and DHCP resolver protected");
         reject({"--no-config", "--mount", "src=/usr,dst=/system,rw"}, "writable alias of /usr refused");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/usr/local"}, "reserved system subtree protected");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/"}, "reserved system ancestors protected");
@@ -467,6 +474,11 @@ int main() {
         fs::create_symlink(root / "missing.toml", config);
         reject({}, "dangling default config symlink does not drop policy silently");
         fs::remove(config);
+        write(root / "machine-id", "fixture-machine-id");
+        write(root / "relative.toml", "[[mounts]]\nsource = 'machine-id'\ntarget = '/etc/machine-id'\nmode = 'ro'\n");
+        options = parse({"--config", (root / "relative.toml").string()});
+        check(options.spec.mounts[0].target == "/etc/machine-id" && options.spec.mounts[0].read_only,
+              "TOML accepts read-only machine-id bind");
         write(root / "relative.toml", "[[mounts]]\nsource = 'data'\ntarget = '/dataset'\n");
         options = parse({"--config", (root / "relative.toml").string()});
         check(options.spec.mounts[0].source == (root / "data").string(), "config-relative source uses config directory");
