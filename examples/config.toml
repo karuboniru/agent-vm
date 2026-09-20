@@ -3,7 +3,8 @@ version = 1
 [vm]
 cpus = 2
 memory_mib = 2048
-# Per guest-native tmpfs capacity limit; actual use consumes VM RAM.
+# Per guest-native tmpfs capacity limit, including [[tmpfs]] below.
+# Actual use consumes VM RAM; this is not an aggregate limit or reservation.
 tmp_mib = 256
 
 [filesystem]
@@ -20,6 +21,40 @@ home = "ephemeral"
 # target = "/data"
 # mode = "ro"
 
+# Empty guest-native storage; writes disappear when the VM exits.
+# CLI --tmpfs entries append to this list. Each uses vm.tmp_mib above.
+# UID/GID default to the invoking user's numeric IDs; mode defaults to 0700.
+# Explicit guest IDs do not change host ownership or the workload identity.
+# Root ownership with mode 0700 denies access to a non-root workload.
+[[tmpfs]]
+target = "/cache"
+# uid = 1000
+# gid = 1000
+# mode = 0o750
+
+# Optional temporary GnuPG home with an existing public keyring exposed read-only.
+# Enable both entries together; do not also mask this source or guest subtree.
+# UID/GID default to the invoking user's IDs; the explicit values are optional.
+# [[tmpfs]]
+# target = "~/.gnupg"
+# uid = 1000
+# gid = 1000
+#
+# [[mounts]]
+# source = "~/.gnupg/pubring.kbx"
+# target = "~/.gnupg/pubring.kbx"
+# mode = "ro"
+
+# Forward an existing filesystem Unix stream socket. Relative sources use this
+# file's directory; ~ expands to the invoking user's home, as for mounts.
+# CLI --socket entries append to these. Targets must be absolute and writable.
+# Missing parent directories are created as guest root, then assigned to the
+# guest user before the relay drops privileges and creates a mode-0600 socket.
+# Existing parent ownership is unchanged; existing destinations are rejected.
+# [[sockets]]
+# source = "~/service.sock"
+# target = "/run/service/client.sock"
+
 [environment]
 # TERM, LANG and LC_ALL are inherited by default when present.
 # Add only variables that the workload needs. Missing explicit names are errors.
@@ -35,4 +70,7 @@ publish = []
 # publish = ["127.0.0.1:8080:8080/tcp"]
 
 [ssh_agent]
+# Alias: host SSH_AUTH_SOCK -> /run/user/<uid>/ssh-agent.socket, with guest env.
+# --no-ssh-agent disables this alias only, not explicit [[sockets]] entries.
+# When disabled, environment.set may specify SSH_AUTH_SOCK for a custom forward.
 enabled = false

@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -41,8 +42,12 @@ extern char **environ;
 struct run_spec {
     struct avm_spec_header header;
     char *home, *cwd;
-    char **argv, **env;
+    char **argv, **env, **sockets;
 };
+
+static pid_t relay_pids[AVM_SOCKET_MAX];
+static uint32_t relay_count;
+static pid_t relay_owner;
 
 struct cursor {
     const unsigned char *data;
@@ -181,14 +186,15 @@ static struct run_spec read_spec(void)
     memcpy(&spec.header, data, sizeof(spec.header));
     const struct avm_spec_header *header = &spec.header;
     if (header->magic != AVM_SPEC_MAGIC || header->version != AVM_SPEC_VERSION ||
-        header->reserved || (header->flags & ~(AVM_FLAG_NETWORK | AVM_FLAG_SSH)))
+        (header->flags & ~AVM_FLAG_NETWORK))
         invalid_spec("unsupported header");
     if (header->uid == UINT32_MAX || header->gid == UINT32_MAX)
         invalid_spec("invalid user or group ID");
     if (!header->argc || header->argc > 65535 || header->envc > 65535 ||
-        (uint64_t)header->argc + header->envc + 2 >
+        header->socket_count > AVM_SOCKET_MAX ||
+        (uint64_t)header->argc + header->envc + header->socket_count + 2 >
             (size - sizeof(*header)) / sizeof(uint32_t))
-        invalid_spec("invalid argument or environment count");
+        invalid_spec("invalid argument, environment, or socket count");
     struct cursor cursor = {data, size, sizeof(*header)};
     spec.home = read_string(&cursor);
     spec.cwd = read_string(&cursor);
@@ -196,7 +202,8 @@ static struct run_spec read_spec(void)
         invalid_spec("HOME and working directory must be absolute normalized paths");
     spec.argv = calloc((size_t)header->argc + 1, sizeof(char *));
     spec.env = calloc((size_t)header->envc + 1, sizeof(char *));
-    if (!spec.argv || !spec.env)
+    spec.sockets = calloc((size_t)header->socket_count + 1, sizeof(char *));
+    if (!spec.argv || !spec.env || !spec.sockets)
         fail("allocate argument vectors");
     for (uint32_t i = 0; i < header->argc; ++i)
         spec.argv[i] = read_string(&cursor);
@@ -206,6 +213,17 @@ static struct run_spec read_spec(void)
         spec.env[i] = read_string(&cursor);
         if (!environment_key(spec.env[i]))
             invalid_spec("invalid environment key");
+    }
+    for (uint32_t i = 0; i < header->socket_count; ++i) {
+        const char *target = spec.sockets[i] = read_string(&cursor);
+        size_t length = strlen(target);
+        if (!absolute_path(target) || length < 2 ||
+            length >= sizeof(((struct sockaddr_un *)0)->sun_path) ||
+            target[length - 1] == '/' || strstr(target, "//"))
+            invalid_spec("socket target must be an absolute normalized Unix socket path");
+        for (uint32_t j = 0; j < i; ++j)
+            if (!strcmp(target, spec.sockets[j]))
+                invalid_spec("duplicate socket target");
     }
     if (cursor.offset != cursor.size)
         invalid_spec("unexpected trailing data");
@@ -539,30 +557,46 @@ static pid_t start_workload(struct run_spec *spec, int listener, int signal_fd,
     return child;
 }
 
-static void stop_relay(pid_t relay)
+static void stop_relays(void)
 {
-    if (relay <= 0)
+    if (getpid() != relay_owner)
         return;
-    (void)kill(relay, SIGTERM);
+    relay_owner = 0;
+    for (uint32_t i = 0; i < relay_count; ++i)
+        if (relay_pids[i] > 0)
+            (void)kill(relay_pids[i], SIGTERM);
     int64_t deadline = monotonic_ms() + 2000;
     for (;;) {
-        int status;
-        pid_t result = waitpid(relay, &status, WNOHANG);
-        if (result == relay || (result < 0 && errno == ECHILD))
+        bool remaining = false;
+        for (uint32_t i = 0; i < relay_count; ++i) {
+            if (relay_pids[i] <= 0)
+                continue;
+            pid_t result = waitpid(relay_pids[i], NULL, WNOHANG);
+            if (result == relay_pids[i] || (result < 0 && errno == ECHILD))
+                relay_pids[i] = 0;
+            else
+                remaining = true;
+        }
+        if (!remaining)
             return;
-        if (result < 0 && errno != EINTR)
-            break;
         if (monotonic_ms() >= deadline)
             break;
         struct timespec pause = {.tv_nsec = 10000000};
         (void)nanosleep(&pause, NULL);
     }
-    (void)kill(relay, SIGKILL);
-    while (waitpid(relay, NULL, 0) < 0 && errno == EINTR)
-        ;
+    for (uint32_t i = 0; i < relay_count; ++i)
+        if (relay_pids[i] > 0)
+            (void)kill(relay_pids[i], SIGKILL);
+    for (uint32_t i = 0; i < relay_count; ++i) {
+        if (relay_pids[i] <= 0)
+            continue;
+        while (waitpid(relay_pids[i], NULL, 0) < 0 && errno == EINTR)
+            ;
+        relay_pids[i] = 0;
+    }
 }
 
-static int supervise(pid_t workload, pid_t *relay, int listener, int signal_fd)
+static int supervise(pid_t workload, const struct run_spec *spec, int listener, int signal_fd)
 {
     struct control_client clients[CONTROL_CLIENTS];
     for (size_t i = 0; i < CONTROL_CLIENTS; ++i)
@@ -583,13 +617,19 @@ static int supervise(pid_t workload, pid_t *relay, int listener, int signal_fd)
             if (child == workload) {
                 workload_status = status;
                 done = true;
-            } else if (child == *relay) {
-                *relay = -1;
-                if (!done) {
+            } else {
+                for (uint32_t i = 0; i < relay_count; ++i) {
+                    if (child != relay_pids[i])
+                        continue;
+                    relay_pids[i] = 0;
+                    if (!relay_failed)
+                        relay_failure_deadline = monotonic_ms() + 2000;
                     relay_failed = true;
-                    relay_failure_deadline = monotonic_ms() + 2000;
-                    fprintf(stderr, "agent-vm guest: SSH relay exited unexpectedly\n");
-                    forward_signal(workload, SIGTERM);
+                    fprintf(stderr, "agent-vm guest: socket relay for %s exited unexpectedly\n",
+                            spec->sockets[i]);
+                    if (!done)
+                        forward_signal(workload, SIGTERM);
+                    break;
                 }
             }
         }
@@ -656,6 +696,10 @@ int main(void)
     if (spec.header.flags & AVM_FLAG_NETWORK)
         check_network();
     prepare_runtime((uid_t)spec.header.uid, (gid_t)spec.header.gid);
+    for (uint32_t i = 0; i < spec.header.socket_count; ++i)
+        if (avm_relay_prepare(spec.sockets[i], (uid_t)spec.header.uid,
+                              (gid_t)spec.header.gid) < 0)
+            fail(spec.sockets[i]);
     int listener = control_listener();
     sigset_t blocked;
     sigemptyset(&blocked);
@@ -677,13 +721,16 @@ int main(void)
     if (signal_fd < 0)
         fail("create supervisor signal descriptor");
     drop_privileges((uid_t)spec.header.uid, (gid_t)spec.header.gid);
-    pid_t relay = -1;
-    if (spec.header.flags & AVM_FLAG_SSH) {
-        char path[108];
-        snprintf(path, sizeof(path), "/run/user/%u/ssh-agent.sock", spec.header.uid);
-        relay = avm_relay_start(path);
-        if (relay < 0)
-            fail("start guest SSH relay");
+    relay_owner = getpid();
+    if (atexit(stop_relays) != 0) {
+        errno = ENOMEM;
+        fail("register socket relay cleanup");
+    }
+    relay_count = spec.header.socket_count;
+    for (uint32_t i = 0; i < relay_count; ++i) {
+        relay_pids[i] = avm_relay_start(spec.sockets[i], AVM_SOCKET_PORT_BASE + i);
+        if (relay_pids[i] < 0)
+            fail(spec.sockets[i]);
     }
     int ready = open(READY_PATH, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (ready < 0)
@@ -691,7 +738,7 @@ int main(void)
     close(ready);
     pid_t previous_foreground;
     pid_t workload = start_workload(&spec, listener, signal_fd, &previous_foreground);
-    int result = supervise(workload, &relay, listener, signal_fd);
+    int result = supervise(workload, &spec, listener, signal_fd);
     if (previous_foreground > 0)
         (void)tcsetpgrp(STDIN_FILENO, previous_foreground);
     (void)unlink(READY_PATH);
@@ -699,7 +746,7 @@ int main(void)
      * command. libkrun's PID 1 tears down the rest when this helper exits. */
     forward_signal(workload, SIGTERM);
     forward_signal(workload, SIGKILL);
-    stop_relay(relay);
+    stop_relays();
     close(listener);
     close(signal_fd);
     return result;

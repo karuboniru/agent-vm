@@ -62,6 +62,11 @@ struct Terminal {
 struct RuntimeDirectory {
     fs::path path;
     explicit RuntimeDirectory(const avm::RunSpec& spec) {
+        std::string socket_suffix = "/ipc/control.sock";
+        if (!spec.sockets.empty()) {
+            auto broker_suffix = "/ipc/socket-" + std::to_string(spec.sockets.size() - 1) + ".sock";
+            if (broker_suffix.size() > socket_suffix.size()) socket_suffix = std::move(broker_suffix);
+        }
         std::vector<fs::path> candidates;
         if (const char* x = getenv("XDG_RUNTIME_DIR"); x && *x) candidates.emplace_back(x);
         candidates.emplace_back("/run/user/" + std::to_string(spec.uid));
@@ -78,7 +83,7 @@ struct RuntimeDirectory {
                 if (avm::path_within(candidate.string(), m.source)) exposed = true;
             if (exposed) continue;
             std::string pattern = (candidate / "agent-vm.XXXXXX").string();
-            if (pattern.size() + sizeof("/ipc/control.sock") > sizeof(sockaddr_un::sun_path)) continue;
+            if (pattern.size() + socket_suffix.size() >= sizeof(sockaddr_un::sun_path)) continue;
             std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
             if (char* made = mkdtemp(name.data())) {
                 path = made;
@@ -120,12 +125,14 @@ void write_spec(const avm::RunSpec& spec, const fs::path& path) {
         uint32_t n = static_cast<uint32_t>(s.size()); append(&n, sizeof(n)); append(s.data(), s.size());
     };
     avm_spec_header header{AVM_SPEC_MAGIC, AVM_SPEC_VERSION, spec.uid, spec.gid,
-        (spec.network ? AVM_FLAG_NETWORK : 0u) | (spec.ssh_agent ? AVM_FLAG_SSH : 0u),
-        static_cast<uint32_t>(spec.command.size()), static_cast<uint32_t>(spec.environment.size()), 0};
+        spec.network ? AVM_FLAG_NETWORK : 0u,
+        static_cast<uint32_t>(spec.command.size()), static_cast<uint32_t>(spec.environment.size()),
+        static_cast<uint32_t>(spec.sockets.size())};
     static_assert(sizeof(header) == 32);
     append(&header, sizeof(header)); string(spec.home); string(spec.cwd);
     for (const auto& arg : spec.command) string(arg);
     for (const auto& [key, value] : spec.environment) string(key + "=" + value);
+    for (const auto& socket : spec.sockets) string(socket.target);
     Fd fd(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
     if (fd.value < 0) system_error("create guest specification");
     write_all(fd.value, bytes.data(), bytes.size());
@@ -143,9 +150,15 @@ void write_worker_spec(const avm::RunSpec& s, const fs::path& path) {
     auto strings = [&](const auto& list) { number(static_cast<uint32_t>(list.size())); for (const auto& v : list) string(v); };
     number(AVM_SPEC_MAGIC); number(s.uid); number(s.gid); number(s.cpus); number(s.memory_mib); number(s.tmp_mib);
     number(s.network); number(s.ssh_agent); number(s.debug);
-    string(s.username); string(s.home); string(s.cwd); string(s.ssh_socket);
+    string(s.username); string(s.home); string(s.cwd);
     number(static_cast<uint32_t>(s.mounts.size()));
     for (const auto& m : s.mounts) { string(m.source); string(m.target); number(m.read_only); }
+    number(static_cast<uint32_t>(s.sockets.size()));
+    for (const auto& socket : s.sockets) { string(socket.source); string(socket.target); }
+    number(static_cast<uint32_t>(s.tmpfs.size()));
+    for (const auto& mount : s.tmpfs) {
+        string(mount.target); number(mount.uid); number(mount.gid); number(mount.mode);
+    }
     strings(s.mask_sources); strings(s.mask_targets);
     number(static_cast<uint32_t>(s.ports.size()));
     for (const auto& p : s.ports) { string(p.address); number(p.host_port); number(p.guest_port); number(p.udp); }
@@ -176,8 +189,19 @@ avm::RunSpec read_worker_spec(const fs::path& path) {
     if (cpus == 0 || cpus > 255 || s.uid != getuid() || s.gid != getgid()) throw std::runtime_error("invalid worker identity or CPU count");
     s.cpus = static_cast<uint8_t>(cpus); s.memory_mib = number(); s.tmp_mib = number();
     s.network = number(); s.ssh_agent = number(); s.debug = number();
-    s.username = string(); s.home = string(); s.cwd = string(); s.ssh_socket = string();
+    s.username = string(); s.home = string(); s.cwd = string();
     for (uint32_t n = count(); n; --n) { avm::MountSpec m; m.source = string(); m.target = string(); m.read_only = number(); s.mounts.push_back(std::move(m)); }
+    uint32_t sockets = count();
+    if (sockets > AVM_SOCKET_MAX) throw std::runtime_error("too many forwarded sockets");
+    for (uint32_t n = 0; n < sockets; ++n) {
+        avm::SocketSpec socket; socket.source = string(); socket.target = string();
+        s.sockets.push_back(std::move(socket));
+    }
+    for (uint32_t n = count(); n; --n) {
+        avm::TmpfsSpec mount; mount.target = string();
+        mount.uid = number(); mount.gid = number(); mount.mode = number();
+        s.tmpfs.push_back(std::move(mount));
+    }
     strings(s.mask_sources); strings(s.mask_targets);
     for (uint32_t n = count(); n; --n) {
         avm::PortSpec p; p.address = string(); uint32_t hp = number(), gp = number();
@@ -298,7 +322,11 @@ int doctor() {
         check_krun(krun_disable_implicit_vsock(context), "disable implicit vsock");
         check_krun(krun_add_vsock(context, 0), "explicit control vsock");
         check_krun(krun_add_vsock_port2(context, AVM_CONTROL_PORT, AVM_CONTROL_SOCKET, true), "control socket");
-        if (spec.ssh_agent) check_krun(krun_add_vsock_port2(context, AVM_SSH_PORT, AVM_SSH_SOCKET, false), "SSH socket");
+        for (size_t i = 0; i < spec.sockets.size(); ++i) {
+            auto path = std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock";
+            check_krun(krun_add_vsock_port2(context, AVM_SOCKET_PORT_BASE + static_cast<uint32_t>(i),
+                                          path.c_str(), false), "forwarded Unix socket");
+        }
         if (spec.network) {
             uint8_t mac[] = {0x02, 0x61, 0x76, 0x6d, 0x00, 0x01};
             check_krun(krun_add_net_unixstream(context, nullptr, net_fd, mac, COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT), "passt NIC");
@@ -335,16 +363,22 @@ int run(const avm::RunSpec& spec) {
     Fd signals(signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK));
     if (signals.value < 0) system_error("signalfd");
     avm::NetworkProcess network;
-    pid_t broker = -1, vm = -1;
+    pid_t vm = -1;
+    std::vector<pid_t> brokers;
+    brokers.reserve(spec.sockets.size());
     auto cleanup = [&] {
         if (vm > 0) { avm::stop_child(vm); vm = -1; }
         if (network.fd >= 0) { close(network.fd); network.fd = -1; }
         if (network.pid > 0) { avm::stop_child(network.pid); network.pid = -1; }
-        if (broker > 0) { avm::stop_child(broker); broker = -1; }
+        for (auto& broker : brokers)
+            if (broker > 0) { avm::stop_child(broker); broker = -1; }
     };
     try {
         if (spec.network) network = avm::start_passt(spec);
-        if (spec.ssh_agent) broker = avm::start_ssh_broker((runtime.path / "ipc/ssh.sock").string(), spec.ssh_socket);
+        for (size_t i = 0; i < spec.sockets.size(); ++i) {
+            auto path = runtime.path / "ipc" / ("socket-" + std::to_string(i) + ".sock");
+            brokers.push_back(avm::start_socket_broker(path.string(), spec.sockets[i].source));
+        }
         pid_t parent = getpid();
         vm = fork(); if (vm < 0) system_error("fork VM");
         if (vm == 0) {
@@ -368,13 +402,16 @@ int run(const avm::RunSpec& spec) {
             pid_t reaped = waitpid(vm, &status, WNOHANG);
             if (reaped == vm) { result = helper_failed ? 125 : status_code(status); vm = -1; break; }
             if (reaped < 0 && errno != EINTR) system_error("wait VM");
-            for (auto* pid : {&network.pid, &broker}) {
-                if (*pid > 0 && waitpid(*pid, &status, WNOHANG) == *pid) {
-                    std::cerr << "agent-vm: " << (pid == &network.pid ? "passt" : "SSH broker") << " exited before the VM (status " << status_code(status) << ")\n";
-                    *pid = -1; helper_failed = true; requested_signal = SIGTERM;
+            auto check_helper = [&](pid_t& pid, const std::string& name) {
+                if (pid > 0 && waitpid(pid, &status, WNOHANG) == pid) {
+                    std::cerr << "agent-vm: " << name << " exited before the VM (status " << status_code(status) << ")\n";
+                    pid = -1; helper_failed = true; requested_signal = SIGTERM;
                     deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::seconds(3));
                 }
-            }
+            };
+            check_helper(network.pid, "passt");
+            for (size_t i = 0; i < brokers.size(); ++i)
+                check_helper(brokers[i], "socket broker for " + spec.sockets[i].target);
             if (access((runtime.path / "ipc/guest-ready").c_str(), F_OK) == 0) {
                 if (requested_signal && send_control(runtime.path / "ipc/control.sock",
                     {AVM_CONTROL_MAGIC, AVM_CONTROL_SIGNAL, static_cast<uint32_t>(requested_signal), 0, 0})) requested_signal = 0;

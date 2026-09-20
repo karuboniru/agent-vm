@@ -1,9 +1,11 @@
 #include "agent_vm/spec.hpp"
+#include "agent_vm/protocol.h"
 
 #include <toml++/toml.hpp>
 #include <arpa/inet.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -58,7 +60,6 @@ bool env_key(const std::string& key) {
 void check_env_key(const std::string& key) {
     if (!env_key(key)) fail("invalid environment variable name: " + key);
     if (key.starts_with("KRUN_")) fail("KRUN_* variables are reserved for the VM bootstrap: " + key);
-    if (key == "SSH_AUTH_SOCK") fail("SSH_AUTH_SOCK is managed by --ssh-agent");
 }
 void set_env(RunSpec& spec, const std::string& item) {
     auto split = item.find('=');
@@ -76,6 +77,13 @@ uint32_t number(std::string_view value, uint32_t maximum, const std::string& lab
     auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), n);
     if (ec != std::errc() || end != value.data() + value.size() || n == 0 || n > maximum)
         fail(label + " must be an integer between 1 and " + std::to_string(maximum));
+    return n;
+}
+uint32_t unsigned_number(std::string_view value, uint32_t maximum, const std::string& label, int base = 10) {
+    uint32_t n = 0;
+    auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), n, base);
+    if (ec != std::errc() || end != value.data() + value.size() || n > maximum)
+        fail(label + " must be " + (base == 8 ? "an octal" : "a decimal") + " integer between 0 and " + std::to_string(maximum));
     return n;
 }
 std::vector<std::string> split(const std::string& value, char delimiter) {
@@ -140,6 +148,44 @@ MountSpec mount_spec(const std::string& value, const fs::path& base, const std::
     if (!source || !target) fail("mount requires src=SOURCE,dst=TARGET");
     return {source_path(*source, base, home, true), target_path(*target, home), read_only.value_or(true)};
 }
+TmpfsSpec tmpfs_spec(const std::string& value, const RunSpec& spec) {
+    TmpfsSpec result{"", spec.uid, spec.gid, 0700};
+    std::optional<std::string> target;
+    std::set<std::string> fields;
+    for (const auto& token : split(value, ',')) {
+        auto eq = token.find('=');
+        auto key = token.substr(0, eq);
+        auto v = eq == std::string::npos ? std::string{} : token.substr(eq + 1);
+        if (key == "dst" || key == "destination") key = "target";
+        if (eq == std::string::npos || !fields.insert(key).second)
+            fail("tmpfs fields require unique key=value pairs");
+        if (key == "target") target = v;
+        else if (key == "uid") result.uid = unsigned_number(v, UINT32_MAX - 1, "tmpfs uid");
+        else if (key == "gid") result.gid = unsigned_number(v, UINT32_MAX - 1, "tmpfs gid");
+        else if (key == "mode") result.mode = unsigned_number(v, 07777, "tmpfs mode", 8);
+        else fail("unknown tmpfs field: " + key);
+    }
+    if (!target) fail("tmpfs requires target=PATH");
+    result.target = target_path(*target, spec.home);
+    return result;
+}
+SocketSpec socket_spec(const std::string& value, const fs::path& base, const std::string& home) {
+    std::optional<std::string> source, target;
+    for (const auto& token : split(value, ',')) {
+        auto eq = token.find('=');
+        auto key = token.substr(0, eq);
+        auto v = eq == std::string::npos ? std::string{} : token.substr(eq + 1);
+        if (key == "src" || key == "source") {
+            if (source || eq == std::string::npos) fail("socket requires one source");
+            source = v;
+        } else if (key == "dst" || key == "target" || key == "destination") {
+            if (target || eq == std::string::npos) fail("socket requires one target");
+            target = v;
+        } else fail("unknown socket field: " + key);
+    }
+    if (!source || !target) fail("socket requires src=SOURCE,dst=TARGET");
+    return {source_path(*source, base, home, true), target_path(*target, home)};
+}
 void keys(const toml::table& table, std::initializer_list<std::string_view> allowed, const std::string& context) {
     for (const auto& [key, value] : table) {
         (void)value;
@@ -176,6 +222,14 @@ std::optional<uint32_t> int_at(const toml::table& table, const char* key, uint32
         fail(std::string(key) + " must be an integer between 1 and " + std::to_string(maximum));
     return static_cast<uint32_t>(*result);
 }
+std::optional<uint32_t> unsigned_int_at(const toml::table& table, const char* key, uint32_t maximum) {
+    auto n = table.get(key);
+    if (!n) return {};
+    auto result = n->value<int64_t>();
+    if (!n->is_integer() || !result || *result < 0 || static_cast<uint64_t>(*result) > maximum)
+        fail(std::string(key) + " must be an integer between 0 and " + std::to_string(maximum));
+    return static_cast<uint32_t>(*result);
+}
 std::vector<std::string> array_at(const toml::table& table, const char* key) {
     auto n = table.get(key);
     if (!n) return {};
@@ -206,7 +260,7 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
     toml::table root;
     try { root = toml::parse_file(file.string()); }
     catch (const toml::parse_error& e) { fail("configuration '" + file.string() + "': " + std::string(e.description())); }
-    keys(root, {"version", "vm", "filesystem", "mounts", "environment", "network", "ssh_agent"}, "");
+    keys(root, {"version", "vm", "filesystem", "mounts", "tmpfs", "sockets", "environment", "network", "ssh_agent"}, "");
     if (auto n = root.get("version")) {
         if (!n->is_integer() || n->value<int64_t>() != 1) fail("configuration version must be 1");
     }
@@ -238,6 +292,34 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
             if (mode != "ro" && mode != "rw") fail("mount mode must be ro or rw");
             spec.mounts.push_back({source_path(*source, file.parent_path(), spec.home, true),
                                    target_path(*target, spec.home), mode == "ro"});
+        }
+    }
+    if (auto n = root.get("tmpfs")) {
+        auto array = n->as_array();
+        if (!array) fail("tmpfs must be an array of tables");
+        for (const auto& v : *array) {
+            auto t = v.as_table();
+            if (!t) fail("tmpfs must contain tables only");
+            keys(*t, {"target", "uid", "gid", "mode"}, "tmpfs.");
+            auto target = string_at(*t, "target");
+            if (!target) fail("each tmpfs requires target");
+            spec.tmpfs.push_back({target_path(*target, spec.home),
+                                 unsigned_int_at(*t, "uid", UINT32_MAX - 1).value_or(spec.uid),
+                                 unsigned_int_at(*t, "gid", UINT32_MAX - 1).value_or(spec.gid),
+                                 unsigned_int_at(*t, "mode", 07777).value_or(0700)});
+        }
+    }
+    if (auto n = root.get("sockets")) {
+        auto array = n->as_array();
+        if (!array) fail("sockets must be an array of tables");
+        for (const auto& v : *array) {
+            auto t = v.as_table();
+            if (!t) fail("sockets must contain tables only");
+            keys(*t, {"source", "target"}, "sockets.");
+            auto source = string_at(*t, "source"), target = string_at(*t, "target");
+            if (!source || !target) fail("each socket requires source and target");
+            spec.sockets.push_back({source_path(*source, file.parent_path(), spec.home, true),
+                                    target_path(*target, spec.home)});
         }
     }
     if (auto t = table_at(root, "environment")) {
@@ -298,6 +380,44 @@ const MountSpec* nearest_mount(const RunSpec& spec, const std::string& target, b
         if ((equal || target != mount.target) && path_within(target, mount.target) &&
             (!result || mount.target.size() > result->target.size())) result = &mount;
     return result;
+}
+const TmpfsSpec* nearest_tmpfs(const RunSpec& spec, const std::string& target, bool equal) {
+    const TmpfsSpec* result = nullptr;
+    for (const auto& tmpfs : spec.tmpfs)
+        if ((equal || target != tmpfs.target) && path_within(target, tmpfs.target) &&
+            (!result || tmpfs.target.size() > result->target.size())) result = &tmpfs;
+    return result;
+}
+bool covered_by_tmpfs(const RunSpec& spec, const std::string& target) {
+    auto tmpfs = nearest_tmpfs(spec, target, true);
+    auto mount = nearest_mount(spec, target, true);
+    return tmpfs && (!mount || tmpfs->target.size() > mount->target.size());
+}
+void check_socket_path(const std::string& path, const char* kind) {
+    if (path.empty() || path[0] != '/' || path.find('\0') != std::string::npos || normalize(path) != path)
+        fail(std::string("socket ") + kind + " must be a normalized absolute pathname: " + path);
+    if (path.size() >= sizeof(sockaddr_un{}.sun_path))
+        fail(std::string("socket ") + kind + " exceeds the Unix socket pathname limit: " + path);
+}
+void check_socket_mount(const MountSpec& mount, const std::string& target) {
+    if (mount.read_only) fail("socket target is inside a read-only shared mount: " + target);
+    fs::path physical(mount.source);
+    std::error_code error;
+    if (!fs::is_directory(physical, error) || error)
+        fail("socket target is inside a regular-file mount: " + target);
+    auto relative = fs::path(target).lexically_relative(mount.target);
+    for (const auto& component : relative) {
+        physical /= component;
+        auto status = fs::symlink_status(physical, error);
+        if (status.type() == fs::file_type::not_found || error == std::errc::no_such_file_or_directory) return;
+        if (error) fail("cannot inspect shared socket target: " + physical.string() + ": " + error.message());
+        if (fs::is_symlink(status)) fail("socket target traverses a shared source symlink: " + physical.string());
+        if (!fs::is_directory(status)) fail("socket target already exists or has a non-directory parent: " + physical.string());
+    }
+    fail("socket target already exists in a shared source: " + target);
+}
+bool paths_overlap(const std::string& a, const std::string& b) {
+    return path_within(a, b) || path_within(b, a);
 }
 void deduplicate(std::vector<std::string>& values) {
     std::sort(values.begin(), values.end());
@@ -418,6 +538,8 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--cwd-mode") cwd_mode(cwd_setting, value());
         else if (option == "--workdir") workdir = target_path(value(), spec.home);
         else if (option == "--mount") spec.mounts.push_back(mount_spec(value(), host_cwd, spec.home));
+        else if (option == "--tmpfs") spec.tmpfs.push_back(tmpfs_spec(value(), spec));
+        else if (option == "--socket") spec.sockets.push_back(socket_spec(value(), host_cwd, spec.home));
         else if (option == "--mask") spec.mask_sources.push_back(source_path(value(), host_cwd, spec.home, false));
         else if (option == "--mask-target") spec.mask_targets.push_back(target_path(value(), spec.home));
         else if (option == "--env" || option == "-e") set_env(spec, value());
@@ -438,8 +560,11 @@ Options parse_options(int argc, char** argv) {
     if (spec.ssh_agent) {
         auto socket = env("SSH_AUTH_SOCK");
         if (socket.empty()) fail("--ssh-agent requires SSH_AUTH_SOCK in the host environment");
-        spec.ssh_socket = source_path(socket, host_cwd, spec.home, true);
-        spec.environment["SSH_AUTH_SOCK"] = "/run/user/" + std::to_string(spec.uid) + "/ssh-agent.sock";
+        auto target = "/run/user/" + std::to_string(spec.uid) + "/ssh-agent.socket";
+        if (spec.environment.contains("SSH_AUTH_SOCK") && spec.environment.at("SSH_AUTH_SOCK") != target)
+            fail("SSH_AUTH_SOCK conflicts with the --ssh-agent target: " + target);
+        spec.sockets.push_back({source_path(socket, host_cwd, spec.home, true), target});
+        spec.environment["SSH_AUTH_SOCK"] = target;
     }
     if (spec.command.empty()) spec.command = {"/bin/sh"};
     deduplicate(spec.mask_sources); deduplicate(spec.mask_targets);
@@ -469,8 +594,40 @@ void validate_spec(const RunSpec& spec) {
         auto status = fs::status(mount.source, error);
         if (error || (!fs::is_directory(status) && !fs::is_regular_file(status)))
             fail("shared sources must be regular files or directories: " + mount.source);
-        if (auto parent = nearest_mount(spec, mount.target, false))
-            check_existing_target(*parent, mount.target, fs::is_directory(status));
+        if (auto parent = nearest_mount(spec, mount.target, false)) {
+            auto tmpfs = nearest_tmpfs(spec, mount.target, false);
+            if (!tmpfs || tmpfs->target.size() < parent->target.size())
+                check_existing_target(*parent, mount.target, fs::is_directory(status));
+        }
+    }
+    if (spec.tmpfs.size() > 65536) fail("too many tmpfs mounts");
+    std::set<std::string> tmpfs_targets;
+    for (const auto& tmpfs : spec.tmpfs) {
+        if (tmpfs.target.find('\0') != std::string::npos) fail("tmpfs target cannot contain NUL bytes");
+        if (tmpfs.target == "/run" || !path_within(tmpfs.target, "/run")) check_target(tmpfs.target, "tmpfs");
+        else if (normalize(tmpfs.target) != tmpfs.target) fail("tmpfs target must be a normalized absolute path: " + tmpfs.target);
+        if (paths_overlap(tmpfs.target, "/.oldroot")) fail("tmpfs target overlaps a private runtime path: " + tmpfs.target);
+        for (const auto& required : {std::string("/tmp"), std::string("/var/tmp"), spec.home,
+                                     "/run/user/" + std::to_string(spec.uid)})
+            if (path_within(required, tmpfs.target)) fail("tmpfs target overlaps a required guest directory: " + tmpfs.target);
+        if (!tmpfs_targets.insert(tmpfs.target).second) fail("duplicate tmpfs target: " + tmpfs.target);
+        if (tmpfs.uid == UINT32_MAX || tmpfs.gid == UINT32_MAX) fail("tmpfs uid and gid cannot be UINT32_MAX");
+        if (tmpfs.mode > 07777) fail("tmpfs mode must fit in permission bits (0000 through 7777)");
+        if (targets.contains(tmpfs.target)) fail("duplicate mount/tmpfs target: " + tmpfs.target);
+        if (auto mount = nearest_mount(spec, tmpfs.target, true)) {
+            auto parent = nearest_tmpfs(spec, tmpfs.target, false);
+            if (!parent || parent->target.size() < mount->target.size())
+                check_existing_target(*mount, tmpfs.target, true);
+        }
+        for (const auto& mask : spec.mask_targets)
+            if (paths_overlap(tmpfs.target, mask)) fail("tmpfs target overlaps a masked target: " + tmpfs.target);
+        for (const auto& mask : spec.mask_sources) {
+            for (const auto& mount : spec.mounts) {
+                if (!path_within(mask, mount.source)) continue;
+                auto target = normalize(fs::path(mount.target) / fs::path(mask).lexically_relative(mount.source));
+                if (paths_overlap(tmpfs.target, target)) fail("tmpfs target overlaps a masked subtree: " + tmpfs.target);
+            }
+        }
     }
     for (const auto& mask : spec.mask_sources) {
         if (mask.empty() || mask[0] != '/' || normalize(mask) != mask) fail("source masks must be normalized absolute paths");
@@ -505,9 +662,56 @@ void validate_spec(const RunSpec& spec) {
             check_existing_target(*parent, target, fs::is_directory(status));
         }
     }
-    // Resolve the working directory against the final deepest shared mount.
-    // Private home and the standard writable FHS directories are built by setup.
-    if (auto mount = nearest_mount(spec, spec.cwd, true)) {
+    if (spec.sockets.size() > AVM_SOCKET_MAX) fail("too many forwarded sockets");
+    std::vector<std::string> socket_targets;
+    for (const auto& socket : spec.sockets) {
+        check_socket_path(socket.source, "source");
+        check_socket_path(socket.target, "target");
+        std::error_code error;
+        auto canonical = fs::canonical(socket.source, error);
+        if (error || normalize(canonical) != socket.source)
+            fail("socket source is missing or no longer canonical: " + socket.source);
+        if (!fs::is_socket(socket.source, error) || error)
+            fail("socket source is not an existing Unix socket: " + socket.source);
+        if (socket.target == "/run" || !path_within(socket.target, "/run")) check_target(socket.target, "socket");
+        if (path_within(spec.home, socket.target) || path_within(spec.cwd, socket.target) ||
+            path_within("/run/user/" + std::to_string(spec.uid), socket.target))
+            fail("socket target overlaps a required guest directory: " + socket.target);
+        for (const auto& target : socket_targets)
+            if (paths_overlap(socket.target, target)) fail("conflicting socket targets: " + socket.target + " and " + target);
+        socket_targets.push_back(socket.target);
+        for (const auto& mount : spec.mounts)
+            if (path_within(mount.target, socket.target)) fail("socket target overlaps a mount point: " + socket.target);
+        for (const auto& tmpfs : spec.tmpfs)
+            if (path_within(tmpfs.target, socket.target)) fail("socket target overlaps a tmpfs mount point: " + socket.target);
+        if (!covered_by_tmpfs(spec, socket.target)) {
+            if (auto parent = nearest_mount(spec, socket.target, true)) check_socket_mount(*parent, socket.target);
+            else if (!(path_within(socket.target, spec.home) || path_within(socket.target, "/tmp") ||
+                       path_within(socket.target, "/var/tmp") || path_within(socket.target, "/run")))
+                fail("socket target is outside the guest's writable filesystems: " + socket.target);
+        }
+        if (socket.target == "/tmp" || socket.target == "/var/tmp")
+            fail("socket target overlaps a required guest directory: " + socket.target);
+        for (const auto& mask : spec.mask_targets)
+            if (paths_overlap(socket.target, mask)) fail("socket target overlaps a masked target: " + socket.target);
+        for (const auto& mask : spec.mask_sources) {
+            for (const auto& mount : spec.mounts) {
+                if (!path_within(mask, mount.source)) continue;
+                auto target = normalize(fs::path(mount.target) / fs::path(mask).lexically_relative(mount.source));
+                if (paths_overlap(socket.target, target)) fail("socket target overlaps a masked subtree: " + socket.target);
+            }
+        }
+    }
+    // Empty private filesystems contain only their roots and paths created
+    // to reach nested mounts; a deeper shared mount supplies its own contents.
+    bool created_directory = std::any_of(spec.tmpfs.begin(), spec.tmpfs.end(), [&](const auto& tmpfs) {
+        return path_within(tmpfs.target, spec.cwd);
+    }) || std::any_of(spec.mounts.begin(), spec.mounts.end(), [&](const auto& mount) {
+        return mount.target != spec.cwd && path_within(mount.target, spec.cwd);
+    });
+    if (covered_by_tmpfs(spec, spec.cwd)) {
+        if (!created_directory) fail("workdir does not exist in the empty tmpfs: " + spec.cwd);
+    } else if (auto mount = nearest_mount(spec, spec.cwd, true)) {
         auto physical = fs::path(mount->source) / fs::path(spec.cwd).lexically_relative(mount->target);
         std::error_code error;
         if (!fs::is_directory(physical, error) || error)
@@ -524,7 +728,7 @@ void validate_spec(const RunSpec& spec) {
             std::error_code error;
             system_directory = fs::is_directory(spec.cwd, error) && !error;
         }
-        if (!private_directory && !system_directory)
+        if (!private_directory && !system_directory && !created_directory)
             fail("workdir is not provided by the guest filesystem: " + spec.cwd);
     }
     for (size_t i = 0; i < spec.ports.size(); ++i) {
@@ -540,13 +744,15 @@ void validate_spec(const RunSpec& spec) {
         }
     }
     if (spec.ssh_agent) {
-        struct stat st{};
-        if (stat(spec.ssh_socket.c_str(), &st) != 0 || !S_ISSOCK(st.st_mode))
-            fail("SSH_AUTH_SOCK is not an existing Unix socket: " + spec.ssh_socket);
+        auto target = "/run/user/" + std::to_string(spec.uid) + "/ssh-agent.socket";
+        if (std::none_of(spec.sockets.begin(), spec.sockets.end(), [&](const auto& socket) { return socket.target == target; }))
+            fail("SSH agent forwarding requires its socket mapping");
+        auto value = spec.environment.find("SSH_AUTH_SOCK");
+        if (value == spec.environment.end() || value->second != target)
+            fail("SSH_AUTH_SOCK must match the SSH agent forwarding target");
     }
     for (const auto& [key, value] : spec.environment) {
-        if (key != "SSH_AUTH_SOCK") check_env_key(key);
-        else if (!spec.ssh_agent) fail("SSH_AUTH_SOCK requires explicit SSH forwarding");
+        check_env_key(key);
         if (value.find('\0') != std::string::npos) fail("environment values cannot contain NUL bytes");
     }
     for (const auto& argument : spec.command)
@@ -560,14 +766,19 @@ void print_plan(const RunSpec& spec) {
               << "Mounts:\n  /usr -> /usr (recursive ro; runtime)\n";
     for (const auto& mount : spec.mounts)
         std::cout << "  " << mount.source << " -> " << mount.target << (mount.read_only ? " (ro)\n" : " (rw)\n");
+    for (const auto& tmpfs : spec.tmpfs)
+        std::cout << "Tmpfs: " << tmpfs.target << " (uid=" << tmpfs.uid << ", gid=" << tmpfs.gid
+                  << ", mode=0o" << std::oct << tmpfs.mode << std::dec << ")\n";
     for (const auto& mask : spec.mask_sources) std::cout << "Source mask: " << mask << '\n';
     for (const auto& mask : spec.mask_targets) std::cout << "Target mask: " << mask << '\n';
     std::cout << "Network: " << (spec.network ? "passt (IPv4)" : "none") << '\n'
-              << "Vsock: fixed control channel enabled; implicit vsock/TSI disabled"
-              << (spec.ssh_agent ? "; authorized SSH agent channel enabled\n" : "\n");
+              << "Vsock: fixed control channel enabled; implicit vsock/TSI disabled; "
+              << spec.sockets.size() << " authorized socket channels\n";
+    for (const auto& socket : spec.sockets)
+        std::cout << "Socket: " << socket.source << " -> " << socket.target << '\n';
     for (const auto& port : spec.ports)
         std::cout << "Publish: " << port.address << ':' << port.host_port << ':' << port.guest_port << (port.udp ? "/udp\n" : "/tcp\n");
-    std::cout << "SSH agent: " << (spec.ssh_agent ? spec.ssh_socket : "disabled") << "\nEnvironment names:";
+    std::cout << "SSH agent: " << (spec.ssh_agent ? "enabled (socket alias)" : "disabled") << "\nEnvironment names:";
     for (const auto& [key, value] : spec.environment) { (void)value; std::cout << ' ' << key; }
     std::cout << "\nCommand arguments: " << spec.command.size() << " (values omitted)\n";
 }
@@ -586,18 +797,21 @@ void print_help() {
   --cwd-mode ro|rw|none  Share the invoking directory (default rw)
   --workdir PATH         Absolute guest working directory
   --mount SPEC           type=bind,src=SOURCE,dst=TARGET[,ro|rw] (default ro)
+  --tmpfs SPEC           target=PATH[,uid=UID,gid=GID,mode=0700] (caller IDs)
+  --socket SPEC          Forward a Unix stream socket: src=SOURCE,dst=TARGET
   --mask SOURCE          Hide a host source subtree through every shared mount
   --mask-target TARGET   Hide one absolute guest target
   -e, --env KEY[=VALUE]   Set a workload variable, or inherit it from the host
   -p, --publish SPEC     [IPv4:]HOST:GUEST[/tcp|udp] (default 127.0.0.1, TCP)
-  --ssh-agent            Forward the host SSH_AUTH_SOCK through a fixed broker
+  --ssh-agent            Forward SSH_AUTH_SOCK to /run/user/UID/ssh-agent.socket
   --no-ssh-agent         Disable configured SSH agent forwarding
   --debug               Enable runtime diagnostic output
 
 Default configuration: $XDG_CONFIG_HOME/agent-vm/config.toml, otherwise
 $HOME/.config/agent-vm/config.toml. Project configuration is never read.
-CLI scalars and environment keys override configuration; masks are combined.
-Mount target conflicts are errors. Disable default mounts with --cwd-mode none
+CLI scalars and environment keys override configuration; mounts, tmpfs, sockets
+and masks are combined. Conflicting filesystem targets are errors.
+Disable default mounts with --cwd-mode none
 or --home ephemeral when replacing them. All values are literal, without shell
 execution. Command defaults to /bin/sh. plan prints environment names, not values.
 )";

@@ -203,10 +203,10 @@ int main() {
     int active = -1;
     try {
         server = echo_server(upstream);
-        expect_failure([&] { avm::start_ssh_broker(dir + "/missing/broker.sock", upstream); }, "reject absent parent");
-        expect_failure([&] { avm::start_ssh_broker(broker_path, dir); }, "reject non-socket upstream");
-        expect_failure([&] { avm::start_ssh_broker(broker_path, "/" + std::string(108, 'x')); }, "reject oversized path");
-        expect_failure([&] { avm::start_ssh_broker(upstream, upstream); }, "refuse existing broker path");
+        expect_failure([&] { avm::start_socket_broker(dir + "/missing/broker.sock", upstream); }, "reject absent parent");
+        expect_failure([&] { avm::start_socket_broker(broker_path, dir); }, "reject non-socket upstream");
+        expect_failure([&] { avm::start_socket_broker(broker_path, "/" + std::string(108, 'x')); }, "reject oversized path");
+        expect_failure([&] { avm::start_socket_broker(upstream, upstream); }, "refuse existing broker path");
 
         int unrelated[2];
         require(pipe2(unrelated, O_CLOEXEC) == 0, "create unrelated FD sentinel");
@@ -214,7 +214,7 @@ int main() {
         sigemptyset(&blocked);
         sigaddset(&blocked, SIGTERM);
         require(sigprocmask(SIG_BLOCK, &blocked, &previous) == 0, "block parent termination signal");
-        broker = avm::start_ssh_broker(broker_path, upstream);
+        broker = avm::start_socket_broker(broker_path, upstream);
         require(getpgid(broker) == broker && getpgid(broker) != getpgrp(),
                 "broker is outside the caller's foreground process group");
         require(sigprocmask(SIG_SETMASK, &previous, nullptr) == 0, "restore parent signals");

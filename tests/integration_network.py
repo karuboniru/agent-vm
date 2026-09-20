@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-VM passt and SSH tests using only disposable local echo services.
+"""Real-VM passt and Unix socket tests using disposable local echo services.
 
 Run outside a sandbox that denies KVM, namespaces, or socket binding:
     python3 tests/integration_network.py --binary /absolute/path/to/agent-vm
@@ -42,8 +42,9 @@ def receive_all(connection: socket.socket) -> bytes:
 class EchoService:
     """Local TCP/Unix stream or UDP endpoint, never consulting host credentials."""
 
-    def __init__(self, family: int, kind: int, address: object):
+    def __init__(self, family: int, kind: int, address: object, marker: bytes = EOF_MARKER):
         self.kind = kind
+        self.marker = marker
         self.listener = socket.socket(family, kind)
         self.listener.bind(address)
         self.address = self.listener.getsockname()
@@ -67,7 +68,7 @@ class EchoService:
                 while data := connection.recv(65536):
                     received += len(data)
                     connection.sendall(data)
-                connection.sendall(EOF_MARKER)
+                connection.sendall(self.marker)
                 marker_sent = True
                 connection.shutdown(socket.SHUT_WR)
         except OSError as error:
@@ -296,17 +297,20 @@ SSH_GUEST = r"""
     assert os.getuid() == expected_uid, 'guest UID changed'
     assert os.getgid() == int(sys.argv[3]), 'guest GID changed'
     endpoint = os.environ['SSH_AUTH_SOCK']
+    assert endpoint == '/run/user/%d/ssh-agent.socket' % expected_uid, 'SSH alias path changed'
     assert endpoint != upstream and not os.path.exists(upstream), 'host agent path exposed'
-    info = os.stat(endpoint)
-    assert stat.S_ISSOCK(info.st_mode), 'guest endpoint is not a Unix socket'
-    assert info.st_uid == expected_uid and stat.S_IMODE(info.st_mode) == 0o600
+    endpoints = (endpoint, '/run/custom/service.socket')
+    for path in endpoints:
+        info = os.stat(path)
+        assert stat.S_ISSOCK(info.st_mode), 'guest endpoint is not a Unix socket'
+        assert info.st_uid == expected_uid and stat.S_IMODE(info.st_mode) == 0o600
     assert 'eth0' not in dict(socket.if_nameindex()).values(), 'network none has a NIC'
 
     def round_trip(index):
         payload = bytes((i * 37 + index) % 251 for i in range(256 * 1024 + index))
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
             peer.settimeout(8)
-            peer.connect(endpoint)
+            peer.connect(endpoints[index % len(endpoints)])
             def send():
                 peer.sendall(payload)
                 peer.shutdown(socket.SHUT_WR)
@@ -334,7 +338,8 @@ def test_ssh(binary: Path, case: Path) -> None:
     endpoint = str(private / "fake-agent.sock")
     with EchoService(socket.AF_UNIX, socket.SOCK_STREAM, endpoint) as agent:
         os.chmod(endpoint, 0o600)
-        with VM(binary, case, SSH_GUEST, ["--network", "none", "--ssh-agent"],
+        with VM(binary, case, SSH_GUEST, ["--network", "none", "--socket",
+                f"src={endpoint},dst=/run/custom/service.socket", "--ssh-agent"],
                 [str(os.getuid()), endpoint, str(os.getgid())], {"SSH_AUTH_SOCK": endpoint}) as vm:
             try:
                 vm.finish("SSH_OK")
@@ -344,16 +349,184 @@ def test_ssh(binary: Path, case: Path) -> None:
         require(not agent.errors, f"fake SSH endpoint errors: {agent.errors}")
 
 
+SOCKETS_GUEST = r"""
+    from pathlib import Path
+    import concurrent.futures, os, socket, stat, sys, time
+    expected_uid, expected_gid = int(sys.argv[1]), int(sys.argv[2])
+    endpoints = sys.argv[3:]
+    assert os.getuid() == expected_uid and os.getgid() == expected_gid
+    assert os.environ['SSH_AUTH_SOCK'] == endpoints[0], 'explicit socket environment lost'
+    assert 'eth0' not in dict(socket.if_nameindex()).values(), 'network none has a NIC'
+    info = os.stat('/run')
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (0, 0, 0o755), (
+        'existing /run metadata changed')
+    assert not Path('/srv/readonly/cache/host-only').exists(), 'covered host data exposed through tmpfs'
+    for endpoint in endpoints:
+        info = os.stat(endpoint)
+        assert stat.S_ISSOCK(info.st_mode), 'forwarded endpoint is not a Unix socket'
+        assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (
+            expected_uid, expected_gid, 0o600), 'socket owner or mode mismatch'
+        for parent in Path(endpoint).parents:
+            if parent in (Path('/'), Path('/run'), Path('/srv/shared'), Path('/srv/readonly')):
+                break
+            info = parent.stat()
+            assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (
+                expected_uid, expected_gid, 0o700), 'new directory owner or mode mismatch'
+
+    def round_trip(index, markers):
+        selected = index % len(endpoints)
+        payload = bytes((i * 31 + index) % 251 for i in range(256 * 1024 + index))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(8)
+            peer.connect(endpoints[selected])
+            def send():
+                peer.sendall(payload)
+                peer.shutdown(socket.SHUT_WR)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as sender:
+                pending = sender.submit(send)
+                response = bytearray()
+                while data := peer.recv(65536):
+                    response.extend(data)
+                pending.result(timeout=1)
+            assert response == payload + markers[selected], (
+                'forwarded stream, route, or half-close mismatch: client=%d length=%d tail=%r'
+                % (index, len(response), response[-16:]))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as clients:
+        list(clients.map(lambda index: round_trip(index, (
+            b'<FIRST>', b'<SECOND>', b'<FIRST>', b'<SECOND>', b'<FIRST>')), range(10)))
+    Path('initial-complete').write_text('ready', encoding='ascii')
+    deadline = time.monotonic() + 10
+    while not Path('upstream-replaced').exists():
+        assert time.monotonic() < deadline, 'host did not replace upstream socket'
+        time.sleep(0.02)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as clients:
+        list(clients.map(lambda index: round_trip(index, (
+            b'<REPLACED>', b'<SECOND>', b'<REPLACED>', b'<SECOND>', b'<REPLACED>')), range(10)))
+    print('SOCKETS_OK', flush=True)
+"""
+
+
+def test_sockets(binary: Path, case: Path) -> None:
+    private = case / "private"
+    private.mkdir(mode=0o700)
+    shared_parent = case / "shared-parent"
+    shared_parent.mkdir(mode=0o751)
+    shared_before = shared_parent.stat()
+    readonly = case / "readonly-parent"
+    readonly_cache = readonly / "cache"
+    readonly_cache.mkdir(parents=True)
+    readonly_cache.chmod(0o751)
+    (readonly_cache / "host-only").write_text("host-data", encoding="ascii")
+    readonly_before = readonly_cache.stat()
+    # A 74-byte runtime directory fits control.sock but not socket-0.sock
+    # after the private directory suffix, so startup must select a fallback.
+    runtime = case / ("runtime-" + "x" * (74 - len(str(case.resolve())) - len("/runtime-")))
+    runtime.mkdir(mode=0o700)
+    require(len(str(runtime.resolve())) == 74, "runtime regression fixture path has unexpected length")
+    upstreams = [str(private / "first.sock"), str(private / "second.sock")]
+    endpoints = ["/run/agent-vm-sockets/first/nested/service.socket",
+                 "/run/agent-vm-sockets/second/service.socket",
+                 "/srv/shared/nested/service.socket",
+                 "/socket-cache/nested/service.socket",
+                 "/srv/readonly/cache/nested/service.socket"]
+    options = ["--network", "none", "--no-ssh-agent", "-e", f"SSH_AUTH_SOCK={endpoints[0]}",
+               "--mount", f"src={shared_parent},dst=/srv/shared,rw",
+               "--mount", f"src={readonly},dst=/srv/readonly,ro",
+               "--tmpfs", "target=/socket-cache", "--tmpfs", "target=/srv/readonly/cache"]
+    for upstream, endpoint in zip([*upstreams, upstreams[0], upstreams[1], upstreams[0]], endpoints):
+        options.extend(["--socket", f"src={upstream},dst={endpoint}"])
+    first = EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[0], b"<FIRST>")
+    try:
+        with EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[1], b"<SECOND>") as second:
+            with VM(binary, case, SOCKETS_GUEST, options,
+                    [str(os.getuid()), str(os.getgid()), *endpoints],
+                    {"XDG_RUNTIME_DIR": str(runtime)}) as vm:
+                vm.wait_file("initial-complete")
+                require(not first.errors, f"first socket service errors: {first.errors}")
+                first.__exit__()
+                os.unlink(upstreams[0])
+                first = EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[0], b"<REPLACED>")
+                (vm.work / "upstream-replaced").write_text("ready", encoding="ascii")
+                vm.finish("SOCKETS_OK")
+            shared_after = shared_parent.stat()
+            require((shared_after.st_ino, shared_after.st_uid, shared_after.st_gid, shared_after.st_mode) ==
+                    (shared_before.st_ino, shared_before.st_uid, shared_before.st_gid, shared_before.st_mode),
+                    "existing shared socket parent metadata changed")
+            readonly_after = readonly_cache.stat()
+            require((readonly_after.st_ino, readonly_after.st_uid, readonly_after.st_gid,
+                     readonly_after.st_mode, readonly_after.st_mtime_ns, readonly_after.st_ctime_ns) ==
+                    (readonly_before.st_ino, readonly_before.st_uid, readonly_before.st_gid,
+                     readonly_before.st_mode, readonly_before.st_mtime_ns, readonly_before.st_ctime_ns),
+                    "tmpfs-backed socket changed covered host directory metadata")
+            require(sorted(p.name for p in readonly_cache.iterdir()) == ["host-only"] and
+                    (readonly_cache / "host-only").read_text(encoding="ascii") == "host-data",
+                    "tmpfs-backed socket changed covered host directory contents")
+            require(not first.errors and not second.errors,
+                    f"socket service errors: {first.errors + second.errors}")
+
+            failure = case / "preexisting"
+            failure.mkdir(mode=0o700)
+            shared = failure / "shared"
+            shared.mkdir(mode=0o751)
+            occupied = shared / "service.socket"
+            occupied.write_bytes(b"existing destination must survive\n")
+            occupied.chmod(0o640)
+            before_parent, before_file = shared.stat(), occupied.stat()
+            failure_options = ["--network", "none", "--mount", f"src={shared},dst=/srv/shared,rw",
+                               "--socket", f"src={upstreams[1]},dst=/srv/shared/service.socket"]
+            with VM(binary, failure, "from pathlib import Path; Path('unexpected-workload').touch()",
+                    failure_options) as vm:
+                code = vm.process.wait(timeout=vm.operation_timeout(25))
+                vm.stderr.flush()
+                errors = (failure / "stderr.log").read_text(encoding="utf-8", errors="replace")
+                require(code != 0, "preexisting socket destination was accepted")
+                require("socket" in errors.lower(), f"missing socket failure diagnostic: {errors}")
+                require(not (vm.work / "unexpected-workload").exists(),
+                        "workload started despite preexisting socket destination")
+            require(occupied.read_bytes() == b"existing destination must survive\n",
+                    "preexisting destination contents changed")
+            for path, before in ((shared, before_parent), (occupied, before_file)):
+                after = path.stat()
+                require((after.st_ino, after.st_uid, after.st_gid, after.st_mode) ==
+                        (before.st_ino, before.st_uid, before.st_gid, before.st_mode),
+                        f"preexisting destination metadata changed: {path}")
+
+            partial = case / "partial-start"
+            partial.mkdir(mode=0o700)
+            shared = partial / "shared"
+            shared.mkdir(mode=0o751)
+            partial_options = ["--network", "none", "--mount", f"src={shared},dst=/srv/shared,rw",
+                               "--socket", f"src={upstreams[1]},dst=/srv/shared/new/first.socket",
+                               "--socket", f"src={upstreams[1]},dst=/run/denied.socket"]
+            with VM(binary, partial, "from pathlib import Path; Path('unexpected-workload').touch()",
+                    partial_options) as vm:
+                code = vm.process.wait(timeout=vm.operation_timeout(25))
+                vm.stderr.flush()
+                errors = (partial / "stderr.log").read_text(encoding="utf-8", errors="replace")
+                require(code != 0, "socket creation under root-owned /run was accepted")
+                require("/run/denied.socket" in errors and "Permission denied" in errors,
+                        f"missing guest socket permission diagnostic: {errors}")
+                require(not (vm.work / "unexpected-workload").exists(),
+                        "workload started after partial socket startup failed")
+            require((shared / "new").is_dir(), "guest never prepared the shared socket directory")
+            require(not (shared / "new/first.socket").exists(),
+                    "first socket survived partial startup cleanup")
+    finally:
+        first.__exit__()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/agent-vm")
-    parser.add_argument("--case", choices=("outbound", "publish", "ssh"), help="run a single case")
+    parser.add_argument("--case", choices=("outbound", "publish", "ssh", "sockets"), help="run a single case")
     arguments = parser.parse_args()
     binary = arguments.binary.resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error(f"agent-vm binary is not executable: {binary}")
     root = Path(tempfile.mkdtemp(prefix="avm-net-integration."))
-    cases = [("outbound", test_outbound), ("publish", test_published_ports), ("ssh", test_ssh)]
+    cases = [("outbound", test_outbound), ("publish", test_published_ports), ("ssh", test_ssh),
+             ("sockets", test_sockets)]
     try:
         for name, test in cases:
             if arguments.case and arguments.case != name:

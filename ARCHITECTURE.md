@@ -10,16 +10,16 @@
 
 采用 **C++20 宿主程序 + 小型 C17 guest helper + libkrun C API + passt**。首版是一条命令启动一个临时 VM，无常驻 root daemon、无 OCI 镜像构建步骤。动态复用宿主 `/usr`，其他路径由临时 FHS 根和显式共享组成。
 
-首版支持：CWD 共享、TOML 用户配置、CLI 挂载/环境变量覆盖、路径 mask、单用户 identity map、IPv4 passt 网络、TCP/UDP 端口发布、可选 SSH agent 转发。默认 CWD 可写、home 临时、网络关闭、SSH 转发关闭；用户可在配置中改变默认值。
+首版支持：CWD 共享、TOML 用户配置、CLI 共享挂载/自定义 tmpfs/环境变量覆盖、路径 mask、单用户 identity map、IPv4 passt 网络、TCP/UDP 端口发布、显式文件系统 Unix stream socket 转发，以及 SSH agent 转发别名。默认 CWD 可写、home 临时、网络关闭、不转发 socket；用户可在配置中改变默认值。
 
-不将多用户 guest、任意 Unix socket 协议、跨架构执行、通用 OCI runtime 或 GPU 纳入首版。宿主 `/usr` 更新会改变下次运行环境，因此这不是可复现的软件镜像；以后可另加 snapshot/image 后端。
+不将多用户 guest、Unix datagram/abstract socket、SCM_RIGHTS 文件描述符传递、跨架构执行、通用 OCI runtime 或 GPU 纳入首版。宿主 `/usr` 更新会改变下次运行环境，因此这不是可复现的软件镜像；以后可另加 snapshot/image 后端。
 
 ## 2. 进程与权限边界
 
 ```text
 agent-vm CLI / supervisor                    调用者 UID，宿主视图
   ├─ passt                                  宿主 netns，仅在联网时启动
-  ├─ ssh-broker                             固定授权的 SSH agent 目标，可选
+  ├─ socket brokers                         每个转发对应固定授权的宿主目标，可选
   └─ sandbox setup → VMM worker + libkrun    user/mount/pid/ipc/uts/net namespace
        ├─ 最小 bootstrap → virtio-fs /dev/root → guest 启动根
        ├─ 受限对象目录 → virtio-fs /.agent-vm/exports → guest 挂载装配
@@ -29,7 +29,7 @@ agent-vm CLI / supervisor                    调用者 UID，宿主视图
 guest: libkrun init（PID 1）
   └─ agent-vm-guest helper
        ├─ 读取挂载描述、创建本地 tmpfs、挂载对象、切入最终根
-       ├─ ssh relay（目标 UID，可选）
+       ├─ socket relays（目标 UID，每个转发一个，可选）
        └─ 用户命令（目标 UID/GID）
 ```
 
@@ -73,7 +73,7 @@ host 不再提供承载 guest 临时文件的 tmpfs。它生成最多 1 MiB 的�
 - `/dev/root`：最小启动根，包含 helper、描述文件、只读 `/usr`、生成的 `/etc` 和 guest 内核挂载所需的空目录。
 - `/.agent-vm/exports`：只包含已 confinement 的文件/目录对象。条目用 `/N/root` 或 `/N/file` 引用对象，完整目标路径放在描述中。
 
-tag 可以用路径形式，但每个目标一个设备会耗尽 libkrun 1.19 的 IRQ。固定两个设备配合对象路径避免这个限制，也避免长目标路径超过 tag 长度上限。guest helper 在独立 mount namespace 内创建本地 tmpfs 根和临时目录，先准备所有挂载点，再从对象目录 bind 到目标路径；不在共享目录里创建挂载点。它保留 libkrun init 已挂载的 guest proc/sys/dev，卸载对象目录的 staging 挂载，随后 `pivot_root` 并断开 bootstrap。PID 1 保留启动 namespace，DHCP resolver 文件在两个视图中引用同一份受限私有文件。
+tag 可以用路径形式，但每个目标一个设备会耗尽 libkrun 1.19 的 IRQ。固定两个设备配合对象路径避免这个限制，也避免长目标路径超过 tag 长度上限。guest helper 在独立 mount namespace 内创建本地 tmpfs 根和内建临时目录，再将用户 bind 与自定义 tmpfs 合并按先祖先、后后代的顺序安装；不在宿主共享目录里创建挂载点。它保留 libkrun init 已挂载的 guest proc/sys/dev，卸载对象目录的 staging 挂载，随后 `pivot_root` 并断开 bootstrap。PID 1 保留启动 namespace，DHCP resolver 文件在两个视图中引用同一份受限私有文件。
 
 guest 最终视图如下：
 
@@ -88,6 +88,7 @@ guest 最终视图如下：
 | CWD | 默认同绝对路径 rw bind；可通过 CLI 改为 ro 或其他目标 |
 | `/tmp`, `/var/tmp` | guest 本地 tmpfs，1777，设置容量限制 |
 | `/run`, `/run/user/U` | guest 本地 tmpfs 中的运行目录，后者归 U、0700 |
+| 自定义 `[[tmpfs]].target` | guest 本地 tmpfs，可包含显式子挂载；根目录 UID/GID 默认调用者 U/G，mode 默认 0700，支持显式指定；tmpfs 自身内容退出后丢弃 |
 | `/var`, `/opt`, `/srv`, `/mnt`, `/media`, `/root` | 最小占位目录，需要时加私有可写子挂载 |
 | `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm` | 由 guest 内核/init 挂载；不整体 bind 宿主对应目录 |
 
@@ -95,7 +96,7 @@ guest 最终视图如下：
 
 共享对象的只读约束在 host 上通过挂载属性实施，不能仅靠 guest 以 ro 挂载 virtio-fs。使用固定 FD 的 bind 和 `mount_setattr(..., AT_RECURSIVE, MOUNT_ATTR_RDONLY)`；父挂载先安装，显式子挂载随后覆盖，不能重新递归锁定父目录而破坏 rw 子挂载。对象目录同时含 ro/rw 内容，不能把整个 export 标成 read_only。[mount_setattr(2)](https://man7.org/linux/man-pages/man2/mount_setattr.2.html)
 
-host 策略骨架和启动配置在装配结束后锁为只读；guest 根骨架也在切根完成后锁为只读，私有可写目录与 rw 共享保持独立子挂载。两侧都使用 `pivot_root`，`chdir("/")`，卸载旧根，失败即终止。guest 本地 tmpfs 消耗 VM RAM，`--tmp-size` 是每个文件系统的容量上限，不预留内存；多个 tmpfs 和进程共同竞争 `--memory` 的预算。
+host 策略骨架和启动配置在装配结束后锁为只读；guest 根骨架也在切根完成后锁为只读，私有可写目录与 rw 共享保持独立子挂载。两侧都使用 `pivot_root`，`chdir("/")`，卸载旧根，失败即终止。guest 本地 tmpfs 消耗 VM RAM，`--tmp-size` / `[vm].tmp_mib` 是每个文件系统（包括自定义 tmpfs）的容量上限，不预留内存；多个 tmpfs 和进程共同竞争 `--memory` 的预算。自定义条目不另设容量选项。
 
 ### VMM 的 `/proc`、KVM 和 FD 生命周期
 
@@ -109,7 +110,13 @@ VMM 需要 `/dev/kvm`，libkrun 1.19 的内建文件后端需要 `/proc/self/fd`
 
 配置和命令行先合并成 MountPlan，再执行；mask 是最终 deny 规则，CLI 新增挂载不能隐式取消 mask。
 
-父子挂载的模式独立：允许 ro 父挂载下配置 rw 子挂载，也允许 rw 父挂载下配置 ro 子挂载。父挂载的 ro 属性递归约束其树，但单独声明的子挂载按各自模式生效。安装顺序始终为先祖先、后后代，与配置或命令行中的声明顺序无关。嵌套目标必须已存在于最近共享父挂载对应的源树中，文件/目录类型与子挂载源匹配，且路径各级不得经过 symlink；否则报错，不在宿主共享目录内创建挂载点。因此只读共享 home 可以保留默认可写 CWD。
+父子挂载的模式独立：允许 ro 父挂载下配置 rw 子挂载，也允许 rw 父挂载下配置 ro 子挂载。父挂载的 ro 属性递归约束其树，但单独声明的子挂载按各自模式生效。用户 bind 与自定义 tmpfs 可以交替嵌套，统一按先祖先、后后代的顺序安装，与配置或命令行中的声明顺序无关。最近父层为共享挂载时，嵌套目标必须已存在于该父层对应的源树中，文件/目录类型与子挂载源匹配，且路径各级不得经过 symlink；最近父层为 tmpfs 时，可在私有树内创建子挂载点。不在宿主共享目录内创建挂载点。因此只读共享 home 可以保留默认可写 CWD。
+
+自定义 tmpfs 可以覆盖共享源中已有且路径各级均无 symlink 的目录，包括 ro 共享目录。host 为 tmpfs 建立私有 staging 树，在其中创建子挂载占位文件或目录并安装显式子挂载，导出前将 staging 骨架锁为只读，保留显式 rw bind 子挂载的写权限。被覆盖的原宿主子树不会通过底层导出暴露，也不修改宿主源目录或 ownership。guest 先装配内建 tmpfs，再按祖先优先顺序混合安装用户 bind 和自定义 tmpfs。tmpfs 自身写入只占 guest RAM，退出后丢弃；其中显式 rw bind 子挂载仍写入对应宿主源。
+
+tmpfs target 重复或与 bind target 相同时拒绝，等于或包含内建 `/tmp`、`/var/tmp`、`/run`、home 或 `/run/user/U` 时也拒绝；保护的系统路径和 `/.oldroot` 不能覆盖，与 mask 重叠也报错。允许 `/run/myapp` 等后代路径。workdir 可以是 tmpfs 根，或为子挂载创建挂载点时产生的父目录；不会自动创建空 tmpfs 内的其他工作目录。socket target 可以位于自定义 tmpfs 内，即使该 tmpfs 覆盖的是 ro 共享子树。
+
+例如在 `[[tmpfs]]` 中设置 `target = "~/.gnupg"`，另用只读 `[[mounts]]` 将宿主 `~/.gnupg/pubring.kbx` 挂到相同 guest 路径，可在临时 GnuPG home 内只暴露现有公钥环。tmpfs 的 UID/GID 默认调用者 U/G，也可显式指定为 1000；该组合不能再与 `.gnupg` 的 source/target mask 重叠。examples/config.toml 包含默认不启用的完整示例。
 
 建议区分两种策略：
 
@@ -152,6 +159,16 @@ source = "~/datasets"
 target = "/data"
 mode = "ro"
 
+[[tmpfs]]
+target = "/cache"
+# uid = 1000
+# gid = 1000
+# mode = 0o750
+
+[[sockets]]
+source = "~/service.sock"
+target = "/run/service/client.sock"
+
 [environment]
 inherit = ["TERM", "LANG", "LC_ALL"]
 
@@ -171,15 +188,19 @@ agent-vm doctor
 agent-vm plan --mask "$HOME/.ssh"
 agent-vm run --network passt \
   --mount type=bind,src="$HOME/datasets",dst=/data,ro \
+  --tmpfs target=/cache \
+  --socket src="$XDG_RUNTIME_DIR/service.sock",dst=/run/service/client.sock \
   --mask "$HOME/.ssh" \
   -e EDITOR=vim -e API_TOKEN \
   -p 127.0.0.1:8080:8080/tcp \
   --ssh-agent -- bash
 ```
 
-`-e KEY=VALUE` 设置值，`-e KEY` 从调用者继承该变量，未定义时报错。默认白名单继承；HOME/USER/LOGNAME/PATH/XDG_RUNTIME_DIR 按 guest 生成。只有启用 SSH 转发时才设置 guest SSH_AUTH_SOCK。
+`-e KEY=VALUE` 设置值，`-e KEY` 从调用者继承该变量，未定义时报错。默认白名单继承；HOME/USER/LOGNAME/PATH/XDG_RUNTIME_DIR 按 guest 生成。SSH 转发别名启用时自动设置 guest SSH_AUTH_SOCK；别名关闭时可显式指定 SSH_AUTH_SOCK，配合自定义 socket 转发使用。
 
-标量 CLI 覆盖配置；环境变量按 key 覆盖；mount 按 target 检查冲突，覆盖需明确规则；mask 取并集。相对源路径以 CLI 的 CWD 或配置文件所在目录解析，并写入 plan 输出。配置不执行 shell、不做任意命令替换。未知字段报错。首版不自动读取工作区内不可信配置。
+`[[tmpfs]]` 必须提供 `target`，可选整数 `uid`、`gid` 默认调用者数字 U/G，可选整数 `mode` 默认 `0o700`。CLI 可重复使用 `--tmpfs target=/cache,uid=1000,gid=1000,mode=0750`，`dst`、`destination` 是 `target` 的别名，mode 按八进制解析。UID/GID 范围是 0 到 4294967294，`UINT32_MAX` 无效；mode 范围是八进制 0000 到 7777。UID/GID 是独立于宿主身份映射的 guest ID，通过 tmpfs mount options 设置根目录 ownership 和权限，不对宿主执行 chown，也不改变 workload 身份；例如 root owner 与 0700 会阻止非 root workload 访问。
+
+标量 CLI 覆盖配置；环境变量按 key 覆盖；bind mount、tmpfs、socket 和端口发布列表追加，重复 target 报错；mask 取并集。mount 与 socket 的相对源路径以 CLI 的 CWD 或配置文件所在目录解析，`~` 展开为调用者 home，并写入 plan 输出。配置不执行 shell、不做任意命令替换。未知字段报错。首版不自动读取工作区内不可信配置。
 
 `plan` 展示最终文件树、UID/GID、网络、socket 授权与环境变量名；秘密值隐藏。用户传入的 workload env 不直接注入 root guest bootstrap，防止 LD_PRELOAD 或 KRUN_* 配置影响初始化；helper 在降权后才交给 execve。启动参数通过私有只读结构化配置传递，不经 shell 拼接。
 
@@ -202,25 +223,31 @@ guest 使用 libkrun 内建 IPv4 DHCP，helper 验证地址/路由/DNS 后才启
 
 `--network none` 同时意味着不启动 passt、不加 NIC、显式禁用 implicit vsock/TSI；若有明确授权的 IPC，再加无 TSI 的 vsock。普通 passt 出站网络不是域名/IP allowlist 防火墙，访问宿主/LAN 的策略需另行定义。IPv6、DHCP 续租和多 NIC 后续单独实现验证。
 
-## 8. SSH agent 与 vsock
+## 8. Unix socket 转发与 vsock
 
 ```text
-guest ssh → /run/user/U/ssh-agent.sock → guest relay
-          → AF_VSOCK(CID_HOST=2, port=P) → libkrun Unix backend
-          → jail 中的 broker socket → host broker → SSH_AUTH_SOCK
+guest client → 配置的 guest socket target → guest relay
+             → AF_VSOCK(CID_HOST=2, port=P) → libkrun Unix backend
+             → jail 中该转发的 broker socket → host broker → 配置的 host source
 ```
 
 ```c
 krun_disable_implicit_vsock(ctx);  // 每个 context 初始化时一次
 krun_add_vsock(ctx, 0);           // 不启用 INET / UNIX TSI
-krun_add_vsock_port2(ctx, P, "/ipc/ssh-broker.sock", false);
+krun_add_vsock_port2(ctx, P, "/ipc/socket-0.sock", false);
 ```
 
 `false` 代表 guest 发起连接到 host Unix socket；反方向使用 true。这个 API 接收 pathname，不接收已连接 FD。使用 libkrun 用户态 Unix backend 时，不要求宿主 `/dev/vsock` 或 `/dev/vhost-vsock`；guest 需要 virtio-vsock。[Unix backend](https://github.com/libkrun/libkrun/blob/v1.19.0/src/devices/src/virtio/vsock/unix.rs)
 
-推荐 broker 的原因是隔离后仍能按固定宿主路径重新连接 SSH agent，而不共享整个宿主 runtime 目录。首版也可精确 bind 单个 SSH socket，代价是宿主 agent 重建 socket inode 后需要重启 VM。broker 路径和 endpoint 在启动时授权，guest 不可传任意宿主目标。
+`--socket src=SOURCE,dst=TARGET` 可重复指定，TOML 使用 `[[sockets]]` 的 `source`、`target` 字段。source 必须解析为现存 socket 文件，并固定为规范化后的宿主绝对路径；target 必须为绝对路径，经过路径规范化。两端 socket pathname 最长 107 字节，转发总数最多 256（包含 SSH agent 别名），重复 guest target 报错。路径含逗号时使用 TOML，避免 CLI 字段分隔歧义。
 
-relay 以 U/G 运行；socket 0600，父目录 0700；每个客户端独立连接，处理半关闭、背压、并发和退出回收。SSH forwarding 是显式的签名能力授权，即使 `.ssh` 被 mask，启用它仍允许使用 agent。首版仅承诺 SSH agent byte-stream，不承诺 SCM_RIGHTS 等跨 VM 的通用 Unix socket 语义。
+每个转发有独立的 host broker、guest relay 和固定授权的 vsock port。broker 在隔离后仍能按固定宿主路径重新连接服务，不共享整个宿主 runtime 目录。broker 路径和 endpoint 在启动时授权，guest 不可传任意宿主目标。转发不依赖 passt，`--network none` 也可使用。
+
+guest helper 先以 root 为 target 创建缺失的父目录（0700），并将新目录 owner 设为 U/G，再降权，以 U/G 创建监听 socket（0600）。已有父目录的 owner 和权限保持不变；已有目标一律报错，不删除或替换。target 必须位于可写 guest 文件系统，例如 `/run`、`/tmp`、`/var/tmp`、临时 home、自定义 tmpfs 或显式 rw 共享；不为 socket 解锁只读根骨架。目录和 socket 文件写入最近的挂载层：rw bind 对应宿主源，tmpfs 对应 guest 临时存储。
+
+`--ssh-agent` / `[ssh_agent].enabled` 保留为别名：将宿主 SSH_AUTH_SOCK 转发到 `/run/user/U/ssh-agent.socket`，并设置 guest SSH_AUTH_SOCK。`--no-ssh-agent` 只关闭别名，不移除显式转发；别名关闭时可以显式设置 SSH_AUTH_SOCK 指向自定义转发。
+
+每个客户端独立连接，处理半关闭、背压、并发和退出回收。仅承诺文件系统 Unix stream byte-stream，不支持 datagram、abstract socket 或 SCM_RIGHTS 等跨 VM 的 Unix socket 语义。显式转发授权 guest 使用该宿主服务的能力；SSH forwarding 是签名能力授权，即使 `.ssh` 被 mask，启用它仍允许使用 agent。
 
 ## 9. 启动顺序、退出与模块
 
@@ -230,7 +257,7 @@ relay 以 U/G 运行；socket 0600，父目录 0700；每个客户端独立连�
 4. 在新 namespace 内安装 bind/mask/ro 属性，从最终视图创建对象目录、bootstrap 和挂载描述；切根、清理旧根引用与 FD。
 5. 清 capabilities、设置 no_new_privs，装载经验证的 VMM seccomp 策略；确保动态库/固件/KVM/proc 需求都在允许视图内。
 6. 使用 libkrun 1.19 C API 配置 RAM/vCPU、virtio-fs、显式 NIC/vsock、guest helper 和精简 bootstrap 环境；调用 krun_start_enter。
-7. libkrun init 挂载 guest 伪文件系统、配置网络；helper 根据描述装配本地 tmpfs 和导出对象，保留 guest 伪文件系统、切入最终根，创建 runtime，降权、按需启动 relay 并监督 workload。
+7. libkrun init 挂载 guest 伪文件系统、配置网络；helper 根据描述装配本地 tmpfs 和导出对象，保留 guest 伪文件系统、切入最终根，创建 runtime 和 socket 父目录、设置新目录 owner，再降权、按需启动 relay 并监督 workload。
 8. supervisor 用 pidfd/signalfd 等管理退出；guest helper 转发信号、回收子进程、传递退出码。TTY 输入、窗口大小、非交互信号和强制停止需要端到端验证；使用超时升级停止，清理 passt/broker 和临时目录。
 
 libkrun 的 start/enter 是进入 VMM 运行循环的接口，因此隔离成独立子进程，supervisor 负责生命周期。需要额外控制通道时只接受固定操作（停止、resize、状态），不接受 guest 指定宿主路径。
@@ -304,10 +331,10 @@ GUEST_PROBE_PASS
 
 ## 13. 0.1.0 实现结果与明确边界
 
-- 已实现 CLI/TOML/plan/doctor、namespace/FHS/UID、挂载与 mask、passt、TCP/UDP 发布、SSH relay、guest 降权、信号/退出码/终端管理。
+- 已实现 CLI/TOML/plan/doctor、namespace/FHS/UID、挂载与 mask、passt、TCP/UDP 发布、Unix stream socket relay 与 SSH agent 别名、guest 降权、信号/退出码/终端管理。
 - VMM 先以精简环境重新 exec，再进入 namespace，避免宿主原始环境及配置解析内存残留在 VMM 地址空间中。启动前关闭非白名单 FD、清空 capability sets，并安装 seccomp denylist。
-- 同一源目录的多个声明挂载均安装 mask；mountinfo 校验拒绝未覆盖的 bind 别名、`/usr` 的可写别名、runtime 的别名暴露。父子挂载模式独立，允许 ro 父挂载下的 rw 子挂载；嵌套目标必须已存在于最近共享父挂载的源树中，类型匹配且无 symlink。缺失的 mask 和需要在宿主创建嵌套挂载点的请求不支持，启动失败，不悄悄放行。
+- 同一源目录的多个声明挂载均安装 mask；mountinfo 校验拒绝未覆盖的 bind 别名、`/usr` 的可写别名、runtime 的别名暴露。父子挂载模式独立，允许 ro 父挂载下的 rw 子挂载，以及 bind/tmpfs 交替嵌套；最近父层为共享挂载时，嵌套目标必须已存在于该源树中，类型匹配且无 symlink；最近父层为 tmpfs 时，在私有树中准备挂载点。缺失的 mask 和需要在宿主创建嵌套挂载点的请求不支持，启动失败，不悄悄放行。
 - 固定 control vsock 始终启用，TSI 显式关闭；network none 不运行 passt。内核可能自带无路由的 dummy0，验收关注无外部 NIC/路由/TSI，以及 guest 本地 loopback 可用。
-- libkrun 1.19 Unix backend 在 HUP 与 IN 同时发生时可能丢失尾部数据。因此 SSH 内部通道使用 DATA/EOF/ACK，控制通道也等待 ACK 后才关闭；对外保留正常字节流和半关闭语义。
+- libkrun 1.19 Unix backend 在 HUP 与 IN 同时发生时可能丢失尾部数据。因此 socket 内部通道使用 DATA/EOF/ACK，控制通道也等待 ACK 后才关闭；对外保留正常字节流和半关闭语义。
 - `tests/config_test.cpp` 覆盖解析和策略；`tests/network_test.cpp` 覆盖并发/背压/半关闭/非法帧/清理；`tests/sandbox_test.cpp --integration` 验证切根、FD 清理、权限、mask 和真实 bind 别名负测；两份 Python integration 脚本通过真实 VM 验证核心功能与网络/SSH。
 - 当前保留 VMM 私有 proc 和精确 KVM 节点；seccomp 是 denylist，而非完整 syscall allowlist。原始恶意 virtio-fs 协议审计、宿主 cgroup 总资源限制、持久磁盘配额、IPv6、多 NIC 和 DHCP 续租仍属后续工作。`--tmp-size` 分别限制各临时文件系统，不是总内存限额。

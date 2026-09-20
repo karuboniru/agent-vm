@@ -230,7 +230,7 @@ bool write_buffer(int fd, Buffer& buffer) {
 }
 
 int relay(int client, int upstream) {
-    // The vsock-facing Unix socket carries framing, not the raw agent stream.
+    // The vsock-facing Unix socket carries framing, not the raw upstream stream.
     // libkrun 1.19 processes host HUP before readable data, so half-closing or
     // closing that endpoint can discard its final reply. Logical EOF plus ACK
     // lets the guest consume the complete reply before it closes the transport.
@@ -517,27 +517,27 @@ NetworkProcess start_passt(const RunSpec& spec) {
     return {parent_socket.release(), child};
 }
 
-pid_t start_ssh_broker(const std::string& listen_path, const std::string& upstream_path) {
+pid_t start_socket_broker(const std::string& listen_path, const std::string& upstream_path) {
     sockaddr_un listen_address = socket_address(listen_path);
     sockaddr_un upstream_address = socket_address(upstream_path);
     struct stat info {};
-    if (lstat(upstream_path.c_str(), &info) < 0) fail("inspect SSH agent socket " + upstream_path);
-    if (!S_ISSOCK(info.st_mode)) throw std::runtime_error("SSH agent endpoint is not a Unix socket: " + upstream_path);
+    if (lstat(upstream_path.c_str(), &info) < 0) fail("inspect upstream Unix socket " + upstream_path);
+    if (!S_ISSOCK(info.st_mode)) throw std::runtime_error("upstream endpoint is not a Unix socket: " + upstream_path);
     const std::string parent_dir = std::filesystem::path(listen_path).parent_path().string();
-    if (lstat(parent_dir.c_str(), &info) < 0) fail("inspect SSH broker directory");
+    if (lstat(parent_dir.c_str(), &info) < 0) fail("inspect socket broker directory");
     if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() || (info.st_mode & 0777) != 0700)
-        throw std::runtime_error("SSH broker directory must be owned by the caller and have mode 0700");
-    if (lstat(listen_path.c_str(), &info) == 0) throw std::runtime_error("SSH broker socket path already exists: " + listen_path);
-    if (errno != ENOENT) fail("inspect SSH broker socket path");
+        throw std::runtime_error("socket broker directory must be owned by the caller and have mode 0700");
+    if (lstat(listen_path.c_str(), &info) == 0) throw std::runtime_error("broker socket path already exists: " + listen_path);
+    if (errno != ENOENT) fail("inspect broker socket path");
     int pipe_fds[2];
-    if (pipe2(pipe_fds, O_CLOEXEC) < 0) fail("create SSH broker startup pipe");
+    if (pipe2(pipe_fds, O_CLOEXEC) < 0) fail("create socket broker startup pipe");
     Fd status_read(pipe_fds[0]), status_write(pipe_fds[1]);
     pid_t parent = getpid();
     pid_t child = fork();
-    if (child < 0) fail("fork SSH broker");
+    if (child < 0) fail("fork socket broker");
     if (child == 0) broker_main(listen_path, listen_address, upstream_address, status_write.get(), parent);
     status_write.reset();
-    wait_startup(status_read.get(), child, false, "SSH broker");
+    wait_startup(status_read.get(), child, false, "socket broker");
     return child;
 }
 }

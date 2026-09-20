@@ -43,8 +43,9 @@ with tempfile.TemporaryDirectory(prefix="agent-vm-core-test-") as directory:
     env.pop("SSH_AUTH_SOCK", None)
     common = [str(binary), "run", "--no-config", "--cpus", "1", "--memory", "512"]
 
-    def run(command, options=(), expected=0, stdin=None, timeout=20):
-        p = subprocess.Popen(common + list(options) + ["--"] + list(command), cwd=work, env=env,
+    def run(command, options=(), expected=0, stdin=None, timeout=20, config=None):
+        invocation = common if config is None else [arg for arg in common if arg != "--no-config"] + ["--config", str(config)]
+        p = subprocess.Popen(invocation + list(options) + ["--"] + list(command), cwd=work, env=env,
                              stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
@@ -93,6 +94,202 @@ for p in ['/tmp/full','/var/tmp/full']:
 print('limits-ok')
 """], ["--tmp-size", "1"])
     check(out.strip() == "limits-ok", "guest tmpfs preserves per-filesystem capacity limits")
+
+    custom_tmpfs = ["--tmpfs", "target=/cache/nested,mode=0750",
+                    "--tmpfs", "target=/run/custom,mode=0770",
+                    "--tmpfs", "target=/cache",
+                    "--tmpfs", "target=/root-owned,uid=0,gid=0,mode=0750",
+                    "--tmpfs", f"target=/foreign-owned,uid={os.getuid() + 1},gid={os.getgid() + 1},mode=0700",
+                    "--tmp-size", "1", "--workdir", "/cache"]
+    out, _ = run(["python3", "-c", """import errno,json,os,pathlib,stat
+paths=['/cache','/cache/nested','/run/custom','/root-owned','/foreign-owned']
+mounts={}
+for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+ left,right=line.split(' - ');mounts[left.split()[4]]=right.split()[0]
+assert all(mounts[p]=='tmpfs' for p in paths),mounts
+assert os.getcwd()=='/cache'
+assert sorted(p.name for p in pathlib.Path('/cache').iterdir())==['nested']
+for p in ['/cache/payload','/cache/nested/payload','/run/custom/payload']:
+ pathlib.Path(p).write_bytes(b'x'*(768*1024))
+ try: pathlib.Path(p+'-overflow').write_bytes(b'x'*(512*1024))
+ except OSError as e: assert e.errno==errno.ENOSPC,e
+ else: raise AssertionError('custom tmpfs capacity limit missing: '+p)
+print(json.dumps({p:[(s:=os.stat(p)).st_uid,s.st_gid,stat.S_IMODE(s.st_mode)] for p in paths}))
+"""], custom_tmpfs)
+    metadata = json.loads(out)
+    check(metadata == {"/cache": [os.getuid(), os.getgid(), 0o700],
+                       "/cache/nested": [os.getuid(), os.getgid(), 0o750],
+                       "/run/custom": [os.getuid(), os.getgid(), 0o770],
+                       "/root-owned": [0, 0, 0o750],
+                       "/foreign-owned": [os.getuid() + 1, os.getgid() + 1, 0o700]},
+          "custom tmpfs applies caller defaults and explicit numeric ownership and modes")
+    check(True, "custom tmpfs supports nested mounts in reverse order, workdir, and independent capacity limits")
+
+    config = base / "tmpfs.toml"
+    config.write_text("""version = 1
+[[tmpfs]]
+target = "/cache/nested"
+mode = 0o750
+[[tmpfs]]
+target = "/cache"
+[[tmpfs]]
+target = "/configured"
+uid = 0
+gid = 0
+mode = 0o755
+""")
+    out, _ = run(["python3", "-c", """import os,pathlib,stat
+assert sorted(p.name for p in pathlib.Path('/cache').iterdir())==['nested']
+assert not list(pathlib.Path('/cache/nested').iterdir())
+assert stat.S_IMODE(os.stat('/cache/nested').st_mode)==0o750
+info=os.stat('/configured')
+assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(0,0,0o755)
+info=os.stat('/cli-added')
+assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(os.getuid(),os.getgid(),0o700)
+pathlib.Path('/cli-added/output').write_text('private')
+print('configured-tmpfs-ok')
+"""], ["--tmpfs", "dst=/cli-added"], config=config)
+    check(out.strip() == "configured-tmpfs-ok", "TOML tmpfs and CLI additions combine, and prior guest writes do not persist")
+
+    tmpfs_share = base / "tmpfs-share"
+    covered = tmpfs_share / "cache"
+    covered.mkdir(parents=True)
+    tmpfs_share.chmod(0o751)
+    covered.chmod(0o750)
+    host_file = covered / "host-only"
+    host_file.write_text("host-data")
+    host_file.chmod(0o640)
+    preserved = {p: p.stat() for p in (tmpfs_share, covered, host_file)}
+    out, _ = run(["python3", "-c", """import errno,os,pathlib,stat
+root=pathlib.Path('/srv/readonly/cache')
+assert not list(root.iterdir())
+assert not (root/'host-only').exists()
+assert pathlib.Path('/srv/alias/cache/host-only').read_text()=='host-data'
+info=root.stat()
+assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(os.getuid(),os.getgid(),0o700)
+(root/'guest-only').write_text('private-data')
+try: pathlib.Path('/srv/readonly/denied').write_text('forbidden')
+except OSError as e: assert e.errno==errno.EROFS,e
+else: raise AssertionError('read-only tmpfs parent writable')
+print('shared-tmpfs-ok')
+"""], ["--mount", f"src={tmpfs_share},dst=/srv/readonly,ro",
+        "--mount", f"src={tmpfs_share},dst=/srv/alias,ro",
+        "--tmpfs", "target=/srv/readonly/cache"])
+    check(out.strip() == "shared-tmpfs-ok", "custom tmpfs hides a read-only shared subtree while preserving its other alias")
+    check(host_file.read_text() == "host-data" and sorted(p.name for p in covered.iterdir()) == ["host-only"] and
+          not (tmpfs_share / "denied").exists(), "custom tmpfs writes do not reach the covered host directory")
+    for path, before in preserved.items():
+        after = path.stat()
+        check((after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_mtime_ns, after.st_ctime_ns) ==
+              (before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+              f"custom tmpfs preserves covered host metadata: {path.name}")
+
+    gnupg = home / ".gnupg"
+    gnupg.mkdir(mode=0o700)
+    keyring = gnupg / "pubring.kbx"
+    keyring.write_bytes(b"fixture-public-keyring")
+    keyring.chmod(0o600)
+    (gnupg / "host-private").write_bytes(b"fixture-hidden-file")
+    gnupg_before = {p: p.stat() for p in (gnupg, keyring, gnupg / "host-private")}
+    gnupg_config = base / "gnupg.toml"
+    gnupg_config.write_text("""version = 1
+[[tmpfs]]
+target = "~/.gnupg"
+mode = 0o700
+[[mounts]]
+source = "~/.gnupg/pubring.kbx"
+target = "~/.gnupg/pubring.kbx"
+mode = "ro"
+""")
+    for home_mode in ("ephemeral", "shared"):
+        out, _ = run(["python3", "-c", """import errno,os,pathlib,socket,stat
+root=pathlib.Path(os.environ['HOME'])/'.gnupg'
+assert os.getcwd()==str(root.parent/'project')
+assert sorted(p.name for p in root.iterdir())==['pubring.kbx']
+mounts={}
+for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+ left,right=line.split(' - ');mounts[left.split()[4]]=right.split()[0]
+assert mounts[str(root)]=='tmpfs'
+assert mounts[str(root/'pubring.kbx')]=='virtiofs'
+info=root.stat()
+assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(os.getuid(),os.getgid(),0o700)
+assert (root/'pubring.kbx').read_bytes()==b'fixture-public-keyring'
+try: (root/'pubring.kbx').write_bytes(b'forbidden')
+except OSError as e: assert e.errno==errno.EROFS,e
+else: raise AssertionError('public keyring bind is writable')
+(root/'trustdb.gpg').write_bytes(b'private-runtime-state')
+(root/'private-keys-v1.d').mkdir()
+(root/'private-keys-v1.d/runtime').write_bytes(b'private-runtime-file')
+with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as endpoint:
+ endpoint.bind(str(root/'S.gpg-agent'))
+ endpoint.listen()
+ assert stat.S_ISSOCK((root/'S.gpg-agent').stat().st_mode)
+print('gnupg-tmpfs-ok')
+"""], ["--home", home_mode], config=gnupg_config)
+        check(out.strip() == "gnupg-tmpfs-ok", f"private GnuPG tmpfs supports a read-only keyring bind with {home_mode} home")
+    check(sorted(p.name for p in gnupg.iterdir()) == ["host-private", "pubring.kbx"] and
+          keyring.read_bytes() == b"fixture-public-keyring" and
+          (gnupg / "host-private").read_bytes() == b"fixture-hidden-file" and
+          all((after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_mtime_ns, after.st_ctime_ns) ==
+              (before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_mtime_ns, before.st_ctime_ns)
+              for path, before in gnupg_before.items() for after in [path.stat()]),
+          "GnuPG runtime files, socket and directories do not persist or alter the host keyring")
+
+    layered_parent = base / "layered-parent"
+    layered_cache = layered_parent / "cache"
+    layered_cache.mkdir(parents=True)
+    (layered_cache / "covered-host").write_text("covered-data")
+    layered_output = base / "layered-output"
+    layered_scratch = layered_output / "scratch"
+    layered_scratch.mkdir(parents=True)
+    (layered_output / "shared-original").write_text("shared-data")
+    (layered_scratch / "deep-host").write_text("deep-data")
+    layered_before = {p: p.stat() for p in (layered_parent, layered_cache, layered_cache / "covered-host",
+                                          layered_output / "shared-original", layered_scratch, layered_scratch / "deep-host")}
+    output_before = layered_output.stat()
+    # Each layer changes the effective parent filesystem for the next one.
+    layers = [("--mount", f"src={layered_parent},dst=/data,ro"),
+              ("--tmpfs", "target=/data/cache"),
+              ("--mount", f"src={layered_output},dst=/data/cache/output,rw"),
+              ("--tmpfs", "target=/data/cache/output/scratch")]
+    for order, ordered_layers in (("forward", layers), ("reverse", list(reversed(layers)))):
+        out, _ = run(["python3", "-c", """import errno,os,pathlib,stat,sys
+cache=pathlib.Path('/data/cache');output=cache/'output';scratch=output/'scratch'
+mounts={}
+for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+ left,right=line.split(' - ');mounts[left.split()[4]]=right.split()[0]
+assert {p:mounts[p] for p in ['/data',str(cache),str(output),str(scratch)]}=={
+ '/data':'virtiofs',str(cache):'tmpfs',str(output):'virtiofs',str(scratch):'tmpfs'}
+for p in (cache,scratch):
+ info=p.stat()
+ assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(os.getuid(),os.getgid(),0o700)
+assert sorted(p.name for p in cache.iterdir())==['output']
+assert not list(scratch.iterdir())
+assert (output/'shared-original').read_text()=='shared-data'
+try: pathlib.Path('/data/denied').write_text('forbidden')
+except OSError as e: assert e.errno==errno.EROFS,e
+else: raise AssertionError('outer shared parent writable')
+(cache/'guest-only').write_text('private-data')
+(scratch/'guest-only').write_text('private-data')
+(output/('approved-'+sys.argv[1])).write_text('authorized-'+sys.argv[1])
+print('alternating-layers-ok')
+""", order], [item for layer in ordered_layers for item in layer])
+        check(out.strip() == "alternating-layers-ok", f"alternating read-only bind, tmpfs, writable bind and tmpfs layers in {order} order")
+    output_after = layered_output.stat()
+    check(sorted(p.name for p in layered_parent.iterdir()) == ["cache"] and
+          sorted(p.name for p in layered_cache.iterdir()) == ["covered-host"] and
+          sorted(p.name for p in layered_scratch.iterdir()) == ["deep-host"] and
+          sorted(p.name for p in layered_output.iterdir()) == ["approved-forward", "approved-reverse", "scratch", "shared-original"] and
+          (layered_cache / "covered-host").read_text() == "covered-data" and
+          (layered_output / "shared-original").read_text() == "shared-data" and
+          (layered_scratch / "deep-host").read_text() == "deep-data" and
+          all((layered_output / ("approved-" + order)).read_text() == "authorized-" + order for order in ("forward", "reverse")) and
+          (output_after.st_ino, output_after.st_uid, output_after.st_gid, output_after.st_mode) ==
+          (output_before.st_ino, output_before.st_uid, output_before.st_gid, output_before.st_mode) and
+          all((after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_mtime_ns, after.st_ctime_ns) ==
+              (before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_mtime_ns, before.st_ctime_ns)
+              for path, before in layered_before.items() for after in [path.stat()]),
+          "alternating layers persist only explicit writable-child writes and preserve covered host paths")
 
     single_file = base / "single-file"
     single_file.write_text("original")

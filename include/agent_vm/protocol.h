@@ -4,16 +4,17 @@
 
 /* Native endian, same-architecture host/guest. Strings are u32 length + bytes,
  * without NUL. Header is followed by home, cwd, then argc and envc strings.
- * Each environment string is KEY=VALUE. Maximum complete config: 1 MiB. */
+ * Each environment string is KEY=VALUE, followed by socket_count target strings.
+ * Socket i connects to AVM_SOCKET_PORT_BASE + i. Maximum complete config: 1 MiB. */
 #define AVM_SPEC_MAGIC 0x41564d31u
-#define AVM_SPEC_VERSION 1u
+#define AVM_SPEC_VERSION 2u
 #define AVM_SPEC_MAX (1024u * 1024u)
 #define AVM_FLAG_NETWORK 1u
-#define AVM_FLAG_SSH 2u
 #define AVM_CONTROL_PORT 1024u
-#define AVM_SSH_PORT 1025u
+#define AVM_SOCKET_PORT_BASE 1025u
+#define AVM_SOCKET_MAX 256u
 
-/* Internal SSH relay transport over vsock: each frame starts with one
+/* Internal Unix stream relay transport over vsock: each frame starts with one
  * network-byte-order uint32_t. DATA has 1..MAX following bytes; EOF and ACK
  * carry no payload. Only host -> guest may send ACK, after both streams have
  * drained and both logical EOFs have been handled. The host keeps its vsock
@@ -28,25 +29,28 @@
 #define AVM_BOOTSTRAP "/.agent-vm/bootstrap"
 #define AVM_NEW_ROOT "/.agent-vm/root"
 #define AVM_MOUNT_MAGIC 0x41564d46u
-#define AVM_MOUNT_VERSION 1u
+#define AVM_MOUNT_VERSION 3u
 #define AVM_MOUNT_TMPFS 1u
 #define AVM_MOUNT_DIRECTORY 2u
 #define AVM_MOUNT_FILE 3u
+#define AVM_MOUNT_USER_TMPFS 4u
 #define AVM_EXPORT_TAG "/.agent-vm/exports"
 /* Native endian: header, then count entries of four u32 values (kind, mode,
  * uid, gid) followed by length-prefixed target and object-path strings. Object
  * paths are relative to AVM_EXPORT_TAG's root (with a leading slash). tmp_mib
  * is a per-filesystem limit. Two devices (bootstrap and object catalog) avoid
  * exhausting libkrun's IRQ budget as the number of configured mounts grows.
- * All host access restrictions are enforced before exporting any object. */
+ * All host access restrictions are enforced before exporting any object.
+ * Built-in TMPFS entries precede exports and USER_TMPFS entries; the latter
+ * are interleaved in parent-before-child order. */
 struct avm_mount_header {
     uint32_t magic, version, count, tmp_mib;
 };
 #define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control.sock"
-#define AVM_SSH_SOCKET "/.agent-vm/ipc/ssh.sock"
+#define AVM_SOCKET_PREFIX "/.agent-vm/ipc/socket-"
 
 struct avm_spec_header {
-    uint32_t magic, version, uid, gid, flags, argc, envc, reserved;
+    uint32_t magic, version, uid, gid, flags, argc, envc, socket_count;
 };
 #define AVM_CONTROL_MAGIC 0x41564331u
 #define AVM_CONTROL_ACK_MAGIC 0x41564332u

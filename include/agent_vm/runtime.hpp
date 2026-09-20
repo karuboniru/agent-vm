@@ -23,7 +23,7 @@ void install_vmm_seccomp();
 
 struct NetworkProcess { int fd = -1; pid_t pid = -1; };
 NetworkProcess start_passt(const RunSpec& spec);
-pid_t start_ssh_broker(const std::string& listen_path, const std::string& upstream_path);
+pid_t start_socket_broker(const std::string& listen_path, const std::string& upstream_path);
 // Both helpers must exit when their parent dies and close all unrelated FDs.
 void stop_child(pid_t pid);
 }

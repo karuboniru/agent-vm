@@ -402,6 +402,26 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     std::sort(mounts.begin(), mounts.end(), [](const auto& a, const auto& b) {
         return a.spec.target.size() < b.spec.target.size();
     });
+    auto tmpfs = spec.tmpfs;
+    for (const auto& mount : tmpfs) {
+        check_absolute(mount.target);
+        if (mount.uid == UINT32_MAX || mount.gid == UINT32_MAX || (mount.mode & ~07777u))
+            throw std::runtime_error("invalid tmpfs ownership or mode: " + mount.target);
+    }
+    std::sort(tmpfs.begin(), tmpfs.end(), [](const auto& a, const auto& b) {
+        return a.target.size() < b.target.size();
+    });
+    struct Layer {
+        std::string target;
+        const PinnedMount* bind;
+        const TmpfsSpec* tmpfs;
+    };
+    std::vector<Layer> layers;
+    for (const auto& mount : mounts) layers.push_back({mount.spec.target, &mount, nullptr});
+    for (const auto& mount : tmpfs) layers.push_back({mount.target, nullptr, &mount});
+    std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
+        return a.target.size() < b.target.size();
+    });
     std::vector<Mask> masks;
     std::vector<Fd> mask_pins;
     for (const auto& path : spec.mask_sources) {
@@ -505,9 +525,8 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     make_dirs(root.fd, spec.home, 0700);
     make_dirs(root.fd, "/run/user/" + std::to_string(spec.uid), 0700);
 
-    for (const auto& m : mounts) placeholder(root.fd, m.spec.target, m.directory);
-    // Creating all placeholders before shared binds prevents host filesystem
-    // mutation. A nested target hidden by a shared ancestor must already exist.
+    // Masks outside shares have private placeholders. Shared mask targets must
+    // already exist; user mount placeholders are prepared per layer below.
     for (const auto& path : spec.mask_targets) {
         bool shared = false;
         for (const auto& m : mounts) shared |= within(path, m.spec.target);
@@ -553,9 +572,33 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     }
 
     bind_fd(root.fd, usr.fd, "/usr", true, true);
-    // Ancestors are mounted first. Each explicit child gets its own mode;
-    // recursively locking a parent again here would override rw children.
-    for (const auto& m : mounts) bind_fd(root.fd, m.fd.fd, m.spec.target, m.directory, m.spec.read_only);
+    // Private tmpfs staging provides mountpoints for explicit bind children.
+    // Never create a placeholder when the effective parent is a host share.
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto& layer = layers[i];
+        const Layer* parent = nullptr;
+        for (size_t j = 0; j < i; ++j)
+            if (within(layer.target, layers[j].target)) parent = &layers[j];
+        if (!parent) {
+            placeholder(root.fd, layer.target, layer.tmpfs || layer.bind->directory);
+        } else if (parent->tmpfs) {
+            Fd private_parent = target_fd(root.fd, parent->target);
+            placeholder(private_parent.fd, layer.target.substr(parent->target.size()),
+                        layer.tmpfs || layer.bind->directory);
+        }
+        if (layer.bind) {
+            bind_fd(root.fd, layer.bind->fd.fd, layer.target, layer.bind->directory, layer.bind->spec.read_only);
+        } else {
+            Fd target = target_fd(root.fd, layer.target);
+            if (!S_ISDIR(info(target.fd).st_mode))
+                throw std::runtime_error("tmpfs target is not a directory: " + layer.target);
+            if (mount("tmpfs", fd_path(target.fd).c_str(), "tmpfs", MS_NOSUID | MS_NODEV,
+                      "size=64m,nr_inodes=65536,mode=0755")) fail("stage private tmpfs " + layer.target);
+        }
+    }
+    // Seal only the staging roots; separately authorized writable bind children
+    // retain their own policy. Guest ownership applies to the guest tmpfs only.
+    for (const auto& mount : tmpfs) attributes(root.fd, mount.target, MOUNT_ATTR_RDONLY, false);
     // DNS is a separate private bind so guest DHCP can write it after the root
     // filesystem containing /etc becomes read-only.
     Fd resolv = target_fd(root.fd, "/.agent-vm/resolv.conf");
@@ -592,20 +635,23 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // never export a pinned original source: it bypasses masks and child binds.
     struct Object { std::string target, path; };
     std::vector<Object> objects;
+    struct GuestMount {
+        uint32_t kind, mode, uid, gid;
+        std::string target, object;
+    };
+    std::vector<GuestMount> guest_mounts;
     std::string manifest(sizeof(avm_mount_header), '\0');
-    uint32_t entries = 0;
     auto number = [&](uint32_t value) { manifest.append(reinterpret_cast<const char*>(&value), sizeof(value)); };
     auto string = [&](const std::string& value) { number(static_cast<uint32_t>(value.size())); manifest += value; };
     auto entry = [&](uint32_t kind, const std::string& target, const std::string& object,
                      uint32_t mode = 0, uint32_t uid = 0, uint32_t gid = 0) {
-        number(kind); number(mode); number(uid); number(gid); string(target); string(object);
-        if (manifest.size() > AVM_SPEC_MAX) throw std::runtime_error("mount specification exceeds 1 MiB");
-        ++entries;
+        guest_mounts.push_back({kind, mode, uid, gid, target, object});
     };
     entry(AVM_MOUNT_TMPFS, "/tmp", "", 01777);
     entry(AVM_MOUNT_TMPFS, "/var/tmp", "", 01777);
     entry(AVM_MOUNT_TMPFS, "/run", "", 0755);
     entry(AVM_MOUNT_TMPFS, spec.home, "", 0700, spec.uid, spec.gid);
+    const auto builtin_mounts = guest_mounts.size();
     auto export_object = [&](const std::string& target, bool readonly_root = false) {
         Fd source = target_fd(root.fd, target);
         bool directory = S_ISDIR(info(source.fd).st_mode);
@@ -635,7 +681,18 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
         for (const auto& m : mounts) shared |= within(path, m.spec.target) && path != m.spec.target;
         if (!shared) export_object(path);
     }
-    avm_mount_header mount_header{AVM_MOUNT_MAGIC, AVM_MOUNT_VERSION, entries, spec.tmp_mib};
+    for (const auto& mount : tmpfs)
+        entry(AVM_MOUNT_USER_TMPFS, mount.target, "", mount.mode, mount.uid, mount.gid);
+    std::stable_sort(guest_mounts.begin() + builtin_mounts, guest_mounts.end(), [](const auto& a, const auto& b) {
+        return a.target.size() < b.target.size();
+    });
+    for (const auto& mount : guest_mounts) {
+        number(mount.kind); number(mount.mode); number(mount.uid); number(mount.gid);
+        string(mount.target); string(mount.object);
+        if (manifest.size() > AVM_SPEC_MAX) throw std::runtime_error("mount specification exceeds 1 MiB");
+    }
+    avm_mount_header mount_header{AVM_MOUNT_MAGIC, AVM_MOUNT_VERSION,
+                                 static_cast<uint32_t>(guest_mounts.size()), spec.tmp_mib};
     std::memcpy(manifest.data(), &mount_header, sizeof(mount_header));
 
     // The boot export contains only what libkrun's init and our helper need.

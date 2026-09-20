@@ -37,7 +37,7 @@ static void stop_worker(int signal_number)
 }
 
 /* The guest supervisor may have control sockets and executable/spec FDs open.
- * None of those descriptors belong in the SSH relay. */
+ * None of those descriptors belong in a socket relay. */
 static void close_inherited_fds(int keep)
 {
 #ifdef SYS_close_range
@@ -260,7 +260,7 @@ static void pump_streams(int client, int remote)
     }
 }
 
-static void run_worker(int client, pid_t parent)
+static void run_worker(int client, pid_t parent, uint32_t port)
 {
     struct sigaction action = {.sa_handler = stop_worker};
     sigemptyset(&action.sa_mask);
@@ -281,7 +281,7 @@ static void run_worker(int client, pid_t parent)
         _exit(1);
     struct sockaddr_vm address = {
         .svm_family = AF_VSOCK,
-        .svm_port = AVM_SSH_PORT,
+        .svm_port = port,
         .svm_cid = VMADDR_CID_HOST
     };
     if (connect(remote, (const struct sockaddr *)&address, sizeof(address)) < 0) {
@@ -319,10 +319,83 @@ static void reap_workers(pid_t workers[MAX_WORKERS], size_t *count)
     }
 }
 
-static void relay_supervisor(const char *path, int ready_fd, pid_t parent)
+static int socket_parent(const char *path, bool create, uid_t uid, gid_t gid)
 {
-    int listener = -1, signal_fd = -1, error = 0;
+    if (!path || path[0] != '/' || !path[1]) {
+        errno = EINVAL;
+        return -1;
+    }
+    char copy[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    if (strlen(path) >= sizeof(copy)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(copy, path, strlen(path) + 1);
+    /* Validate all components before creating any directory. */
+    for (const char *part = path + 1;;) {
+        const char *end = strchr(part, '/');
+        size_t length = end ? (size_t)(end - part) : strlen(part);
+        if (!length || (length == 1 && part[0] == '.') ||
+            (length == 2 && part[0] == '.' && part[1] == '.')) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (!end)
+            break;
+        part = end + 1;
+    }
+    int directory = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0)
+        return -1;
+    char *part = copy + 1, *end;
+    while ((end = strchr(part, '/'))) {
+        *end = '\0';
+        bool created = false;
+        if (create) {
+            if (mkdirat(directory, part, 0700) == 0)
+                created = true;
+            else if (errno != EEXIST)
+                goto failed;
+        }
+        int next = openat(directory, part, (created ? O_RDONLY : O_PATH) |
+                          O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next < 0)
+            goto failed;
+        if (created && (fchown(next, uid, gid) < 0 || fchmod(next, 0700) < 0)) {
+            int error = errno;
+            close(next);
+            errno = error;
+            goto failed;
+        }
+        close(directory);
+        directory = next;
+        part = end + 1;
+    }
+    return directory;
+
+failed: {
+    int error = errno;
+    close(directory);
+    errno = error;
+    return -1;
+}
+}
+
+int avm_relay_prepare(const char *socket_path, uid_t uid, gid_t gid)
+{
+    int directory = socket_parent(socket_path, true, uid, gid);
+    if (directory < 0)
+        return -1;
+    close(directory);
+    return 0;
+}
+
+static void relay_supervisor(const char *path, uint32_t port, int ready_fd, pid_t parent)
+{
+    int listener = -1, signal_fd = -1, parent_fd = -1, error = 0;
     bool bound = false;
+    struct stat bound_status;
+    const char *name = strrchr(path, '/') + 1;
     pid_t workers[MAX_WORKERS];
     size_t count = 0;
     close_inherited_fds(ready_fd);
@@ -353,22 +426,25 @@ static void relay_supervisor(const char *path, int ready_fd, pid_t parent)
     signal_fd = signalfd(-1, &signals, SFD_CLOEXEC | SFD_NONBLOCK);
     if (signal_fd < 0)
         goto failed;
+    parent_fd = socket_parent(path, false, 0, 0);
+    if (parent_fd < 0 || fchdir(parent_fd) < 0)
+        goto failed;
     listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (listener < 0)
         goto failed;
     struct sockaddr_un address = {.sun_family = AF_UNIX};
-    size_t length = strlen(path);
-    if (!length || length >= sizeof(address.sun_path)) {
-        errno = length ? ENAMETOOLONG : EINVAL;
-        goto failed;
-    }
-    memcpy(address.sun_path, path, length + 1);
-    umask(0077);
+    size_t length = strlen(name);
+    memcpy(address.sun_path, name, length + 1);
+    /* The isolated relay's cwd anchors bind to the verified parent inode.
+     * This also avoids following replacement symlinks in the original path. */
+    umask(0177);
     if (bind(listener, (const struct sockaddr *)&address,
              (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1)) < 0)
         goto failed;
+    if (fstatat(parent_fd, name, &bound_status, AT_SYMLINK_NOFOLLOW) < 0)
+        goto failed;
     bound = true;
-    if (chmod(path, 0600) < 0 || listen(listener, (int)MAX_WORKERS) < 0)
+    if (listen(listener, (int)MAX_WORKERS) < 0)
         goto failed;
     if (report_ready(ready_fd, 0) < 0)
         goto finished;
@@ -413,7 +489,8 @@ static void relay_supervisor(const char *path, int ready_fd, pid_t parent)
                 if (child == 0) {
                     close(listener);
                     close(signal_fd);
-                    run_worker(client, supervisor);
+                    close(parent_fd);
+                    run_worker(client, supervisor, port);
                 }
                 close(client);
                 if (child < 0)
@@ -438,14 +515,22 @@ finished:
         (void)kill(workers[i], SIGTERM);
     for (size_t i = 0; i < count; ++i)
         while (waitpid(workers[i], NULL, 0) < 0 && errno == EINTR) {}
-    if (bound)
-        (void)unlink(path);
+    if (bound) {
+        struct stat current;
+        if (fstatat(parent_fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISSOCK(current.st_mode) && current.st_dev == bound_status.st_dev &&
+            current.st_ino == bound_status.st_ino)
+            (void)unlinkat(parent_fd, name, 0);
+    }
+    if (parent_fd >= 0)
+        close(parent_fd);
     _exit(error ? 1 : 0);
 }
 
-pid_t avm_relay_start(const char *socket_path)
+pid_t avm_relay_start(const char *socket_path, uint32_t port)
 {
-    if (!socket_path) {
+    if (!socket_path || socket_path[0] != '/' ||
+        port < AVM_SOCKET_PORT_BASE || port - AVM_SOCKET_PORT_BASE >= AVM_SOCKET_MAX) {
         errno = EINVAL;
         return -1;
     }
@@ -456,7 +541,7 @@ pid_t avm_relay_start(const char *socket_path)
     pid_t child = fork();
     if (child == 0) {
         close(readiness[0]);
-        relay_supervisor(socket_path, readiness[1], parent);
+        relay_supervisor(socket_path, port, readiness[1], parent);
     }
     int saved = errno;
     close(readiness[1]);

@@ -61,6 +61,19 @@ static bool path_valid(const char *path)
         p = end + 1;
     }
 }
+static bool within(const char *path, const char *parent)
+{
+    size_t size = strlen(parent);
+    return !strncmp(path, parent, size) && (!path[size] || path[size] == '/');
+}
+static bool protected_target(const char *path)
+{
+    const char *protected[] = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
+        "/.oldroot", "/bin", "/sbin", "/lib", "/lib64", "/ipc"};
+    for (size_t i = 0; i < sizeof(protected) / sizeof(protected[0]); ++i)
+        if (within(path, protected[i]) || within(protected[i], path)) return true;
+    return false;
+}
 static int target_fd(int root, const char *path)
 {
     struct open_how how = {.flags = O_PATH | O_CLOEXEC,
@@ -73,8 +86,8 @@ static void fd_path(int fd, char path[64])
 {
     snprintf(path, 64, "/proc/self/fd/%d", fd);
 }
-/* Called only before any host share is installed: creating placeholders must
- * never modify shared host directories. Later mount targets are opened only. */
+/* Create placeholders only on guest-native filesystems. Targets within a host
+ * share must already exist and are opened without creating anything. */
 static void placeholder(int root, const char *path, bool directory)
 {
     char *copy = strdup(path + 1), *save = NULL;
@@ -107,6 +120,13 @@ static void mount_at(int root, const char *path, const char *source, const char 
     if (mount(source, destination, type, flags, options) < 0) fail(path);
     close(fd);
 }
+static void mount_tmpfs(int root, const struct entry *e, uint32_t tmp_mib)
+{
+    char options[160];
+    snprintf(options, sizeof(options), "size=%um,nr_inodes=65536,mode=%o,uid=%u,gid=%u",
+             tmp_mib, e->mode, e->uid, e->gid);
+    mount_at(root, e->target, "tmpfs", "tmpfs", MS_NOSUID | MS_NODEV, options);
+}
 
 void avm_mount_filesystems(void)
 {
@@ -131,18 +151,28 @@ void avm_mount_filesystems(void)
     if (!count || count > (r.size - r.offset) / 24 || !tmp_mib) invalid();
     struct entry *entries = calloc(count, sizeof(*entries));
     if (!entries) fail("allocate entries");
-    bool exports_started = false;
+    bool layers_started = false;
     for (uint32_t i = 0; i < count; ++i) {
         struct entry *e = &entries[i];
         e->kind = number(&r); e->mode = number(&r); e->uid = number(&r); e->gid = number(&r);
         e->target = string(&r); e->object = string(&r);
         if (!path_valid(e->target) || e->uid == UINT32_MAX || e->gid == UINT32_MAX) invalid();
         if (e->kind == AVM_MOUNT_TMPFS) {
-            if (exports_started || e->object[0] || (e->mode & ~07777u)) invalid();
-        } else {
-            exports_started = true;
-            if ((e->kind != AVM_MOUNT_DIRECTORY && e->kind != AVM_MOUNT_FILE) ||
-                !path_valid(e->object) || e->mode || e->uid || e->gid) invalid();
+            if (layers_started || e->object[0] || (e->mode & ~07777u)) invalid();
+            continue;
+        } else if (e->kind == AVM_MOUNT_DIRECTORY || e->kind == AVM_MOUNT_FILE) {
+            if (!path_valid(e->object) || e->mode || e->uid || e->gid) invalid();
+        } else if (e->kind == AVM_MOUNT_USER_TMPFS) {
+            if (e->object[0] || (e->mode & ~07777u) || protected_target(e->target)) invalid();
+        } else invalid();
+        layers_started = true;
+        for (uint32_t j = 0; j < i; ++j) {
+            const struct entry *prior = &entries[j];
+            // Layers must install parents first. Only shared mounts may cover
+            // built-in tmpfs, as happens when sharing the user's home.
+            if (((prior->kind != AVM_MOUNT_TMPFS || e->kind == AVM_MOUNT_USER_TMPFS) &&
+                 within(prior->target, e->target)) ||
+                (prior->kind == AVM_MOUNT_FILE && within(e->target, prior->target))) invalid();
         }
     }
     if (r.offset != r.size) invalid();
@@ -162,22 +192,32 @@ void avm_mount_filesystems(void)
         struct entry *e = &entries[i];
         if (e->kind != AVM_MOUNT_TMPFS) continue;
         placeholder(root, e->target, true);
-        char options[160];
-        snprintf(options, sizeof(options), "size=%um,nr_inodes=65536,mode=%o,uid=%u,gid=%u",
-                 tmp_mib, e->mode, e->uid, e->gid);
-        mount_at(root, e->target, "tmpfs", "tmpfs", MS_NOSUID | MS_NODEV, options);
-    }
-    // All placeholders precede shared mounts, including nested file targets.
-    for (uint32_t i = 0; i < count; ++i) {
-        struct entry *e = &entries[i];
-        if (e->kind == AVM_MOUNT_TMPFS) continue;
-        placeholder(root, e->target, e->kind == AVM_MOUNT_DIRECTORY);
+        mount_tmpfs(root, e, tmp_mib);
     }
     mount_at(root, "/.agent-vm/objects", AVM_EXPORT_TAG, "virtiofs", MS_NOSUID | MS_NODEV, NULL);
     int objects = target_fd(root, "/.agent-vm/objects");
     for (uint32_t i = 0; i < count; ++i) {
-        struct entry *e = &entries[i];
+        const struct entry *e = &entries[i], *parent = NULL;
         if (e->kind == AVM_MOUNT_TMPFS) continue;
+        for (uint32_t j = 0; j < i; ++j) {
+            const struct entry *prior = &entries[j];
+            // Later containing mounts hide earlier ones, including an export
+            // replacing or covering the built-in private home filesystem.
+            if (within(e->target, prior->target)) parent = prior;
+        }
+        if (!parent) placeholder(root, e->target, e->kind != AVM_MOUNT_FILE);
+        else if (parent->kind == AVM_MOUNT_TMPFS || parent->kind == AVM_MOUNT_USER_TMPFS) {
+            const char *relative = e->target + strlen(parent->target);
+            if (*relative) {
+                int native = target_fd(root, parent->target);
+                placeholder(native, relative, e->kind != AVM_MOUNT_FILE);
+                close(native);
+            }
+        }
+        if (e->kind == AVM_MOUNT_USER_TMPFS) {
+            mount_tmpfs(root, e, tmp_mib);
+            continue;
+        }
         int source = target_fd(objects, e->object);
         char source_path[64];
         fd_path(source, source_path);

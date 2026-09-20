@@ -7,12 +7,12 @@ tool sandbox as the ordinary invoking user; no sudo was needed.
 | Check | Result |
 | --- | --- |
 | CMake/Ninja RelWithDebInfo build | Passed, no compiler warnings |
-| `config-test` | 82 parser and policy checks passed |
+| `config-test` | 272 parser and policy checks passed |
 | `network-test` | Concurrent framed streams, 8 × 2 MiB, backpressure, half-close, reconnect, invalid frames, FD/worker/process-group cleanup passed |
 | `sandbox-test` | Seccomp denies dangerous operations while allowing threads |
-| `sandbox-test --integration` | Single-ID mapping, PID namespace, capabilities, read-only host policy placeholders, writable DNS, export-object masks and nested ro/rw, bootstrap contents, FD cleanup, bind-alias negative tests passed |
-| `integration_core.py` | 33 real-VM checks passed |
-| `integration_network.py` | Outbound TCP/UDP, published TCP/UDP, and SSH bridge cases passed |
+| `sandbox-test --integration` | Single-ID mapping, PID namespace, capabilities, read-only host policy placeholders, writable DNS, export-object masks and nested ro/rw, tmpfs-covered export isolation, bootstrap contents, FD cleanup, bind-alias negative tests passed |
+| `integration_core.py` | 47 real-VM checks passed |
+| `integration_network.py` | Outbound TCP/UDP, published TCP/UDP, SSH alias, and generic Unix socket bridge cases passed |
 | Relocated installation | `cmake --install --prefix /tmp/...`; installed executable found its libexec helper, started a VM, and read generated loader configuration |
 
 Core VM coverage includes literal argv/environment transport, non-inheritance
@@ -25,10 +25,22 @@ assembly coverage includes guest-native tmpfs for the root, home and temporary
 directories, per-filesystem ENOSPC limits, one path-tagged export catalog,
 single-file ro/rw aliases, long target paths, whole-file and private-path masks,
 and detachment of the guest's bootstrap root and catalog staging mount.
+Custom tmpfs coverage includes default and explicit UID/GID/mode, nested
+mount ordering, independent capacity limits, empty filesystems on each run,
+configuration and CLI combination, working directories, and writable tmpfs
+over read-only shares without modifying the covered host directory.
+Mixed-layer tests cover a temporary GnuPG directory with a read-only keyring
+bind under both ephemeral and shared home, plus alternating bind/tmpfs layers
+in both declaration orders. Only explicitly writable bind children persist
+writes; temporary files, directories and sockets do not change the host tree.
 
 Network tests use temporary local TCP/UDP/Unix echo services. The SSH test uses
 six concurrent 256 KiB streams and checks final data after half-close; it does
-not use real SSH credentials or a public network endpoint. Unpublished UDP
+not use real SSH credentials or a public network endpoint. Generic forwarding
+tests exercise independent routes, concurrent streams, upstream socket
+replacement, root-created user-owned parent directories, shared-directory
+permissions, custom tmpfs socket destinations (including over read-only shares),
+and refusal to replace existing targets. Unpublished UDP
 ports remain unbound even when a matching TCP port is published.
 
 Integration findings affected the implementation:

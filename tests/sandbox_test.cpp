@@ -156,6 +156,55 @@ static void nested_mount_modes_test() {
     }
     std::cout << "nested mount modes passed\n";
 }
+static void tmpfs_export_test() {
+    Fixture fixture;
+    fs::create_directory(fixture.source / "cache");
+    write_file(fixture.source / "cache/host-only", "host content");
+    auto s = fixture.run_spec();
+    s.mounts = {{fixture.source.string(), "/work", true}};
+    write_file(fixture.base / "selected", "selected data");
+    write_file(fixture.base / "output", "initial");
+    s.mounts.push_back({(fixture.base / "selected").string(), "/work/cache/selected", true});
+    s.mounts.push_back({(fixture.base / "output").string(), "/work/cache/output", false});
+    s.tmpfs = {{"/work/cache/nested", s.uid, s.gid, 0700},
+               {"/work/cache", s.uid, s.gid, 0750}};
+    struct stat before{};
+    require(stat((fixture.source / "cache").c_str(), &before) == 0, "stat tmpfs fixture failed");
+    require(child_status([&] {
+        fixture.enter(s);
+        require(!fs::exists("/work/cache/host-only") && fs::is_empty("/work/cache/nested"),
+                "covered host tmpfs target remains visible to VMM");
+        bool found = false;
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            const auto tree = object.path() / "root";
+            if (!fs::exists(tree / "public")) continue;
+            found = true;
+            require(!fs::exists(tree / "cache/host-only") && fs::is_empty(tree / "cache/nested"),
+                    "object catalog exposes tmpfs-covered host content");
+            require(read_file((tree / "cache/selected").c_str()) == "selected data",
+                    "tmpfs staging hid an authorized child bind");
+            int selected = open((tree / "cache/selected").c_str(), O_WRONLY);
+            require(selected == -1 && errno == EROFS, "read-only tmpfs child bind became writable");
+            write_file(tree / "cache/output", "authorized output");
+            int fd = open((tree / "cache/new").c_str(), O_WRONLY | O_CREAT, 0600);
+            require(fd == -1 && (errno == EROFS || errno == EACCES), "VMM can write tmpfs placeholder");
+        }
+        require(found, "tmpfs containing share not exported");
+    }) == 0, "tmpfs export isolation failed");
+    struct stat after{};
+    require(stat((fixture.source / "cache").c_str(), &after) == 0, "stat tmpfs source after run failed");
+    require(before.st_ino == after.st_ino && before.st_uid == after.st_uid &&
+            before.st_gid == after.st_gid && before.st_mode == after.st_mode,
+            "tmpfs preparation modified host target metadata");
+    require(read_file((fixture.source / "cache/host-only").c_str()) == "host content",
+            "tmpfs preparation changed host contents");
+    require(!fs::exists(fixture.source / "cache/nested"), "nested tmpfs created a host mountpoint");
+    require(!fs::exists(fixture.source / "cache/selected") && !fs::exists(fixture.source / "cache/output"),
+            "bind children created host mountpoints below tmpfs");
+    require(read_file((fixture.base / "output").c_str()) == "authorized output",
+            "sealing tmpfs staging broke an authorized writable child");
+    std::cout << "tmpfs export isolation passed\n";
+}
 static void integration_test() {
     Fixture fixture;
     auto s = fixture.run_spec();
@@ -290,6 +339,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--integration") {
             integration_test();
             nested_mount_modes_test();
+            tmpfs_export_test();
         }
         std::cout << "sandbox tests passed\n";
         return 0;

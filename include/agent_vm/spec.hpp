@@ -11,6 +11,16 @@ struct MountSpec {
     std::string target; // Absolute, lexically normalized guest path.
     bool read_only = true;
 };
+struct SocketSpec {
+    std::string source; // Absolute, canonical host socket path.
+    std::string target; // Absolute, lexically normalized guest socket path.
+};
+struct TmpfsSpec {
+    std::string target; // Absolute, lexically normalized guest mount point.
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+    uint32_t mode = 0700;
+};
 struct PortSpec {
     std::string address = "127.0.0.1";
     uint16_t host_port = 0;
@@ -29,8 +39,9 @@ struct RunSpec {
     bool network = false;
     bool ssh_agent = false;
     bool debug = false;
-    std::string ssh_socket;
     std::vector<MountSpec> mounts;
+    std::vector<SocketSpec> sockets;
+    std::vector<TmpfsSpec> tmpfs;
     std::vector<std::string> mask_sources;
     std::vector<std::string> mask_targets;
     std::vector<PortSpec> ports;
