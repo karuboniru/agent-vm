@@ -51,10 +51,13 @@ mock -r fedora-45-x86_64 --uniqueext=agent-vm --buildsrpm \
   --spec "$PWD/agent-vm.spec" --sources "$PWD/build-rpm/sources" \
   --resultdir "$PWD/build-rpm/srpm"
 mock -r fedora-45-x86_64 --uniqueext=agent-vm --rebuild \
-  "$PWD/build-rpm/srpm/agent-vm-0.1.0-1.gitmaster.fc45.src.rpm" \
+  "$PWD"/build-rpm/srpm/agent-vm-*.src.rpm \
   --resultdir "$PWD/build-rpm/result"
 rpmlint agent-vm.spec build-rpm/result/*.rpm
 ```
+
+Use an empty SRPM output directory so the rebuild selects only the current
+snapshot. Forge macros include the snapshot date and branch in the RPM release.
 
 For a committed local checkout, replace the download with
 `git archive --format=tar.gz --prefix=agent-vm-master/ HEAD > build-rpm/sources/agent-vm-master.tar.gz`.
