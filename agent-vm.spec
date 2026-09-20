@@ -32,10 +32,12 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %prep
 %autosetup
 
-%build
+%conf
 # avm_core is an internal library, not an installed shared library.
 # Build services need neither KVM nor namespace access to produce the RPM.
 %cmake -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+
+%build
 %cmake_build
 
 %install
