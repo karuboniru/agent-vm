@@ -15,6 +15,11 @@ struct SocketSpec {
     std::string source; // Absolute, canonical host socket path.
     std::string target; // Absolute, lexically normalized guest socket path.
 };
+struct DbusSpec {
+    bool enabled = false;
+    std::string address; // Host D-Bus address; resolved only for enabled buses.
+    std::vector<std::string> args; // Per-proxy options, passed literally.
+};
 struct TmpfsSpec {
     std::string target; // Absolute, lexically normalized guest mount point.
     uint32_t uid = 0;
@@ -39,6 +44,7 @@ struct RunSpec {
     bool network = false;
     bool ssh_agent = false;
     bool debug = false;
+    DbusSpec dbus_user, dbus_system;
     std::vector<MountSpec> mounts;
     std::vector<SocketSpec> sockets;
     std::vector<TmpfsSpec> tmpfs;

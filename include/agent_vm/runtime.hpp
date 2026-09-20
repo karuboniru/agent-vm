@@ -22,8 +22,10 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
 void install_vmm_seccomp();
 
 struct NetworkProcess { int fd = -1; pid_t pid = -1; };
+// Returned fd is the readiness/lifetime pipe and must remain open while in use.
+NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path);
 NetworkProcess start_passt(const RunSpec& spec);
 pid_t start_socket_broker(const std::string& listen_path, const std::string& upstream_path);
-// Both helpers must exit when their parent dies and close all unrelated FDs.
+// Helpers must exit when their parent dies and close all unrelated FDs.
 void stop_child(pid_t pid);
 }

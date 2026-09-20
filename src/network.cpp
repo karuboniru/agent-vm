@@ -57,8 +57,8 @@ const char* stage_name(Stage stage) {
     case Stage::Descriptors: return "close unrelated descriptors";
     case Stage::Privileges: return "drop helper privileges";
     case Stage::Stdin: return "redirect helper stdin";
-    case Stage::Output: return "redirect passt stdout/stderr";
-    case Stage::Exec: return "execute /usr/bin/passt";
+    case Stage::Output: return "redirect helper output";
+    case Stage::Exec: return "execute helper";
     case Stage::Socket: return "create broker socket";
     case Stage::Bind: return "bind broker socket";
     case Stage::Listen: return "listen on broker socket";
@@ -444,6 +444,57 @@ void stop_child(pid_t pid) {
     }
     kill(pid, SIGKILL);
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path) {
+    socket_address(path);
+    int pair[2];
+    if (pipe2(pair, O_CLOEXEC) < 0) fail("create D-Bus readiness pipe");
+    Fd ready_read(pair[0]), ready_write(pair[1]);
+    move_above_stdio(ready_read); move_above_stdio(ready_write);
+    int status[2];
+    if (pipe2(status, O_CLOEXEC) < 0) fail("create D-Bus startup pipe");
+    Fd status_read(status[0]), status_write(status[1]);
+    move_above_stdio(status_read); move_above_stdio(status_write);
+    std::vector<std::string> args {"/usr/bin/xdg-dbus-proxy", "--fd=" + std::to_string(ready_write.get()),
+                                   spec.address, path, "--filter"};
+    args.insert(args.end(), spec.args.begin(), spec.args.end());
+    std::vector<char*> argv;
+    for (auto& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    pid_t parent = getpid(), child = fork();
+    if (child < 0) fail("fork xdg-dbus-proxy");
+    if (child == 0) {
+        if (!reset_signals() || !ignore_terminal_signals()) child_fail(status_write.get(), Stage::Signals);
+        if (setpgid(0, 0) < 0) child_fail(status_write.get(), Stage::ProcessGroup);
+        if (!parent_death(parent, SIGKILL)) child_fail(status_write.get(), Stage::ParentDeath);
+        if (!close_except({ready_write.get(), status_write.get()})) child_fail(status_write.get(), Stage::Descriptors);
+        if (!null_stream(STDIN_FILENO, O_RDONLY)) child_fail(status_write.get(), Stage::Stdin);
+        // Keep --log diagnostics off workload stdout.
+        if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) child_fail(status_write.get(), Stage::Output);
+        if (!drop_privileges()) child_fail(status_write.get(), Stage::Privileges);
+        if (fcntl(ready_write.get(), F_SETFD, 0) < 0) child_fail(status_write.get(), Stage::Descriptors);
+        char path_env[] = "PATH=/usr/bin:/bin", locale[] = "LC_ALL=C";
+        char* environment[] = {path_env, locale, nullptr};
+        execve(argv[0], argv.data(), environment);
+        child_fail(status_write.get(), Stage::Exec);
+    }
+    status_write.reset(); ready_write.reset();
+    wait_startup(status_read.get(), child, true, "xdg-dbus-proxy");
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        pollfd event{ready_read.get(), POLLIN, 0};
+        int result = poll(&event, 1, 100);
+        if (result < 0 && errno == EINTR) continue;
+        char byte;
+        if (result > 0 && (event.revents & POLLIN) && read(ready_read.get(), &byte, 1) == 1)
+            return {ready_read.release(), child};
+        if (result < 0 || (result > 0 && (event.revents & (POLLHUP | POLLERR))) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            stop_child(child);
+            throw std::runtime_error("xdg-dbus-proxy exited or timed out before readiness");
+        }
+    }
 }
 
 NetworkProcess start_passt(const RunSpec& spec) {

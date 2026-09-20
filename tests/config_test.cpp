@@ -92,6 +92,24 @@ int main() {
         check(!options.spec.network && !options.spec.ssh_agent, "network and SSH disabled by default");
         check(options.spec.command == std::vector<std::string>{"/bin/sh"}, "default shell");
         check(!options.spec.environment.contains("SSH_AUTH_SOCK"), "host SSH socket does not leak to environment");
+        auto dbus_config = root / "dbus.toml";
+        write(dbus_config, "[dbus.user]\nenabled = true\naddress = 'unix:path=/nonexistent/test-bus'\nargs = ['--talk=org.example.Service', '--call=org.example.Other=org.example.API.Read@/obj']\n[dbus.system]\nenabled = true\naddress = 'unix:path=/nonexistent/system-bus'\nargs = []\n");
+        auto dbus = parse({"--config", dbus_config.string()}).spec;
+        check(dbus.dbus_user.enabled && dbus.dbus_system.enabled && dbus.sockets.size() == 2,
+              "both D-Bus buses independently materialize socket channels without launching proxies in plan");
+        auto bus_target = "/run/user/" + std::to_string(getuid()) + "/dbus-user.socket";
+        check(dbus.environment.at("DBUS_SESSION_BUS_ADDRESS") == "unix:path=" + bus_target &&
+              dbus.environment.at("DBUS_SYSTEM_BUS_ADDRESS").ends_with("/dbus-system.socket"), "D-Bus guest addresses generated");
+        reject({"--config", dbus_config.string(), "-e", "DBUS_SESSION_BUS_ADDRESS=unix:path=/wrong"}, "D-Bus environment conflict");
+        for (auto arg : {"--fd=3", "--args=3", "unix:path=/extra", "--unknown", "--talk="}) {
+            write(dbus_config, std::string("[dbus.user]\nargs = ['") + arg + "']\n");
+            reject({"--config", dbus_config.string()}, "reject proxy control arguments and empty rules");
+        }
+        write(dbus_config, "[dbus.user]\nenabled = false\n[dbus.system]\nenabled = true\naddress = 'unix:path=/nonexistent/system-bus'\n");
+        auto system_bus = parse({"--config", dbus_config.string()}).spec;
+        check(system_bus.sockets.size() == 1 && !system_bus.environment.contains("DBUS_SESSION_BUS_ADDRESS"), "system bus independent of user bus");
+        write(dbus_config, "[dbus.user]\nenabeld = true\n");
+        reject({"--config", dbus_config.string()}, "unknown D-Bus fields rejected");
         check(avm::path_within("/a/b", "/a") && !avm::path_within("/ab", "/a"), "path component containment");
         check(avm::path_within("/a/b/../c", "/a/") && avm::path_within("/a", "/"), "normalized path containment");
 

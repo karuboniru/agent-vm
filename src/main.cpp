@@ -304,6 +304,7 @@ int doctor() {
     if (received != sizeof(error) || error) {
         std::cout << "FAIL user/mount namespace: " << (error ? std::strerror(error) : "probe failed") << "; check sandbox, LSM and container restrictions\n"; good = false;
     } else std::cout << "OK unprivileged user/mount namespaces\n";
+    std::cout << (!access("/usr/bin/xdg-dbus-proxy", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/xdg-dbus-proxy (required for D-Bus forwarding)\n";
     std::cout << (!access("/usr/bin/passt", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/passt (required for --network passt)\n";
     return good ? 0 : 1;
 }
@@ -345,7 +346,7 @@ int doctor() {
         std::cerr << "agent-vm: sandbox/VM: " << e.what() << '\n'; _exit(125);
     }
 }
-int run(const avm::RunSpec& spec) {
+int run(avm::RunSpec spec) {
     maximize_nofile();
     avm::validate_spec(spec);
     if (access("/dev/kvm", R_OK | W_OK)) system_error("/dev/kvm unavailable in this execution environment; run agent-vm doctor");
@@ -357,13 +358,13 @@ int run(const avm::RunSpec& spec) {
     struct RestoreSignals { sigset_t mask; ~RestoreSignals() { sigprocmask(SIG_SETMASK, &mask, nullptr); } } restore{previous};
     // Restore the caller's signal mask last, after terminal and directory cleanup.
     RuntimeDirectory runtime(spec);
-    write_spec(spec, runtime.path / "spec.bin");
-    write_worker_spec(spec, runtime.path / "worker.bin");
     Terminal terminal;
     Fd signals(signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK));
     if (signals.value < 0) system_error("signalfd");
     avm::NetworkProcess network;
     pid_t vm = -1;
+    std::vector<avm::NetworkProcess> proxies;
+    proxies.reserve(2);
     std::vector<pid_t> brokers;
     brokers.reserve(spec.sockets.size());
     auto cleanup = [&] {
@@ -372,8 +373,23 @@ int run(const avm::RunSpec& spec) {
         if (network.pid > 0) { avm::stop_child(network.pid); network.pid = -1; }
         for (auto& broker : brokers)
             if (broker > 0) { avm::stop_child(broker); broker = -1; }
+        for (auto& proxy : proxies) {
+            avm::stop_child(proxy.pid); proxy.pid = -1;
+            if (proxy.fd >= 0) { close(proxy.fd); proxy.fd = -1; }
+        }
     };
     try {
+        for (bool system : {false, true}) {
+            const auto& bus = system ? spec.dbus_system : spec.dbus_user;
+            if (!bus.enabled) continue;
+            auto path = (runtime.path / (system ? "dbus-system.sock" : "dbus-user.sock")).string();
+            proxies.push_back(avm::start_dbus_proxy(bus, path));
+            auto target = "/run/user/" + std::to_string(spec.uid) + (system ? "/dbus-system.socket" : "/dbus-user.socket");
+            for (auto& socket : spec.sockets) if (socket.target == target && socket.source.empty()) socket.source = path;
+        }
+        avm::validate_spec(spec);
+        write_spec(spec, runtime.path / "spec.bin");
+        write_worker_spec(spec, runtime.path / "worker.bin");
         if (spec.network) network = avm::start_passt(spec);
         for (size_t i = 0; i < spec.sockets.size(); ++i) {
             auto path = runtime.path / "ipc" / ("socket-" + std::to_string(i) + ".sock");
@@ -410,6 +426,7 @@ int run(const avm::RunSpec& spec) {
                 }
             };
             check_helper(network.pid, "passt");
+            for (auto& proxy : proxies) check_helper(proxy.pid, "xdg-dbus-proxy");
             for (size_t i = 0; i < brokers.size(); ++i)
                 check_helper(brokers[i], "socket broker for " + spec.sockets[i].target);
             if (access((runtime.path / "ipc/guest-ready").c_str(), F_OK) == 0) {

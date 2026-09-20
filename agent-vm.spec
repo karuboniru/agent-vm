@@ -25,6 +25,7 @@ BuildRequires:  cmake(tomlplusplus)
 
 # Launched with execve, so RPM's ELF dependency generator cannot detect it.
 Requires:       passt
+Recommends:     xdg-dbus-proxy
 
 %description
 agent-vm runs commands in rootless Linux microVMs using libkrun. It shares

@@ -338,3 +338,20 @@ GUEST_PROBE_PASS
 - libkrun 1.19 Unix backend 在 HUP 与 IN 同时发生时可能丢失尾部数据。因此 socket 内部通道使用 DATA/EOF/ACK，控制通道也等待 ACK 后才关闭；对外保留正常字节流和半关闭语义。
 - `tests/config_test.cpp` 覆盖解析和策略；`tests/network_test.cpp` 覆盖并发/背压/半关闭/非法帧/清理；`tests/sandbox_test.cpp --integration` 验证切根、FD 清理、权限、mask 和真实 bind 别名负测；两份 Python integration 脚本通过真实 VM 验证核心功能与网络/SSH。
 - 当前保留 VMM 私有 proc 和精确 KVM 节点；seccomp 是 denylist，而非完整 syscall allowlist。原始恶意 virtio-fs 协议审计、宿主 cgroup 总资源限制、持久磁盘配额、IPv6、多 NIC 和 DHCP 续租仍属后续工作。`--tmp-size` 分别限制各临时文件系统，不是总内存限额。
+
+## Filtered D-Bus forwarding
+
+`[dbus.user]` and `[dbus.system]` independently enable host-side xdg-dbus-proxy
+instances with literal per-bus filter arguments. Filtering is mandatory; callers
+cannot inject extra listeners or override lifecycle descriptors through arguments.
+Proxy sockets live outside the exported IPC directory in the private runtime.
+Only the existing framed brokers are reachable through authorized vsock ports.
+The supervisor waits for proxy readiness before creating brokers or launching the
+VM, monitors proxy exits and cleans up helpers on shutdown. Host proxy policy and
+upstream addresses are not serialized to the clean VMM worker; resolved socket
+mappings and guest bus environment values use the existing launch formats.
+
+Authentication reaches the bus through the host proxy with the invoking user's
+identity. The transport carries bytes, not SCM_RIGHTS; D-Bus methods requiring
+Unix file descriptors remain unsupported. Empty rules retain xdg-dbus-proxy's
+baseline bus access, rather than granting access to arbitrary service names.

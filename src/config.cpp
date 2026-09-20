@@ -260,7 +260,7 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
     toml::table root;
     try { root = toml::parse_file(file.string()); }
     catch (const toml::parse_error& e) { fail("configuration '" + file.string() + "': " + std::string(e.description())); }
-    keys(root, {"version", "vm", "filesystem", "mounts", "tmpfs", "sockets", "environment", "network", "ssh_agent"}, "");
+    keys(root, {"version", "vm", "filesystem", "mounts", "tmpfs", "sockets", "environment", "network", "ssh_agent", "dbus"}, "");
     if (auto n = root.get("version")) {
         if (!n->is_integer() || n->value<int64_t>() != 1) fail("configuration version must be 1");
     }
@@ -341,6 +341,18 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
         keys(*t, {"mode", "publish"}, "network.");
         if (auto v = string_at(*t, "mode")) network_mode(spec, *v);
         for (const auto& v : array_at(*t, "publish")) spec.ports.push_back(port_spec(v));
+    }
+    if (auto t = table_at(root, "dbus")) {
+        keys(*t, {"user", "system"}, "dbus.");
+        for (auto name : {"user", "system"}) {
+            if (auto bus = table_at(*t, name)) {
+                keys(*bus, {"enabled", "address", "args"}, std::string("dbus.") + name + ".");
+                auto& config = std::string(name) == "user" ? spec.dbus_user : spec.dbus_system;
+                if (auto v = bool_at(*bus, "enabled")) config.enabled = *v;
+                if (auto v = string_at(*bus, "address")) config.address = *v;
+                config.args = array_at(*bus, "args");
+            }
+        }
     }
     if (auto t = table_at(root, "ssh_agent")) {
         keys(*t, {"enabled"}, "ssh_agent.");
@@ -566,6 +578,32 @@ Options parse_options(int argc, char** argv) {
         spec.sockets.push_back({source_path(socket, host_cwd, spec.home, true), target});
         spec.environment["SSH_AUTH_SOCK"] = target;
     }
+    for (bool system : {false, true}) {
+        auto& bus = system ? spec.dbus_system : spec.dbus_user;
+        if (!bus.enabled) continue;
+        const char* key = system ? "DBUS_SYSTEM_BUS_ADDRESS" : "DBUS_SESSION_BUS_ADDRESS";
+        if (bus.address.empty()) bus.address = env(key);
+        if (bus.address.empty()) {
+            if (system) bus.address = "unix:path=/run/dbus/system_bus_socket";
+            else {
+                auto runtime = env("XDG_RUNTIME_DIR");
+                if (runtime.empty()) fail("dbus.user requires address, DBUS_SESSION_BUS_ADDRESS or XDG_RUNTIME_DIR");
+                // Escape address delimiters in the host runtime pathname.
+                const char* hex = "0123456789abcdef";
+                bus.address = "unix:path=";
+                for (unsigned char c : runtime + "/bus") {
+                    if (std::isalnum(c) || c == '/' || c == '_' || c == '-' || c == '.') bus.address += c;
+                    else { bus.address += '%'; bus.address += hex[c >> 4]; bus.address += hex[c & 15]; }
+                }
+            }
+        }
+        auto target = "/run/user/" + std::to_string(spec.uid) + (system ? "/dbus-system.socket" : "/dbus-user.socket");
+        auto value = "unix:path=" + target;
+        if (spec.environment.contains(key) && spec.environment.at(key) != value)
+            fail(std::string(key) + " conflicts with D-Bus forwarding");
+        spec.environment[key] = value;
+        spec.sockets.push_back({"", target}); // Materialized after proxy readiness, before worker serialization.
+    }
     if (spec.command.empty()) spec.command = {"/bin/sh"};
     deduplicate(spec.mask_sources); deduplicate(spec.mask_targets);
     validate_spec(spec);
@@ -573,6 +611,17 @@ Options parse_options(int argc, char** argv) {
 }
 
 void validate_spec(const RunSpec& spec) {
+    for (const auto* bus : {&spec.dbus_user, &spec.dbus_system}) {
+        if (bus->address.find('\0') != std::string::npos || (!bus->address.empty() && bus->address.front() == '-'))
+            fail("invalid D-Bus address");
+        for (const auto& arg : bus->args) {
+            bool allowed = arg == "--log" || arg == "--filter" || arg == "--sloppy-names";
+            for (auto prefix : {"--see=", "--talk=", "--own=", "--call=", "--broadcast="})
+                if (arg.starts_with(prefix) && arg.size() > std::string_view(prefix).size()) allowed = true;
+            if (!allowed || arg.find('\0') != std::string::npos)
+                fail("unsupported D-Bus proxy argument: " + arg);
+        }
+    }
     if (spec.cpus == 0 || spec.memory_mib == 0 || spec.tmp_mib == 0) fail("VM resources must be positive");
     if (!spec.network && !spec.ports.empty()) fail("port publishing requires --network passt");
     if (spec.home.empty() || spec.home[0] != '/' || normalize(spec.home) != spec.home) fail("home must be a normalized absolute path");
@@ -665,14 +714,19 @@ void validate_spec(const RunSpec& spec) {
     if (spec.sockets.size() > AVM_SOCKET_MAX) fail("too many forwarded sockets");
     std::vector<std::string> socket_targets;
     for (const auto& socket : spec.sockets) {
-        check_socket_path(socket.source, "source");
+        bool pending_bus = socket.source.empty() &&
+            ((spec.dbus_user.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-user.socket") ||
+             (spec.dbus_system.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-system.socket"));
+        if (!pending_bus) {
+            check_socket_path(socket.source, "source");
+            std::error_code error;
+            auto canonical = fs::canonical(socket.source, error);
+            if (error || normalize(canonical) != socket.source)
+                fail("socket source is missing or no longer canonical: " + socket.source);
+            if (!fs::is_socket(socket.source, error) || error)
+                fail("socket source is not an existing Unix socket: " + socket.source);
+        }
         check_socket_path(socket.target, "target");
-        std::error_code error;
-        auto canonical = fs::canonical(socket.source, error);
-        if (error || normalize(canonical) != socket.source)
-            fail("socket source is missing or no longer canonical: " + socket.source);
-        if (!fs::is_socket(socket.source, error) || error)
-            fail("socket source is not an existing Unix socket: " + socket.source);
         if (socket.target == "/run" || !path_within(socket.target, "/run")) check_target(socket.target, "socket");
         if (path_within(spec.home, socket.target) || path_within(spec.cwd, socket.target) ||
             path_within("/run/user/" + std::to_string(spec.uid), socket.target))
@@ -775,9 +829,14 @@ void print_plan(const RunSpec& spec) {
               << "Vsock: fixed control channel enabled; implicit vsock/TSI disabled; "
               << spec.sockets.size() << " authorized socket channels\n";
     for (const auto& socket : spec.sockets)
-        std::cout << "Socket: " << socket.source << " -> " << socket.target << '\n';
+        std::cout << "Socket: " << (socket.source.empty() ? "<filtered D-Bus proxy>" : socket.source) << " -> " << socket.target << '\n';
     for (const auto& port : spec.ports)
         std::cout << "Publish: " << port.address << ':' << port.host_port << ':' << port.guest_port << (port.udp ? "/udp\n" : "/tcp\n");
+    for (bool system : {false, true}) {
+        const auto& bus = system ? spec.dbus_system : spec.dbus_user;
+        std::cout << "D-Bus " << (system ? "system" : "user") << ": " << (bus.enabled ? "filtered" : "disabled") << '\n';
+        if (bus.enabled) for (const auto& arg : bus.args) std::cout << "  " << arg << '\n';
+    }
     std::cout << "SSH agent: " << (spec.ssh_agent ? "enabled (socket alias)" : "disabled") << "\nEnvironment names:";
     for (const auto& [key, value] : spec.environment) { (void)value; std::cout << ' ' << key; }
     std::cout << "\nCommand arguments: " << spec.command.size() << " (values omitted)\n";

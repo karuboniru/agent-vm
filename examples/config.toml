@@ -74,3 +74,18 @@ publish = []
 # --no-ssh-agent disables this alias only, not explicit [[sockets]] entries.
 # When disabled, environment.set may specify SSH_AUTH_SOCK for a custom forward.
 enabled = false
+
+# Optional filtered D-Bus forwarding; each bus is independently disabled by default.
+# Arguments are literal xdg-dbus-proxy per-bus options; --filter is always added.
+# No shell expansion. Empty args exposes only the proxy's baseline bus operations.
+[dbus.user]
+enabled = false
+args = ["--talk=org.freedesktop.Notifications"]
+# address = "unix:path=/run/user/1000/bus"
+# Otherwise uses host DBUS_SESSION_BUS_ADDRESS, then $XDG_RUNTIME_DIR/bus.
+
+[dbus.system]
+enabled = false
+args = ["--talk=org.freedesktop.UPower"]
+# address = "unix:path=/run/dbus/system_bus_socket"
+# Otherwise uses host DBUS_SYSTEM_BUS_ADDRESS, then the standard system socket.

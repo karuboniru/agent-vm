@@ -121,6 +121,26 @@ Targets must lie on a writable guest filesystem, such as `/run`, `/tmp`, `/var/t
 
 `--ssh-agent` (or `[ssh_agent].enabled = true`) is an alias for forwarding the host `SSH_AUTH_SOCK` to `/run/user/<uid>/ssh-agent.socket` and setting the guest `SSH_AUTH_SOCK` to that path. `--no-ssh-agent` disables only this alias, leaving explicit socket forwards intact. With the alias disabled, a custom forward can be paired with an explicit environment value, for example `--socket "src=$SSH_AUTH_SOCK,dst=/run/custom/agent.sock" -e SSH_AUTH_SOCK=/run/custom/agent.sock`.
 
+D-Bus forwarding requires `/usr/bin/xdg-dbus-proxy`. Configure each bus independently:
+
+```toml
+[dbus.user]
+enabled = true
+args = ["--talk=org.freedesktop.Notifications"]
+
+[dbus.system]
+enabled = true
+args = ["--call=org.freedesktop.UPower=org.freedesktop.DBus.Properties.GetAll@/org/freedesktop/UPower"]
+```
+
+Both default to disabled. Optional `address` selects a host D-Bus address; otherwise the host's `DBUS_SESSION_BUS_ADDRESS` / `DBUS_SYSTEM_BUS_ADDRESS` is used. User bus fallback is `$XDG_RUNTIME_DIR/bus` (requires that variable); system bus fallback is `/run/dbus/system_bus_socket`. Addresses are D-Bus address strings, without shell or tilde expansion.
+
+The runner always supplies `--filter`. `args` passes literal per-bus options: `--see=`, `--talk=`, `--own=`, `--call=`, `--broadcast=`, `--log`, `--sloppy-names`, and optional redundant `--filter`. See the [xdg-dbus-proxy manual](https://github.com/flatpak/xdg-dbus-proxy/blob/main/xdg-dbus-proxy.xml) for rule syntax. Empty rules retain the proxy's baseline bus operations only. Process-control options (`--fd`, `--args`), extra address/path pairs and unknown options are rejected. Invalid rule syntax is reported by the proxy at startup.
+
+Each enabled bus gets its own host proxy, readiness handshake and socket broker. The guest receives `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/dbus-user.socket` and/or `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/user/<uid>/dbus-system.socket`. Conflicting explicit environment settings and socket targets are errors. These channels count toward the socket limit and work with networking disabled. `plan` shows enabled buses and filter arguments without launching helpers. Proxy exit terminates the VM; shutdown stops proxies and removes the private runtime sockets.
+
+D-Bus forwarding uses the existing byte-stream relay: **Unix FD passing is unsupported**, so methods requiring file descriptors (including many portal APIs) are not supported. The proxy authenticates upstream as the invoking host user. Filtering controls access within that user's existing bus permissions.
+
 The workload's exit status is returned. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to the supervisor are forwarded to the guest process group; SIGWINCH updates the guest terminal size. Unresponsive shutdown is forcibly terminated after five seconds. Terminal state is restored on normal supervisor exit and handled signals. No process can restore terminal state after an uncatchable SIGKILL; use `stty sane` if an external kill leaves a terminal in raw mode.
 
 Before starting the VM and host helpers, `run` raises the host process's `RLIMIT_NOFILE` soft limit to its inherited hard limit. The VMM and helpers inherit it; this does not change the invoking shell's limits or the guest's limits.
@@ -163,6 +183,8 @@ Namespace and real VM acceptance tests, in an environment with KVM and namespace
 ./build/sandbox-test --integration
 python3 tests/integration_core.py
 python3 tests/integration_network.py
+# Requires dbus-daemon; add --daemon-prefix toolbox run if installed there.
+python3 tests/integration_dbus.py
 ```
 
 The integration tests use temporary homes/workspaces and local echo services. They do not use real SSH credentials or public services. The network tests retain their temporary logs on failure. A tool sandbox denial is an execution-environment restriction; run these tests outside that sandbox, rather than assuming the physical host lacks KVM.
