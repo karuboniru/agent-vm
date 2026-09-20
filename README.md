@@ -30,6 +30,37 @@ cmake --install build --prefix "$HOME/.local"
 
 Both `agent-vm` and its installed `libexec/agent-vm-guest` helper are needed. The current backend uses the libkrun 1.x API; libkrun 2.x is not supported.
 
+## Fedora RPM
+
+`agent-vm.spec` builds from a release tarball using Fedora's CMake macros,
+compiler hardening flags, and automatic ELF dependencies. `passt` is an explicit
+runtime dependency; the `libkrun` package pulls in its own firmware dependency.
+The internal core library is linked statically into the executable. Tests are
+disabled so build services do not need KVM or unprivileged user namespaces.
+
+With `mock` installed and configured for your user, build a release on Fedora 45:
+
+```sh
+mkdir -p build-rpm/{sources,srpm,result}
+curl -fL https://github.com/karuboniru/agent-vm/archive/refs/tags/v0.1.0/agent-vm-0.1.0.tar.gz \
+  -o build-rpm/sources/agent-vm-0.1.0.tar.gz
+mock -r fedora-45-x86_64 --uniqueext=agent-vm --buildsrpm \
+  --spec "$PWD/agent-vm.spec" --sources "$PWD/build-rpm/sources" \
+  --resultdir "$PWD/build-rpm/srpm"
+mock -r fedora-45-x86_64 --uniqueext=agent-vm --rebuild \
+  "$PWD/build-rpm/srpm/agent-vm-0.1.0-1.fc45.src.rpm" \
+  --resultdir "$PWD/build-rpm/result"
+rpmlint agent-vm.spec build-rpm/result/*.rpm
+```
+
+For a committed local checkout, replace the download with
+`git archive --format=tar.gz --prefix=agent-vm-0.1.0/ HEAD > build-rpm/sources/agent-vm-0.1.0.tar.gz`.
+The archive must contain the matching version's sources and `LICENSE`.
+Other Fedora targets need libkrun >= 1.19 and < 2 in their repositories.
+The package installs the command in `/usr/bin`, the guest helper in
+`/usr/libexec`, and the example configuration in `/usr/share/agent-vm`.
+User configuration remains opt-in; the example is not a system configuration file.
+
 ## Run commands
 
 ```sh
@@ -118,3 +149,7 @@ The initial validation results and exact coverage are recorded in [tests/VALIDAT
 | `guest/main.c` | Launch specification, guest identity, command supervision and control channel |
 | `guest/relay.c` | Guest SSH agent socket bridge |
 | `include/agent_vm/protocol.h` | Bounded launch/control/bridge formats |
+
+## License
+
+MIT; see [LICENSE](LICENSE).
