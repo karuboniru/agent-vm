@@ -58,6 +58,14 @@ with tempfile.TemporaryDirectory(prefix="agent-vm-core-test-") as directory:
             raise AssertionError(f"exit {p.returncode}, expected {expected}: {command!r}\nstdout={out!r}\nstderr={err!r}")
         return out.decode(), err.decode()
 
+    run(["/usr/bin/python3", "-c", """
+import os
+for path in ('/.agent-vm/ipc', '/ipc'):
+    assert not os.path.lexists(path), 'host IPC exposed: ' + path
+assert '/.agent-vm/ipc' not in open('/proc/self/mountinfo').read()
+"""])
+    check(True, "host IPC absent from guest filesystem and mount table")
+
     code = """import os,json,pathlib
 p=pathlib.Path('created');p.write_text('persistent')
 print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'cwd':os.getcwd(),'owner':p.stat().st_uid,'home':os.environ['HOME'],'private':os.getenv('AVM_TEST_PRIVATE'),'inherited':os.getenv('AVM_TEST_INHERIT'),'value':os.getenv('COMPLEX')}))

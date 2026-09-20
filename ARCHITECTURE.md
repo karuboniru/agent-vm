@@ -234,7 +234,7 @@ guest client → 配置的 guest socket target → guest relay
 ```c
 krun_disable_implicit_vsock(ctx);  // 每个 context 初始化时一次
 krun_add_vsock(ctx, 0);           // 不启用 INET / UNIX TSI
-krun_add_vsock_port2(ctx, P, "/ipc/socket-0.sock", false);
+krun_add_vsock_port2(ctx, P, "/.agent-vm/ipc/socket-0.sock", false);
 ```
 
 `false` 代表 guest 发起连接到 host Unix socket；反方向使用 true。这个 API 接收 pathname，不接收已连接 FD。使用 libkrun 用户态 Unix backend 时，不要求宿主 `/dev/vsock` 或 `/dev/vhost-vsock`；guest 需要 virtio-vsock。[Unix backend](https://github.com/libkrun/libkrun/blob/v1.19.0/src/devices/src/virtio/vsock/unix.rs)
@@ -344,7 +344,7 @@ GUEST_PROBE_PASS
 `[dbus.user]` and `[dbus.system]` independently enable host-side xdg-dbus-proxy
 instances with literal per-bus filter arguments. Filtering is mandatory; callers
 cannot inject extra listeners or override lifecycle descriptors through arguments.
-Proxy sockets live outside the exported IPC directory in the private runtime.
+Proxy sockets live in the private runtime. The IPC directory is also host/VMM-private and is never included in the virtio-fs bootstrap or object catalog. Control (port 1024), authorized brokers (ports 1025–1280), and dedicated one-shot readiness (port 1281) use explicit vsock mappings. Readiness is a guest connection to a private host listener, with no filesystem marker or variable-length payload; it is a lifecycle hint, not proof that the guest is trustworthy.
 Only the existing framed brokers are reachable through authorized vsock ports.
 The supervisor waits for proxy readiness before creating brokers or launching the
 VM, monitors proxy exits and cleans up helpers on shutdown. Host proxy policy and

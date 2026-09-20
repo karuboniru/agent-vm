@@ -680,7 +680,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     };
     export_object("/usr");
     export_object("/etc", true);
-    export_object("/.agent-vm/ipc");
+    // IPC is VMM-private: never add it to the virtio-fs object catalog.
     for (const auto& m : mounts) {
         bool hidden = false;
         for (const auto& path : masked_ancestors) hidden |= within(m.spec.target, path);

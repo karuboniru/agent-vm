@@ -323,6 +323,7 @@ int doctor() {
         check_krun(krun_disable_implicit_vsock(context), "disable implicit vsock");
         check_krun(krun_add_vsock(context, 0), "explicit control vsock");
         check_krun(krun_add_vsock_port2(context, AVM_CONTROL_PORT, AVM_CONTROL_SOCKET, true), "control socket");
+        check_krun(krun_add_vsock_port2(context, AVM_READY_PORT, AVM_READY_SOCKET, false), "readiness socket");
         for (size_t i = 0; i < spec.sockets.size(); ++i) {
             auto path = std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock";
             check_krun(krun_add_vsock_port2(context, AVM_SOCKET_PORT_BASE + static_cast<uint32_t>(i),
@@ -358,6 +359,18 @@ int run(avm::RunSpec spec) {
     struct RestoreSignals { sigset_t mask; ~RestoreSignals() { sigprocmask(SIG_SETMASK, &mask, nullptr); } } restore{previous};
     // Restore the caller's signal mask last, after terminal and directory cleanup.
     RuntimeDirectory runtime(spec);
+    // Bind before starting the VMM; CLOEXEC keeps the host listener out of it.
+    Fd readiness(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    if (readiness.value < 0) system_error("create readiness listener");
+    sockaddr_un ready_address{};
+    ready_address.sun_family = AF_UNIX;
+    const auto ready_path = (runtime.path / "ipc/ready.sock").string();
+    if (ready_path.size() >= sizeof(ready_address.sun_path))
+        throw std::runtime_error("readiness socket path too long");
+    std::memcpy(ready_address.sun_path, ready_path.c_str(), ready_path.size() + 1);
+    if (bind(readiness.value, reinterpret_cast<sockaddr*>(&ready_address), sizeof(ready_address)) ||
+        chmod(ready_path.c_str(), 0600) || listen(readiness.value, 1))
+        system_error("listen for guest readiness");
     Terminal terminal;
     Fd signals(signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK));
     if (signals.value < 0) system_error("signalfd");
@@ -411,7 +424,7 @@ int run(avm::RunSpec spec) {
         if (spec.debug) std::cerr << "agent-vm: runtime " << runtime.path << "; VM supervisor pid " << vm << '\n';
         auto deadline = std::chrono::steady_clock::time_point::max();
         int requested_signal = 0;
-        bool resize_pending = true, helper_failed = false;
+        bool resize_pending = true, helper_failed = false, guest_ready = false;
         int result = 125;
         for (;;) {
             int status;
@@ -429,7 +442,16 @@ int run(avm::RunSpec spec) {
             for (auto& proxy : proxies) check_helper(proxy.pid, "xdg-dbus-proxy");
             for (size_t i = 0; i < brokers.size(); ++i)
                 check_helper(brokers[i], "socket broker for " + spec.sockets[i].target);
-            if (access((runtime.path / "ipc/guest-ready").c_str(), F_OK) == 0) {
+            if (!guest_ready) {
+                Fd notification(accept4(readiness.value, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
+                if (notification.value >= 0) {
+                    guest_ready = true;
+                    close(readiness.value); readiness.value = -1;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    system_error("accept guest readiness");
+                }
+            }
+            if (guest_ready) {
                 if (requested_signal && send_control(runtime.path / "ipc/control.sock",
                     {AVM_CONTROL_MAGIC, AVM_CONTROL_SIGNAL, static_cast<uint32_t>(requested_signal), 0, 0})) requested_signal = 0;
                 if (resize_pending) {

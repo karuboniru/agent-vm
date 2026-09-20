@@ -212,10 +212,26 @@ static void tmpfs_export_test() {
 static void integration_test() {
     Fixture fixture;
     auto s = fixture.run_spec();
+    write_file(fixture.ipc / "private-marker", "host IPC");
     int leaked = open(fixture.source.c_str(), O_PATH | O_CLOEXEC);
     require(leaked >= 0, "open inherited fixture descriptor failed");
     require(child_status([&] {
         fixture.enter(s);
+        // Inspect the actual host export roots, independent of guest mounts
+        // or guest privilege. The IPC bind must remain available only to VMM.
+        require(read_file("/.agent-vm/ipc/private-marker") == "host IPC", "VMM lost private IPC");
+        struct stat ipc_info{};
+        require(stat("/.agent-vm/ipc", &ipc_info) == 0, "stat private IPC failed");
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            struct stat exported{};
+            if (stat((object.path() / "root").c_str(), &exported) != 0) continue;
+            require(exported.st_dev != ipc_info.st_dev || exported.st_ino != ipc_info.st_ino,
+                    "private IPC directory entered the virtio-fs catalog");
+            require(!fs::exists(object.path() / "root/.agent-vm/ipc"), "export contains private IPC");
+        }
+        require(!fs::exists(std::string(AVM_BOOTSTRAP) + "/.agent-vm/ipc"), "bootstrap exposes IPC");
+        require(read_file((std::string(AVM_BOOTSTRAP) + AVM_MOUNT_SPEC).c_str()).find("/.agent-vm/ipc") == std::string::npos,
+                "guest mount manifest includes IPC");
         require(getpid() == 1, "VMM did not become PID namespace init");
         require(getuid() == s.uid && getgid() == s.gid, "identity changed");
         require(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1, "no_new_privs absent");

@@ -13,6 +13,9 @@
 #define AVM_CONTROL_PORT 1024u
 #define AVM_SOCKET_PORT_BASE 1025u
 #define AVM_SOCKET_MAX 256u
+#define AVM_READY_PORT (AVM_SOCKET_PORT_BASE + AVM_SOCKET_MAX)
+/* A connection on this dedicated guest -> host port signals readiness.
+ * No payload, paths, or commands are accepted; the host latches it once. */
 
 /* Internal Unix stream relay transport over vsock: each frame starts with one
  * network-byte-order uint32_t. DATA has 1..MAX following bytes; EOF and ACK
@@ -46,6 +49,8 @@
 struct avm_mount_header {
     uint32_t magic, version, count, tmp_mib;
 };
+/* Host/VMM paths only: these are never exported to the guest. */
+#define AVM_READY_SOCKET "/.agent-vm/ipc/ready.sock"
 #define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control.sock"
 #define AVM_SOCKET_PREFIX "/.agent-vm/ipc/socket-"
 

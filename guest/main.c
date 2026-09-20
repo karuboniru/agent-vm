@@ -35,7 +35,6 @@
 #include <unistd.h>
 
 #define CONTROL_CLIENTS 32
-#define READY_PATH "/.agent-vm/ipc/guest-ready"
 
 extern char **environ;
 
@@ -732,8 +731,14 @@ int main(void)
         if (relay_pids[i] < 0)
             fail(spec.sockets[i]);
     }
-    int ready = open(READY_PATH, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    int ready = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (ready < 0)
+        fail("create readiness socket");
+    struct sockaddr_vm ready_address = {0};
+    ready_address.svm_family = AF_VSOCK;
+    ready_address.svm_cid = VMADDR_CID_HOST;
+    ready_address.svm_port = AVM_READY_PORT;
+    if (connect(ready, (struct sockaddr *)&ready_address, sizeof(ready_address)) < 0)
         fail("publish guest readiness");
     close(ready);
     pid_t previous_foreground;
@@ -741,7 +746,6 @@ int main(void)
     int result = supervise(workload, &spec, listener, signal_fd);
     if (previous_foreground > 0)
         (void)tcsetpgrp(STDIN_FILENO, previous_foreground);
-    (void)unlink(READY_PATH);
     /* Any remaining processes in the workload group must not outlive its main
      * command. libkrun's PID 1 tears down the rest when this helper exits. */
     forward_signal(workload, SIGTERM);
