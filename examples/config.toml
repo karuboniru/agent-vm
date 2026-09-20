@@ -1,0 +1,37 @@
+version = 1
+
+[vm]
+cpus = 2
+memory_mib = 2048
+tmp_mib = 256
+
+[filesystem]
+cwd = "rw"
+home = "ephemeral"
+# Source masks apply at every shared alias. Missing paths beneath a shared
+# directory are rejected, because creating placeholders would modify the host.
+# mask_sources = ["~/.ssh", "~/.gnupg"]
+# mask_targets = ["/data/private"]
+
+# Relative source paths are resolved against this file's directory.
+# [[mounts]]
+# source = "~/datasets"
+# target = "/data"
+# mode = "ro"
+
+[environment]
+# TERM, LANG and LC_ALL are inherited by default when present.
+# Add only variables that the workload needs. Missing explicit names are errors.
+inherit = []
+
+[environment.set]
+EDITOR = "vi"
+
+[network]
+mode = "none"
+# Publishing requires mode = "passt". Default bind address is loopback.
+publish = []
+# publish = ["127.0.0.1:8080:8080/tcp"]
+
+[ssh_agent]
+enabled = false
