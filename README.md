@@ -32,29 +32,32 @@ Both `agent-vm` and its installed `libexec/agent-vm-guest` helper are needed. Th
 
 ## Fedora RPM
 
-`agent-vm.spec` builds from a release tarball using Fedora's CMake macros,
+`agent-vm.spec` builds from a source tarball using Fedora's CMake macros,
 compiler hardening flags, and automatic ELF dependencies. `passt` is an explicit
 runtime dependency; the `libkrun` package pulls in its own firmware dependency.
 The internal core library is linked statically into the executable. Tests are
 disabled so build services do not need KVM or unprivileged user namespaces.
 
-With `mock` installed and configured for your user, build a release on Fedora 45:
+The spec uses the Fedora SourceURL forge macros and defaults to the `master`
+branch. This is a moving development snapshot; pin a commit or release tag for
+reproducible distribution builds. With `mock` installed and configured for your
+user, build on Fedora 45:
 
 ```sh
 mkdir -p build-rpm/{sources,srpm,result}
-curl -fL https://github.com/karuboniru/agent-vm/archive/refs/tags/v0.1.0/agent-vm-0.1.0.tar.gz \
-  -o build-rpm/sources/agent-vm-0.1.0.tar.gz
+curl -fL https://github.com/karuboniru/agent-vm/archive/master/agent-vm-master.tar.gz \
+  -o build-rpm/sources/agent-vm-master.tar.gz
 mock -r fedora-45-x86_64 --uniqueext=agent-vm --buildsrpm \
   --spec "$PWD/agent-vm.spec" --sources "$PWD/build-rpm/sources" \
   --resultdir "$PWD/build-rpm/srpm"
 mock -r fedora-45-x86_64 --uniqueext=agent-vm --rebuild \
-  "$PWD/build-rpm/srpm/agent-vm-0.1.0-1.fc45.src.rpm" \
+  "$PWD/build-rpm/srpm/agent-vm-0.1.0-1.gitmaster.fc45.src.rpm" \
   --resultdir "$PWD/build-rpm/result"
 rpmlint agent-vm.spec build-rpm/result/*.rpm
 ```
 
 For a committed local checkout, replace the download with
-`git archive --format=tar.gz --prefix=agent-vm-0.1.0/ HEAD > build-rpm/sources/agent-vm-0.1.0.tar.gz`.
+`git archive --format=tar.gz --prefix=agent-vm-master/ HEAD > build-rpm/sources/agent-vm-master.tar.gz`.
 The archive must contain the matching version's sources and `LICENSE`.
 Other Fedora targets need libkrun >= 1.19 and < 2 in their repositories.
 The package installs the command in `/usr/bin`, the guest helper in

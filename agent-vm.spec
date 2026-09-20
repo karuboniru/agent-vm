@@ -1,11 +1,15 @@
+%global forgeurl https://github.com/karuboniru/agent-vm
+%global branch master
+%forgemeta
+
 Name:           agent-vm
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
 License:        MIT
-URL:            https://github.com/karuboniru/agent-vm
-Source0:        %{url}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
+URL:            %{forgeurl}
+Source0:        %{forgesource}
 
 # Architectures supported by Fedora's libkrun and libkrunfw packages.
 ExclusiveArch:  x86_64 aarch64
@@ -30,7 +34,7 @@ passt and SSH agent forwarding are configurable. Running a VM requires
 access to /dev/kvm and permission to create unprivileged user namespaces.
 
 %prep
-%autosetup
+%forgeautosetup
 
 %conf
 # avm_core is an internal library, not an installed shared library.
