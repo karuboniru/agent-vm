@@ -70,6 +70,56 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'cwd':os.getcwd(),'owner':
     check(result["private"] is None and result["inherited"] == "inherited-value", "environment allowlist and explicit inheritance")
     check(result["value"] == complex_value, "literal environment quotes and newlines")
 
+    out, _ = run(["python3", "-c", """import os,json,pathlib
+mounts={}
+for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+ left,right=line.split(' - ');mounts.setdefault(left.split()[4],right.split()[:2])
+paths=['/','/tmp','/var/tmp','/run',os.environ['HOME'],'/usr',os.getcwd()]
+print(json.dumps({p:mounts[p] for p in paths}))
+assert not pathlib.Path('/.oldroot').exists()
+assert not pathlib.Path('/.agent-vm/objects').exists()
+assert not pathlib.Path('/.agent-vm/bootstrap').exists()
+"""])
+    filesystems = json.loads(out)
+    check(all(filesystems[p][0] == "tmpfs" for p in ["/", "/tmp", "/var/tmp", "/run", str(home)]),
+          "root and private writable directories use guest-native tmpfs")
+    check(all(filesystems[p] == ["virtiofs", "/.agent-vm/exports"] for p in ["/usr", str(work)]),
+          "shared objects use one path-tagged virtiofs catalog without an IRQ per mount")
+    out, _ = run(["python3", "-c", """import errno,pathlib
+for p in ['/tmp/full','/var/tmp/full']:
+ try: pathlib.Path(p).write_bytes(b'x'*(2*1024*1024))
+ except OSError as e: assert e.errno==errno.ENOSPC,e
+ else: raise AssertionError('tmpfs capacity limit missing')
+print('limits-ok')
+"""], ["--tmp-size", "1"])
+    check(out.strip() == "limits-ok", "guest tmpfs preserves per-filesystem capacity limits")
+
+    single_file = base / "single-file"
+    single_file.write_text("original")
+    long_target = "/long-" + "x" * 80 + "/file"
+    out, _ = run(["python3", "-c", """import errno,pathlib,sys
+ro=pathlib.Path('/single-ro');rw=pathlib.Path(sys.argv[1])
+assert ro.read_text()=='original'
+try: ro.write_text('forbidden')
+except OSError as e: assert e.errno==errno.EROFS,e
+else: raise AssertionError('ro file writable')
+rw.write_text('updated')
+assert ro.read_text()=='updated'
+print('files-ok')
+""", long_target], ["--mount", f"src={single_file},dst=/single-ro,ro",
+                    "--mount", f"src={single_file},dst={long_target},rw"])
+    check(out.strip() == "files-ok" and single_file.read_text() == "updated",
+          "single-file objects preserve independent ro/rw modes and long target paths")
+
+    out, _ = run(["python3", "-c", """import pathlib
+assert not pathlib.Path('/single-hidden').read_bytes()
+assert not list(pathlib.Path('/tmp/hidden').iterdir())
+print('private-masks-ok')
+"""], ["--mount", f"src={single_file},dst=/single-hidden,rw",
+        "--mask-target", "/single-hidden", "--mask-target", "/tmp/hidden"])
+    check(out.strip() == "private-masks-ok" and single_file.read_text() == "updated",
+          "whole-file and private-tmpfs target masks survive guest assembly")
+
     special = ["", "with spaces", "one'two", 'one"two', "line1\nline2", "$(not-a-command)"]
     out, _ = run(["python3", "-c", "import json,sys;print(json.dumps(sys.argv[1:]))"] + special)
     check(json.loads(out) == special, "argv exact round trip without shell interpretation")

@@ -31,7 +31,7 @@ target_compile_definitions(agent-vm PRIVATE
     AVM_INSTALLED_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/agent-vm-guest")
 target_compile_options(agent-vm PRIVATE -Wall -Wextra -Wpedantic -Wformat=2)
 
-add_executable(agent-vm-guest guest/main.c guest/relay.c)
+add_executable(agent-vm-guest guest/main.c guest/relay.c guest/filesystem.c)
 target_include_directories(agent-vm-guest PRIVATE include)
 target_compile_options(agent-vm-guest PRIVATE -Wall -Wextra -Wpedantic -Wformat=2)
 add_dependencies(agent-vm agent-vm-guest)

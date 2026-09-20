@@ -21,12 +21,14 @@ agent-vm CLI / supervisor                    调用者 UID，宿主视图
   ├─ passt                                  宿主 netns，仅在联网时启动
   ├─ ssh-broker                             固定授权的 SSH agent 目标，可选
   └─ sandbox setup → VMM worker + libkrun    user/mount/pid/ipc/uts/net namespace
-       ├─ 允许的文件树 → virtio-fs → guest root
+       ├─ 最小 bootstrap → virtio-fs /dev/root → guest 启动根
+       ├─ 受限对象目录 → virtio-fs /.agent-vm/exports → guest 挂载装配
        ├─ 已连接 socket FD ↔ passt ↔ host network
        └─ virtio-vsock ↔ broker 的精确 Unix socket
 
 guest: libkrun init（PID 1）
   └─ agent-vm-guest helper
+       ├─ 读取挂载描述、创建本地 tmpfs、挂载对象、切入最终根
        ├─ ssh relay（目标 UID，可选）
        └─ 用户命令（目标 UID/GID）
 ```
@@ -64,7 +66,16 @@ v1.19.0 的 virtio-fs 后端在缺少 CAP_SETUID/CAP_SETGID 时支持自身 U/G 
 
 ## 4. mount jail 与 FHS 根
 
-在新 mountns 中先将传播设为 recursive private。用 tmpfs 构造根、准备挂载点，再安装共享路径。guest 的建议视图如下：
+host 在新 mountns 中先将传播设为 recursive private，用 tmpfs 构造受限策略树，安装共享路径、嵌套覆盖、ro 属性和 mask。所有导出对象都从最终策略树取得，不能直接使用原始 source FD 导出。切根后断开旧根并关闭源 FD，VMM 自身也无法从原始路径或导出别名绕过策略。
+
+host 不再提供承载 guest 临时文件的 tmpfs。它生成最多 1 MiB 的二进制挂载描述（版本、条目数、tmpfs 限额；每条包括类型、权限、UID/GID、目标路径、对象路径），并提供两个固定 virtio-fs 设备：
+
+- `/dev/root`：最小启动根，包含 helper、描述文件、只读 `/usr`、生成的 `/etc` 和 guest 内核挂载所需的空目录。
+- `/.agent-vm/exports`：只包含已 confinement 的文件/目录对象。条目用 `/N/root` 或 `/N/file` 引用对象，完整目标路径放在描述中。
+
+tag 可以用路径形式，但每个目标一个设备会耗尽 libkrun 1.19 的 IRQ。固定两个设备配合对象路径避免这个限制，也避免长目标路径超过 tag 长度上限。guest helper 在独立 mount namespace 内创建本地 tmpfs 根和临时目录，先准备所有挂载点，再从对象目录 bind 到目标路径；不在共享目录里创建挂载点。它保留 libkrun init 已挂载的 guest proc/sys/dev，卸载对象目录的 staging 挂载，随后 `pivot_root` 并断开 bootstrap。PID 1 保留启动 namespace，DHCP resolver 文件在两个视图中引用同一份受限私有文件。
+
+guest 最终视图如下：
 
 | 路径 | 来源与规则 |
 | --- | --- |
@@ -73,18 +84,18 @@ v1.19.0 的 virtio-fs 后端在缺少 CAP_SETUID/CAP_SETGID 时支持自身 U/G 
 | `/lib`, `/lib64` | 按架构与宿主布局链接到 `usr/lib`, `usr/lib64`；不制造无效链接 |
 | `/etc` | 生成私有 passwd、group、nsswitch.conf、hosts、hostname；复制宿主 ld.so.conf 和 ld.so.conf.d/ 内容（存在时，普通配置文件的符号链接复制为文件）；CA、时区、ld.so.cache 从固定系统位置单独导入，最终只读 |
 | `/etc/resolv.conf` | 私有普通文件，通过独立 rw file bind 挂入只读 `/etc`，供 guest DHCP 写入 |
-| `/home/...` | 默认空的临时 home；显式请求时才共享宿主 home |
+| `/home/...` | 默认空的 guest 本地 tmpfs home；显式请求时才共享宿主 home |
 | CWD | 默认同绝对路径 rw bind；可通过 CLI 改为 ro 或其他目标 |
-| `/tmp`, `/var/tmp` | 私有 tmpfs，1777，设置容量限制 |
-| `/run`, `/run/user/U` | 私有运行目录，后者归 U、0700 |
+| `/tmp`, `/var/tmp` | guest 本地 tmpfs，1777，设置容量限制 |
+| `/run`, `/run/user/U` | guest 本地 tmpfs 中的运行目录，后者归 U、0700 |
 | `/var`, `/opt`, `/srv`, `/mnt`, `/media`, `/root` | 最小占位目录，需要时加私有可写子挂载 |
 | `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm` | 由 guest 内核/init 挂载；不整体 bind 宿主对应目录 |
 
 只共享 `/usr` 不等于所有宿主命令都开箱即用：CA、NSS、locale、timezone、`/usr/local` 中指向外部的 symlink 等要检测目标。`/etc` 默认生成和按需导入，不整体共享。宿主的 `/home → /var/home` 等布局需要解析、保留必要别名，HOME 与 CWD 必须指向实际可达路径。
 
-只读是 host 上的挂载属性约束，不能仅靠 guest 以 ro 挂载 virtio-fs。优先使用 `open_tree` / `move_mount` 和 `mount_setattr(..., AT_RECURSIVE, MOUNT_ATTR_RDONLY)`；支持旧内核时必须逐个验证子挂载，不能把顶层 remount 当成 recursive ro。混合根包含可写 CWD，不能把整个根 export 标成 read_only。[mount_setattr(2)](https://man7.org/linux/man-pages/man2/mount_setattr.2.html)
+共享对象的只读约束在 host 上通过挂载属性实施，不能仅靠 guest 以 ro 挂载 virtio-fs。使用固定 FD 的 bind 和 `mount_setattr(..., AT_RECURSIVE, MOUNT_ATTR_RDONLY)`；父挂载先安装，显式子挂载随后覆盖，不能重新递归锁定父目录而破坏 rw 子挂载。对象目录同时含 ro/rw 内容，不能把整个 export 标成 read_only。[mount_setattr(2)](https://man7.org/linux/man-pages/man2/mount_setattr.2.html)
 
-根骨架和启动配置在装配结束后锁为只读，私有可写目录与 rw 共享保持独立子挂载。使用 `pivot_root`，`chdir("/")`，卸载旧根；如支持 chroot fallback，需要同等级的旧根/FD 清理，不能在失败时静默降级。
+host 策略骨架和启动配置在装配结束后锁为只读；guest 根骨架也在切根完成后锁为只读，私有可写目录与 rw 共享保持独立子挂载。两侧都使用 `pivot_root`，`chdir("/")`，卸载旧根，失败即终止。guest 本地 tmpfs 消耗 VM RAM，`--tmp-size` 是每个文件系统的容量上限，不预留内存；多个 tmpfs 和进程共同竞争 `--memory` 的预算。
 
 ### VMM 的 `/proc`、KVM 和 FD 生命周期
 
@@ -216,10 +227,10 @@ relay 以 U/G 运行；socket 0600，父目录 0700；每个客户端独立连�
 1. 读取调用者身份/CWD/配置，验证依赖，构建 RunSpec 与 MountPlan。
 2. 准备明确授权的 FD 和运行目录；按需启动 passt、broker。
 3. 单线程 sandbox setup 建 userns 并同步写映射，再建 mount/ipc/uts/net namespace；PID namespace 要 fork 后才对新子进程生效。
-4. 在新 namespace 内装配根、安装 bind/mask/ro 属性；切根、清理旧根引用与 FD。
+4. 在新 namespace 内安装 bind/mask/ro 属性，从最终视图创建对象目录、bootstrap 和挂载描述；切根、清理旧根引用与 FD。
 5. 清 capabilities、设置 no_new_privs，装载经验证的 VMM seccomp 策略；确保动态库/固件/KVM/proc 需求都在允许视图内。
 6. 使用 libkrun 1.19 C API 配置 RAM/vCPU、virtio-fs、显式 NIC/vsock、guest helper 和精简 bootstrap 环境；调用 krun_start_enter。
-7. libkrun init 挂载 guest 伪文件系统、配置网络；helper 创建 guest 私有 runtime、按需启动 relay，降权并监督 workload。
+7. libkrun init 挂载 guest 伪文件系统、配置网络；helper 根据描述装配本地 tmpfs 和导出对象，保留 guest 伪文件系统、切入最终根，创建 runtime，降权、按需启动 relay 并监督 workload。
 8. supervisor 用 pidfd/signalfd 等管理退出；guest helper 转发信号、回收子进程、传递退出码。TTY 输入、窗口大小、非交互信号和强制停止需要端到端验证；使用超时升级停止，清理 passt/broker 和临时目录。
 
 libkrun 的 start/enter 是进入 VMM 运行循环的接口，因此隔离成独立子进程，supervisor 负责生命周期。需要额外控制通道时只接受固定操作（停止、resize、状态），不接受 guest 指定宿主路径。

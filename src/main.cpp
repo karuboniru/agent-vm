@@ -289,7 +289,7 @@ int doctor() {
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(125);
         sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, nullptr);
         for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGCHLD, SIGWINCH}) signal(sig, SIG_DFL);
-        avm::enter_sandbox(spec, (runtime / "root").string(), (runtime / "ipc").string(),
+        auto exports = avm::enter_sandbox(spec, (runtime / "root").string(), (runtime / "ipc").string(),
                            (runtime / "spec.bin").string(), helper, net_fd >= 0 ? std::vector<int>{net_fd} : std::vector<int>{});
         clearenv(); setenv("PATH", "/usr/bin:/bin", 1);
         check_krun(krun_set_log_level(spec.debug ? 4 : 1), "libkrun log");
@@ -303,7 +303,9 @@ int doctor() {
             uint8_t mac[] = {0x02, 0x61, 0x76, 0x6d, 0x00, 0x01};
             check_krun(krun_add_net_unixstream(context, nullptr, net_fd, mac, COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT), "passt NIC");
         }
-        check_krun(krun_add_virtiofs3(context, KRUN_FS_ROOT_TAG, "/", 0, false), "virtio-fs root");
+        check_krun(krun_add_virtiofs3(context, KRUN_FS_ROOT_TAG, AVM_BOOTSTRAP, 0, false), "virtio-fs bootstrap");
+        for (const auto& object : exports)
+            check_krun(krun_add_virtiofs3(context, object.tag.c_str(), object.path.c_str(), 0, false), "virtio-fs object");
         const char* args[] = {nullptr};
         const char* environment[] = {"PATH=/usr/bin:/bin", "HOME=/", "HOSTNAME=agent-vm", nullptr};
         check_krun(krun_set_workdir(context, "/"), "bootstrap cwd");

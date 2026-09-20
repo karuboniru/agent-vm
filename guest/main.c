@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "agent_vm/protocol.h"
 #include "relay.h"
+#include "filesystem.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -651,6 +652,7 @@ int main(void)
         fprintf(stderr, "agent-vm guest: helper must start as guest root\n");
         return 125;
     }
+    avm_mount_filesystems();
     if (spec.header.flags & AVM_FLAG_NETWORK)
         check_network();
     prepare_runtime((uid_t)spec.header.uid, (gid_t)spec.header.gid);

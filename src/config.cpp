@@ -279,6 +279,7 @@ void check_existing_target(const MountSpec& parent, const std::string& target, b
     fs::path relative = fs::path(target).lexically_relative(parent.target);
     fs::path physical(parent.source);
     for (const auto& component : relative) {
+        if (component == ".") continue;
         physical /= component;
         std::error_code error;
         auto status = fs::symlink_status(physical, error);
@@ -496,7 +497,8 @@ void validate_spec(const RunSpec& spec) {
         check_target(target, "mask");
         if (path_within(spec.cwd, target)) fail("workdir is inside a masked target: " + spec.cwd);
         if (auto parent = nearest_mount(spec, target, true)) {
-            auto path = fs::path(parent->source) / fs::path(target).lexically_relative(parent->target);
+            auto path = fs::path(parent->source);
+            if (target != parent->target) path /= fs::path(target).lexically_relative(parent->target);
             std::error_code error;
             auto status = fs::status(path, error);
             if (error || !fs::exists(status)) fail("mask target does not exist in a shared source: " + target);

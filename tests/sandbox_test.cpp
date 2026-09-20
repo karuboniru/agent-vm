@@ -1,4 +1,5 @@
 #include "agent_vm/runtime.hpp"
+#include "agent_vm/protocol.h"
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -97,8 +98,8 @@ struct Fixture {
         s.mask_sources = {(source / ".ssh").string()};
         return s;
     }
-    void enter(avm::RunSpec s, const std::vector<int>& keep = {}) const {
-        avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep);
+    std::vector<avm::FilesystemExport> enter(avm::RunSpec s, const std::vector<int>& keep = {}) const {
+        return avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep);
     }
 };
 static void nested_mount_modes_test() {
@@ -119,7 +120,9 @@ static void nested_mount_modes_test() {
                 {(fixture.base / "file").string(), "/work/public", false},
                 {fixture.source.string(), "/work", true}};
     require(child_status([&] {
-        fixture.enter(s);
+        auto exports = fixture.enter(s);
+        require(exports.size() == 1 && exports[0].tag == AVM_EXPORT_TAG,
+                "object exports must use a bounded number of devices");
         for (const char* path : {"/work/denied", "/work/nested/locked/denied"}) {
             const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
             require(fd == -1 && errno == EROFS, "read-only parent accepted a write");
@@ -127,6 +130,16 @@ static void nested_mount_modes_test() {
         write_file("/work/nested/created", "child");
         write_file("/work/nested/locked/writable/created", "leaf");
         write_file("/work/public", "file child");
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            auto tree = object.path() / "root";
+            if (fs::exists(tree / "nested/locked")) {
+                int fd = open((tree / "denied").c_str(), O_WRONLY | O_CREAT, 0600);
+                require(fd == -1 && errno == EROFS, "export registry bypassed parent read-only policy");
+                fd = open((tree / "nested/locked/denied").c_str(), O_WRONLY | O_CREAT, 0600);
+                require(fd == -1 && errno == EROFS, "export registry bypassed nested read-only policy");
+                write_file(tree / "nested/locked/writable/exported", "allowed");
+            }
+        }
     }) == 0, "alternating nested mount modes failed");
     require(read_file((child / "created").c_str()) == "child", "rw child write missing on host");
     require(read_file((leaf / "created").c_str()) == "leaf", "rw leaf write missing on host");
@@ -161,15 +174,33 @@ static void integration_test() {
         require(read_file("/work/public") == "public data", "shared public data unavailable");
         require(access("/work/.ssh/key", F_OK) == -1 && errno == ENOENT, "source mask leaked primary alias");
         require(access("/copy/.ssh/key", F_OK) == -1 && errno == ENOENT, "source mask leaked secondary alias");
+        unsigned shared_objects = 0;
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            const auto tree = object.path() / "root";
+            if (!fs::exists(tree / "public")) continue;
+            ++shared_objects;
+            require(read_file((tree / "public").c_str()) == "public data", "export lost allowed data");
+            require(!fs::exists(tree / ".ssh/key"), "VMM export registry bypassed a source mask");
+            const int fd = open((tree / ".ssh/new").c_str(), O_WRONLY | O_CREAT, 0600);
+            require(fd == -1 && (errno == EROFS || errno == EACCES), "VMM can write through export mask");
+        }
+        require(shared_objects == 2, "shared aliases missing from object registry");
+        require(read_file(AVM_BOOTSTRAP AVM_GUEST_HELPER) == "helper fixture", "bootstrap helper truncated");
+        require(read_file(AVM_BOOTSTRAP AVM_GUEST_SPEC) == "config fixture", "bootstrap spec truncated");
+        require(!fs::exists(AVM_BOOTSTRAP "/dev/kvm"), "bootstrap exports host KVM node");
+        require(!fs::exists(AVM_BOOTSTRAP "/proc/self"), "bootstrap exports host proc");
+        require(!fs::exists(AVM_BOOTSTRAP "/work"), "bootstrap contains workload shares");
         int fd = open("/work/.ssh/new", O_WRONLY | O_CREAT, 0600);
         require(fd == -1 && (errno == EROFS || errno == EACCES), "masked directory is writable");
         fd = open("/etc/hostname", O_WRONLY);
         require(fd == -1 && errno == EROFS, "root skeleton is writable");
         fd = open("/etc/resolv.conf", O_WRONLY);
         require(fd >= 0, "private DHCP resolver is not writable"); close(fd);
-        write_file(s.home + "/ephemeral", "home");
-        write_file("/tmp/ephemeral", "tmp");
-        write_file("/run/user/" + std::to_string(s.uid) + "/ephemeral", "run");
+        for (const auto& path : {s.home + "/ephemeral", std::string("/tmp/ephemeral"),
+                                "/run/user/" + std::to_string(s.uid) + "/ephemeral"}) {
+            fd = open(path.c_str(), O_WRONLY | O_CREAT, 0600);
+            require(fd == -1 && errno == EROFS, "host retains writable guest-private tmpfs");
+        }
         write_file("/work/created", "shared");
         struct statvfs usr_mount{}, shared_mount{};
         require(statvfs("/usr", &usr_mount) == 0 && (usr_mount.f_flag & ST_RDONLY), "/usr lacks read-only mount attribute");
@@ -184,6 +215,24 @@ static void integration_test() {
     require(fs::is_empty(fixture.root), "namespace mount leaked to supervisor");
     require(read_file((fixture.source / ".ssh/key").c_str()) == "never expose", "host secret changed");
     require(!fs::exists(fixture.source / ".ssh/new"), "mask modified source");
+
+    // A mask above a share must suppress its standalone export as well.
+    const auto hidden_source = fixture.base / "hidden-source";
+    fs::create_directory(hidden_source);
+    write_file(hidden_source / "secret", "not exported");
+    auto hidden = fixture.run_spec();
+    hidden.mounts.push_back({hidden_source.string(), "/hidden/child", false});
+    hidden.mask_targets.push_back("/hidden");
+    require(child_status([&] {
+        fixture.enter(hidden);
+        require(!fs::exists("/hidden/child"), "VMM can reach child beneath target mask");
+        require(!fs::exists(hidden_source), "VMM retains original hidden source path");
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            const auto tree = object.path() / "root";
+            require(!fs::exists(tree / "secret") && !fs::exists(tree / "child/secret"),
+                    "masked child remains accessible as a standalone export");
+        }
+    }) == 0, "target mask above an exported child failed");
 
     // A missing nested mountpoint must fail without creating a host directory.
     s = fixture.run_spec();

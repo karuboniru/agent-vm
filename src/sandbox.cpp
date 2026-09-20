@@ -158,14 +158,6 @@ void bind_fd(int root, int source, const std::string& target, bool recursive, bo
                      (read_only ? MOUNT_ATTR_RDONLY : 0);
     attributes(root, target, attrs, true);
 }
-void private_tmpfs(int root, const std::string& path, uint32_t mib, mode_t mode) {
-    Fd target = target_fd(root, path);
-    char permission[16];
-    snprintf(permission, sizeof(permission), "%o", mode);
-    const std::string options = "size=" + std::to_string(mib) + "m,nr_inodes=65536,mode=" + permission;
-    if (mount("tmpfs", fd_path(target.fd).c_str(), "tmpfs", MS_NOSUID | MS_NODEV, options.c_str()))
-        fail("private tmpfs " + path);
-}
 void copy_file(int root, int source, const std::string& target, mode_t mode, size_t limit) {
     const auto st = info(source);
     if (!S_ISREG(st.st_mode) || st.st_size < 0 || static_cast<uint64_t>(st.st_size) > limit)
@@ -364,7 +356,7 @@ void verify_identity_text(const std::string& text) {
 }
 } // namespace
 
-void enter_sandbox(const RunSpec& spec, const std::string& root_dir,
+std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                    const std::string& ipc_dir, const std::string& spec_file,
                    const std::string& helper, const std::vector<int>& keep_fds) {
     if (getuid() != spec.uid || getgid() != spec.gid || geteuid() != spec.uid || getegid() != spec.gid)
@@ -508,11 +500,9 @@ void enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                              "/tmp", "/run", "/var", "/var/tmp", "/home", "/opt", "/srv",
                              "/mnt", "/media", "/root", "/.agent-vm", "/.agent-vm/ipc", "/.oldroot"})
         make_dirs(root.fd, path);
-    private_tmpfs(root.fd, "/tmp", spec.tmp_mib, 01777);
-    private_tmpfs(root.fd, "/var/tmp", spec.tmp_mib, 01777);
-    private_tmpfs(root.fd, "/run", spec.tmp_mib, 0755);
+    // Private writable filesystems belong to the guest. These host directories
+    // are only policy-tree placeholders, sealed read-only before VM launch.
     make_dirs(root.fd, spec.home, 0700);
-    private_tmpfs(root.fd, spec.home, spec.tmp_mib, 0700);
     make_dirs(root.fd, "/run/user/" + std::to_string(spec.uid), 0700);
 
     for (const auto& m : mounts) placeholder(root.fd, m.spec.target, m.directory);
@@ -528,8 +518,6 @@ void enter_sandbox(const RunSpec& spec, const std::string& root_dir,
     create_file(root.fd, "/etc/resolv.conf", "", 0644);
     create_file(root.fd, "/.agent-vm/empty-file", "", 0444);
     make_dirs(root.fd, "/.agent-vm/empty-dir", 0555);
-    copy_file(root.fd, configuration.fd, AVM_GUEST_SPEC, 0400, AVM_SPEC_MAX);
-    copy_file(root.fd, executable.fd, AVM_GUEST_HELPER, 0555, 32u * 1024u * 1024u);
     const auto uid = std::to_string(spec.uid), gid = std::to_string(spec.gid);
     std::string passwd = "root:x:0:0:root:/root:/bin/sh\n";
     std::string group = "root:x:0:\n";
@@ -599,6 +587,78 @@ void enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                 true, mask.check_identity ? &expected : nullptr);
         masked_ancestors.push_back(mask.path);
     }
+
+    // Only the final, masked tree may supply export objects. In particular,
+    // never export a pinned original source: it bypasses masks and child binds.
+    struct Object { std::string target, path; };
+    std::vector<Object> objects;
+    std::string manifest(sizeof(avm_mount_header), '\0');
+    uint32_t entries = 0;
+    auto number = [&](uint32_t value) { manifest.append(reinterpret_cast<const char*>(&value), sizeof(value)); };
+    auto string = [&](const std::string& value) { number(static_cast<uint32_t>(value.size())); manifest += value; };
+    auto entry = [&](uint32_t kind, const std::string& target, const std::string& object,
+                     uint32_t mode = 0, uint32_t uid = 0, uint32_t gid = 0) {
+        number(kind); number(mode); number(uid); number(gid); string(target); string(object);
+        if (manifest.size() > AVM_SPEC_MAX) throw std::runtime_error("mount specification exceeds 1 MiB");
+        ++entries;
+    };
+    entry(AVM_MOUNT_TMPFS, "/tmp", "", 01777);
+    entry(AVM_MOUNT_TMPFS, "/var/tmp", "", 01777);
+    entry(AVM_MOUNT_TMPFS, "/run", "", 0755);
+    entry(AVM_MOUNT_TMPFS, spec.home, "", 0700, spec.uid, spec.gid);
+    auto export_object = [&](const std::string& target, bool readonly_root = false) {
+        Fd source = target_fd(root.fd, target);
+        bool directory = S_ISDIR(info(source.fd).st_mode);
+        const auto container = std::string(AVM_EXPORT_TAG) + "/" + std::to_string(objects.size());
+        make_dirs(root.fd, container);
+        const auto object = directory ? container + "/root" : container + "/file";
+        placeholder(root.fd, object, directory);
+        bind_fd(root.fd, source.fd, object, directory, false);
+        // Generated /etc is read-only, except for its private DHCP file mount.
+        if (readonly_root) attributes(root.fd, object, MOUNT_ATTR_RDONLY, false);
+        objects.push_back({target, object});
+        entry(directory ? AVM_MOUNT_DIRECTORY : AVM_MOUNT_FILE, target,
+              object.substr(std::strlen(AVM_EXPORT_TAG)));
+    };
+    export_object("/usr");
+    export_object("/etc", true);
+    export_object("/.agent-vm/ipc");
+    for (const auto& m : mounts) {
+        bool hidden = false;
+        for (const auto& path : masked_ancestors) hidden |= within(m.spec.target, path);
+        if (!hidden) export_object(m.spec.target);
+    }
+    // Masks within a share are already part of that share's host view. Masks
+    // on private guest paths still need an empty, host-enforced RO object.
+    for (const auto& path : masked_ancestors) {
+        bool shared = false;
+        for (const auto& m : mounts) shared |= within(path, m.spec.target) && path != m.spec.target;
+        if (!shared) export_object(path);
+    }
+    avm_mount_header mount_header{AVM_MOUNT_MAGIC, AVM_MOUNT_VERSION, entries, spec.tmp_mib};
+    std::memcpy(manifest.data(), &mount_header, sizeof(mount_header));
+
+    // The boot export contains only what libkrun's init and our helper need.
+    // The VMM's proc, KVM node, policy tree and object registry are not its root.
+    const std::string boot = AVM_BOOTSTRAP;
+    for (const char* path : {"/usr", "/etc", "/dev", "/dev/pts", "/dev/shm", "/proc", "/sys",
+                             "/run", "/tmp", "/.agent-vm", AVM_NEW_ROOT})
+        make_dirs(root.fd, boot + path);
+    for (const auto& object : objects) {
+        if (object.target != "/usr" && object.target != "/etc") continue;
+        Fd source = target_fd(root.fd, object.path);
+        bind_fd(root.fd, source.fd, boot + object.target, true, false);
+    }
+    copy_file(root.fd, configuration.fd, boot + AVM_GUEST_SPEC, 0400, AVM_SPEC_MAX);
+    copy_file(root.fd, executable.fd, boot + AVM_GUEST_HELPER, 0555, 32u * 1024u * 1024u);
+    create_file(root.fd, boot + AVM_MOUNT_SPEC, manifest, 0400);
+    Fd boot_fd = target_fd(root.fd, boot);
+    for (const char* name : {"bin", "sbin", "lib", "lib64"}) {
+        struct stat st{};
+        if (fstatat(root.fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode))
+            if (symlinkat((std::string("usr/") + name).c_str(), boot_fd.fd, name)) fail("bootstrap FHS symlink");
+    }
+    boot_fd = Fd();
     if (fchdir(root.fd)) fail("chdir private root");
     if (syscall(SYS_pivot_root, ".", ".oldroot")) fail("pivot_root");
     if (chdir("/")) fail("chdir new root");
@@ -613,6 +673,7 @@ void enter_sandbox(const RunSpec& spec, const std::string& root_dir,
     resolv = Fd(); proc = Fd(); empty_directory = Fd(); empty_file = Fd(); root = Fd();
     close_unlisted(keep_fds);
     drop_capabilities();
+    return {{AVM_EXPORT_TAG, AVM_EXPORT_TAG}};
 }
 
 void install_vmm_seccomp() {

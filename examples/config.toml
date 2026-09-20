@@ -3,6 +3,7 @@ version = 1
 [vm]
 cpus = 2
 memory_mib = 2048
+# Per guest-native tmpfs capacity limit; actual use consumes VM RAM.
 tmp_mib = 256
 
 [filesystem]

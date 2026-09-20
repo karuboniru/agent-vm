@@ -24,6 +24,24 @@
 #define AVM_STREAM_ACK UINT32_MAX
 #define AVM_GUEST_HELPER "/.agent-vm/guest"
 #define AVM_GUEST_SPEC "/.agent-vm/spec.bin"
+#define AVM_MOUNT_SPEC "/.agent-vm/mounts.bin"
+#define AVM_BOOTSTRAP "/.agent-vm/bootstrap"
+#define AVM_NEW_ROOT "/.agent-vm/root"
+#define AVM_MOUNT_MAGIC 0x41564d46u
+#define AVM_MOUNT_VERSION 1u
+#define AVM_MOUNT_TMPFS 1u
+#define AVM_MOUNT_DIRECTORY 2u
+#define AVM_MOUNT_FILE 3u
+#define AVM_EXPORT_TAG "/.agent-vm/exports"
+/* Native endian: header, then count entries of four u32 values (kind, mode,
+ * uid, gid) followed by length-prefixed target and object-path strings. Object
+ * paths are relative to AVM_EXPORT_TAG's root (with a leading slash). tmp_mib
+ * is a per-filesystem limit. Two devices (bootstrap and object catalog) avoid
+ * exhausting libkrun's IRQ budget as the number of configured mounts grows.
+ * All host access restrictions are enforced before exporting any object. */
+struct avm_mount_header {
+    uint32_t magic, version, count, tmp_mib;
+};
 #define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control.sock"
 #define AVM_SSH_SOCKET "/.agent-vm/ipc/ssh.sock"
 
