@@ -211,6 +211,55 @@ def test_outbound(binary: Path, case: Path) -> None:
         require(not tcp.errors and not udp.errors, f"host echo service errors: {tcp.errors + udp.errors}")
 
 
+OUTBOUND6_GUEST = r"""
+    import socket, sys, time
+    deadline = time.monotonic() + 10
+    while True:
+        addresses = [row.split() for row in open('/proc/net/if_inet6')]
+        ready = any(row[3] == '00' and not int(row[4], 16) & 0x48 for row in addresses)
+        routes = [row.split() for row in open('/proc/net/ipv6_route')]
+        route = next((row for row in routes if row[0] == '0' * 32 and row[1] == '00'
+                      and row[4] != '0' * 32), None)
+        if ready and route:
+            break
+        assert time.monotonic() < deadline, 'IPv6 address/default route not ready'
+        time.sleep(0.1)
+    gateway = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(route[4]))
+    scope = socket.if_nametoindex(route[-1])
+    payload = bytes(range(256)) * 127
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as peer:
+        peer.settimeout(4)
+        peer.connect((gateway, int(sys.argv[1]), 0, scope))
+        peer.sendall(payload)
+        peer.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while data := peer.recv(65536):
+            response.extend(data)
+        assert response == payload + b'<EOF>', 'IPv6 TCP echo mismatch'
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as peer:
+        peer.settimeout(4)
+        peer.sendto(payload[:1200], (gateway, int(sys.argv[2]), 0, scope))
+        assert peer.recv(2000) == payload[:1200], 'IPv6 UDP echo mismatch'
+    print('OUTBOUND6_OK', flush=True)
+"""
+
+
+def test_outbound6(binary: Path, case: Path) -> None:
+    # Automatic passt IPv6 configuration requires a host IPv6 default route.
+    routes = Path('/proc/net/ipv6_route')
+    if not routes.exists() or not any(
+            row[0] == '0' * 32 and row[1] == '00' and int(row[8], 16) & 1
+            for row in (line.split() for line in routes.read_text().splitlines())):
+        print('SKIP IPv6 echo: host has no IPv6 default route', flush=True)
+        return
+    with EchoService(socket.AF_INET6, socket.SOCK_STREAM, ("::1", 0)) as tcp, \
+            EchoService(socket.AF_INET6, socket.SOCK_DGRAM, ("::1", 0)) as udp:
+        with VM(binary, case, OUTBOUND6_GUEST, ["--network", "passt"],
+                [str(tcp.address[1]), str(udp.address[1])]) as vm:
+            vm.finish("OUTBOUND6_OK")
+        require(not tcp.errors and not udp.errors, f"IPv6 echo errors: {tcp.errors + udp.errors}")
+
+
 PUBLISHED_GUEST = r"""
     from pathlib import Path
     import selectors, socket, sys, time
@@ -519,13 +568,13 @@ def test_sockets(binary: Path, case: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/agent-vm")
-    parser.add_argument("--case", choices=("outbound", "publish", "ssh", "sockets"), help="run a single case")
+    parser.add_argument("--case", choices=("outbound", "outbound6", "publish", "ssh", "sockets"), help="run a single case")
     arguments = parser.parse_args()
     binary = arguments.binary.resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error(f"agent-vm binary is not executable: {binary}")
     root = Path(tempfile.mkdtemp(prefix="avm-net-integration."))
-    cases = [("outbound", test_outbound), ("publish", test_published_ports), ("ssh", test_ssh),
+    cases = [("outbound", test_outbound), ("outbound6", test_outbound6), ("publish", test_published_ports), ("ssh", test_ssh),
              ("sockets", test_sockets)]
     try:
         for name, test in cases:

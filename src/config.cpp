@@ -830,7 +830,7 @@ void print_plan(const RunSpec& spec) {
                   << ", mode=0o" << std::oct << tmpfs.mode << std::dec << ")\n";
     for (const auto& mask : spec.mask_sources) std::cout << "Source mask: " << mask << '\n';
     for (const auto& mask : spec.mask_targets) std::cout << "Target mask: " << mask << '\n';
-    std::cout << "Network: " << (spec.network ? "passt (IPv4)" : "none") << '\n'
+    std::cout << "Network: " << (spec.network ? "passt (IPv4/IPv6)" : "none") << '\n'
               << "Vsock: fixed control channel enabled; implicit vsock/TSI disabled; "
               << spec.sockets.size() << " authorized socket channels\n";
     for (const auto& socket : spec.sockets)

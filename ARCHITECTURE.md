@@ -10,7 +10,7 @@
 
 采用 **C++20 宿主程序 + 小型 C17 guest helper + libkrun C API + passt**。首版是一条命令启动一个临时 VM，无常驻 root daemon、无 OCI 镜像构建步骤。动态复用宿主 `/usr`，其他路径由临时 FHS 根和显式共享组成。
 
-首版支持：CWD 共享、TOML 用户配置、CLI 共享挂载/自定义 tmpfs/环境变量覆盖、路径 mask、单用户 identity map、IPv4 passt 网络、TCP/UDP 端口发布、显式文件系统 Unix stream socket 转发，以及 SSH agent 转发别名。默认 CWD 可写、home 临时、网络关闭、不转发 socket；用户可在配置中改变默认值。
+首版支持：CWD 共享、TOML 用户配置、CLI 共享挂载/自定义 tmpfs/环境变量覆盖、路径 mask、单用户 identity map、IPv4/IPv6 passt 网络、TCP/UDP 端口发布、显式文件系统 Unix stream socket 转发，以及 SSH agent 转发别名。默认 CWD 可写、home 临时、网络关闭、不转发 socket；用户可在配置中改变默认值。
 
 不将多用户 guest、Unix datagram/abstract socket、SCM_RIGHTS 文件描述符传递、跨架构执行、通用 OCI runtime 或 GPU 纳入首版。宿主 `/usr` 更新会改变下次运行环境，因此这不是可复现的软件镜像；以后可另加 snapshot/image 后端。
 
@@ -221,7 +221,7 @@ FD 来自 `socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, ...)`，一端供 `pa
 
 guest 使用 libkrun 内建 IPv4 DHCP，helper 验证地址/路由/DNS 后才启动需要联网的命令。内建初始化对 DHCP 失败可能只发警告，不能把 VM 启动成功视为网络就绪。`/etc/resolv.conf` 是每次运行私有文件；不要复制宿主不可达的 stub DNS 地址。[DHCP 实现](https://github.com/libkrun/libkrun/blob/v1.19.0/init/dhcp.c)
 
-`--network none` 同时意味着不启动 passt、不加 NIC、显式禁用 implicit vsock/TSI；若有明确授权的 IPC，再加无 TSI 的 vsock。普通 passt 出站网络不是域名/IP allowlist 防火墙，访问宿主/LAN 的策略需另行定义。IPv6、DHCP 续租和多 NIC 后续单独实现验证。
+`--network none` 同时意味着不启动 passt、不加 NIC、显式禁用 implicit vsock/TSI；若有明确授权的 IPC，再加无 TSI 的 vsock。普通 passt 出站网络不是域名/IP allowlist 防火墙，访问宿主/LAN 的策略需另行定义。passt 默认按宿主网络可用性启用 IPv4/IPv6，IPv6 使用 RA/SLAAC 自动配置；端口发布地址仍只支持 IPv4。DHCP 续租和多 NIC 后续单独实现验证。
 
 ## 8. Unix socket 转发与 vsock
 
@@ -337,7 +337,7 @@ GUEST_PROBE_PASS
 - 固定 control vsock 始终启用，TSI 显式关闭；network none 不运行 passt。内核可能自带无路由的 dummy0，验收关注无外部 NIC/路由/TSI，以及 guest 本地 loopback 可用。
 - libkrun 1.19 Unix backend 在 HUP 与 IN 同时发生时可能丢失尾部数据。因此 socket 内部通道使用 DATA/EOF/ACK，控制通道也等待 ACK 后才关闭；对外保留正常字节流和半关闭语义。
 - `tests/config_test.cpp` 覆盖解析和策略；`tests/network_test.cpp` 覆盖并发/背压/半关闭/非法帧/清理；`tests/sandbox_test.cpp --integration` 验证切根、FD 清理、权限、mask 和真实 bind 别名负测；两份 Python integration 脚本通过真实 VM 验证核心功能与网络/SSH。
-- 当前保留 VMM 私有 proc 和精确 KVM 节点；seccomp 是 denylist，而非完整 syscall allowlist。原始恶意 virtio-fs 协议审计、宿主 cgroup 总资源限制、持久磁盘配额、IPv6、多 NIC 和 DHCP 续租仍属后续工作。`--tmp-size` 分别限制各临时文件系统，不是总内存限额。
+- 当前保留 VMM 私有 proc 和精确 KVM 节点；seccomp 是 denylist，而非完整 syscall allowlist。原始恶意 virtio-fs 协议审计、宿主 cgroup 总资源限制、持久磁盘配额、IPv6 端口发布、多 NIC 和 DHCP 续租仍属后续工作。`--tmp-size` 分别限制各临时文件系统，不是总内存限额。
 
 ## Filtered D-Bus forwarding
 

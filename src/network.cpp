@@ -498,7 +498,7 @@ NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path) {
 }
 
 NetworkProcess start_passt(const RunSpec& spec) {
-    std::vector<std::string> args {"/usr/bin/passt", "--foreground", "--ipv4-only", "--fd"};
+    std::vector<std::string> args {"/usr/bin/passt", "--foreground", "--fd"};
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0) fail("create passt socketpair");
     Fd parent_socket(pair[0]), child_socket(pair[1]);
