@@ -394,6 +394,9 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     if (!spec.tmp_mib) throw std::runtime_error("private tmpfs size must be positive");
 
     Fd usr = open_source("/usr");
+    Fd alternatives;
+    if (std::filesystem::is_directory("/etc/alternatives"))
+        alternatives = open_source("/etc/alternatives");
     Fd kvm = open_source("/dev/kvm");
     if (!S_ISCHR(info(kvm.fd).st_mode)) throw std::runtime_error("/dev/kvm is not a character device");
     Fd ipc = open_source(ipc_dir);
@@ -519,6 +522,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // An O_PATH FD into the previous mount namespace cannot be recursively
     // bound here. Reopen in the private namespace and verify inode identity.
     repin(usr, "/usr");
+    if (alternatives.fd >= 0) repin(alternatives, "/etc/alternatives");
     repin(kvm, "/dev/kvm");
     repin(ipc, ipc_dir);
     for (auto& mount : mounts) repin(mount.fd, mount.spec.source);
@@ -593,6 +597,11 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     }
 
     bind_fd(root.fd, usr.fd, "/usr", true, true);
+    if (alternatives.fd >= 0) {
+        make_dirs(root.fd, "/etc/alternatives");
+        bind_fd(root.fd, alternatives.fd, "/etc/alternatives", true, true);
+        alternatives = Fd();
+    }
     // Private tmpfs staging provides mountpoints for explicit bind children.
     // Writable shares also permit missing mountpoints; read-only shares require
     // existing targets. The kernel enforces the backing filesystem permissions.
