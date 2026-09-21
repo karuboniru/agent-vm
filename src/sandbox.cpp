@@ -569,7 +569,9 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
         if (std::filesystem::is_regular_file(path, ec)) { ca_source = path; break; }
     }
     if (!ca_source.empty()) {
-        for (const char* target : {"/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/cert.pem",
+        // Fedora curl also uses the extracted bundle path directly.
+        for (const char* target : {"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                   "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/cert.pem",
                                    "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"})
             copy_optional(root.fd, ca_source, target, 16u * 1024u * 1024u);
     }

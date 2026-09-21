@@ -66,6 +66,23 @@ assert '/.agent-vm/ipc' not in open('/proc/self/mountinfo').read()
 """])
     check(True, "host IPC absent from guest filesystem and mount table")
 
+    ca_sources = [Path(p) for p in ("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                  "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem")]
+    ca_source = next((p for p in ca_sources if p.is_file()), None)
+    if ca_source is not None:
+        import hashlib
+        digest = hashlib.sha256(ca_source.read_bytes()).hexdigest()
+        run(["python3", "-c", """import hashlib, pathlib, ssl, sys
+for path in ('/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+             '/etc/pki/tls/certs/ca-bundle.crt', '/etc/pki/tls/cert.pem',
+             '/etc/ssl/certs/ca-certificates.crt', '/etc/ssl/cert.pem'):
+ assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() == sys.argv[1], path
+ context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ context.load_verify_locations(cafile=path)
+ assert context.cert_store_stats()['x509_ca'] > 0, path
+""", digest], ["--network", "none"])
+        check(True, "host CA bundle loads at all guest TLS trust paths")
+
     code = """import os,json,pathlib
 p=pathlib.Path('created');p.write_text('persistent')
 print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'cwd':os.getcwd(),'owner':p.stat().st_uid,'home':os.environ['HOME'],'private':os.getenv('AVM_TEST_PRIVATE'),'inherited':os.getenv('AVM_TEST_INHERIT'),'value':os.getenv('COMPLEX')}))
