@@ -583,8 +583,18 @@ Options parse_options(int argc, char** argv) {
         bool ro = host_cwd == fs::path(spec.home) && cwd_setting == "ro";
         spec.mounts.push_back({source_path(spec.home, host_cwd, spec.home, true), spec.home, ro});
     }
-    if (cwd_setting != "none" && !(home_setting == "shared" && host_cwd == fs::path(spec.home)))
-        spec.mounts.push_back({host_cwd.string(), host_cwd.string(), cwd_setting == "ro"});
+    if (cwd_setting != "none" && !path_within(host_cwd.string(), "/usr")) {
+        // Reuse an exact same-source mount; CWD wins over a different source
+        // or tmpfs at its target. Parent shares retain independent modes.
+        auto existing = std::find_if(spec.mounts.begin(), spec.mounts.end(), [&](const auto& mount) {
+            return mount.target == host_cwd.string() && mount.source == host_cwd.string();
+        });
+        if (existing == spec.mounts.end()) {
+            std::erase_if(spec.mounts, [&](const auto& mount) { return mount.target == host_cwd.string(); });
+            spec.mounts.push_back({host_cwd.string(), host_cwd.string(), cwd_setting == "ro"});
+        }
+        std::erase_if(spec.tmpfs, [&](const auto& mount) { return mount.target == host_cwd.string(); });
+    }
     if (workdir) spec.cwd = *workdir;
     else if (cwd_setting == "none") spec.cwd = spec.home;
     if (spec.ssh_agent) {
@@ -707,7 +717,7 @@ void validate_spec(const RunSpec& spec) {
         if (path_within(mask, "/usr") || path_within("/usr", mask))
             fail("source mask overlaps the runtime /usr tree: " + mask);
         for (const auto& mount : spec.mounts) {
-            if (path_within(mount.source, mask)) fail("a shared source is inside a masked subtree: " + mount.source);
+            if (mount.source == mask) fail("a source cannot be both shared and masked: " + mount.source);
             if (path_within(mask, mount.source)) {
                 std::error_code error;
                 auto status = fs::status(mask, error);
@@ -716,7 +726,11 @@ void validate_spec(const RunSpec& spec) {
                 if (!fs::is_directory(status) && !fs::is_regular_file(status))
                     fail("masked sources must be regular files or directories: " + mask);
                 auto target = normalize(fs::path(mount.target) / fs::path(mask).lexically_relative(mount.source));
-                if (path_within(spec.cwd, target)) fail("workdir is inside a masked subtree: " + spec.cwd);
+                if (path_within(spec.cwd, target)) {
+                    auto child = nearest_mount(spec, spec.cwd, true);
+                    if (!child || child->target == target || !path_within(child->target, target))
+                        fail("workdir is inside a masked subtree: " + spec.cwd);
+                }
                 // A target beneath a later child mount must still be maskable without host writes.
                 if (auto covering = nearest_mount(spec, target, true))
                     check_existing_target(*covering, target, fs::is_directory(status));
@@ -725,6 +739,7 @@ void validate_spec(const RunSpec& spec) {
     }
     for (const auto& target : spec.mask_targets) {
         check_target(target, "mask");
+        if (targets.contains(target)) fail("a target cannot be both shared and masked: " + target);
         if (path_within(spec.cwd, target)) fail("workdir is inside a masked target: " + spec.cwd);
         if (auto parent = nearest_mount(spec, target, true)) {
             auto path = fs::path(parent->source);

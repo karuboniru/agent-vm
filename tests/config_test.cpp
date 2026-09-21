@@ -120,6 +120,19 @@ int main() {
         reject({"--no-config", "--home", "shared", "--mask", "~/.missing"}, "missing mask under writable shared parent refused");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/backup,ro", "--mask", "~/.missing"}, "missing mask under read-only shared parent refused");
         reject({"--no-config", "--mask", "~/.ssh", "--mount", "src=" + home + "/.ssh,dst=/keys"}, "direct source mask bypass refused");
+        write(root / "home/.ssh/known_hosts", "public hosts");
+        options = parse({"--no-config", "--home", "shared", "--mask", "~/.ssh", "--mount",
+                         "src=" + home + "/.ssh/known_hosts,dst=" + home + "/.ssh/known_hosts"});
+        check(options.spec.mounts.size() == 3, "explicit child of source mask accepted");
+        fs::current_path("/usr/bin");
+        options = parse({"--no-config"});
+        check(options.spec.mounts.empty() && options.spec.cwd == fs::canonical("/usr/bin"),
+              "runtime CWD reuses usr mount");
+        fs::current_path(home);
+        options = parse({"--no-config", "--mount", "src=" + cwd + ",dst=" + home});
+        check(options.spec.mounts.size() == 1 && options.spec.mounts[0].source == home,
+              "home CWD overrides conflicting mount");
+        fs::current_path(cwd);
         fs::create_directory_symlink(root / "home/.ssh", root / "alias");
         reject({"--no-config", "--mask", "~/.ssh", "--mount", "src=" + (root / "alias").string() + ",dst=/keys"}, "symlink alias bypass refused");
         parse({"--no-config", "--mask", "~/.missing"});
@@ -157,7 +170,15 @@ int main() {
             reject({"--no-config", "--mount", "src=" + home + ",dst=" + target}, "managed runtime directory protected");
         parse({"--no-config", "--mount", "src=" + home + ",dst=/run/user/" + std::to_string(getuid()) + "/custom"});
         reject({"--no-config", "--mount", "src=" + home + ",dst=relative"}, "relative target refused");
-        reject({"--no-config", "--mount", "src=" + home + ",dst=" + cwd}, "explicit duplicate default target refused");
+        options = parse({"--no-config", "--mount", "src=" + home + ",dst=" + cwd});
+        check(options.spec.mounts.size() == 1 && options.spec.mounts[0].source == cwd,
+              "CWD wins over a conflicting source");
+        for (const auto& mode : {"ro", "rw"}) {
+            options = parse({"--no-config", "--cwd-mode", std::string(mode) == "ro" ? "rw" : "ro",
+                             "--mount", "src=" + cwd + ",dst=" + cwd + "," + mode});
+            check(options.spec.mounts.size() == 1 && options.spec.mounts[0].read_only == (std::string(mode) == "ro"),
+                  "reused CWD mount retains its explicit mode");
+        }
         parse({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--mount", "src=" + home + ",dst=/data/new,ro"});
         parse({"--no-config", "--mount", "src=" + home + "/file,dst=/data/new/deep/file,ro", "--mount", "src=" + home + ",dst=/data,rw"});
         parse({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--tmpfs", "target=/data/new/cache"});
@@ -234,7 +255,8 @@ int main() {
                "missing workdir in child bind beneath tmpfs rejected");
         reject({"--no-config", "--tmpfs", "target=/cache", "--mount", "src=" + home + "/file,dst=/cache/file", "--workdir", "/cache/file"},
                "file bind beneath tmpfs cannot be workdir");
-        reject({"--no-config", "--tmpfs", "target=" + cwd}, "tmpfs conflicts with default CWD mount");
+        options = parse({"--no-config", "--tmpfs", "target=" + cwd});
+        check(options.spec.tmpfs.empty(), "CWD wins over conflicting tmpfs");
         options = parse({"--no-config", "--tmpfs", "target=/cache/parent/child", "--tmpfs", "target=/cache", "--workdir", "/cache/parent"});
         check(options.spec.tmpfs.size() == 2 && options.spec.cwd == "/cache/parent", "nested tmpfs parents created regardless of CLI order");
         parse({"--no-config", "--tmpfs", "target=/cache", "--workdir", "/cache"});

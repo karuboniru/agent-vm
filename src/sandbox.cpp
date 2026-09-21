@@ -343,7 +343,11 @@ void reject_mount_alias_conflicts(const RunSpec& spec, const std::vector<std::st
                     mask.filesystem_path.substr(exported.filesystem_path == "/" ? 0 : exported.filesystem_path.size());
                 const bool mask_contains_source = within(exported.visible_path, mask.visible_path) &&
                     within(exported.filesystem_path, mask.filesystem_path);
-                if (!source_contains_mask || mask_contains_source)
+                const bool explicit_child = mount.source != mask.visible_path &&
+                    within(mount.source, mask.visible_path) && mask_contains_source &&
+                    exported.visible_path.substr(mask.visible_path.size()) ==
+                    exported.filesystem_path.substr(mask.filesystem_path.size());
+                if ((!source_contains_mask || mask_contains_source) && !explicit_child)
                     throw std::runtime_error("source mask conflicts with a filesystem mount alias: " + exported.visible_path);
             }
         }
@@ -445,7 +449,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
             throw std::runtime_error("source masks overlapping /usr are unsupported");
         bool needed = false;
         for (const auto& m : mounts) {
-            if (within(m.spec.source, path))
+            if (m.spec.source == path)
                 throw std::runtime_error("shared source is denied by source mask: " + m.spec.source);
             needed |= within(path, m.spec.source);
         }
@@ -637,15 +641,49 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     Fd empty_directory = target_fd(root.fd, "/.agent-vm/empty-dir");
     Fd empty_file = target_fd(root.fd, "/.agent-vm/empty-file");
     std::vector<std::string> masked_ancestors;
+    std::vector<std::string> restored;
     for (const auto& mask : masks) {
         bool covered = false;
-        for (const auto& ancestor : masked_ancestors) covered |= within(mask.path, ancestor);
+        for (const auto& ancestor : masked_ancestors) {
+            if (!within(mask.path, ancestor)) continue;
+            bool exposed = false;
+            for (const auto& child : restored)
+                exposed |= within(mask.path, child) && within(child, ancestor) && child != ancestor;
+            covered |= !exposed;
+        }
         if (covered) continue;
+        // Preserve the composed child view, never the original source: it may
+        // itself contain child binds. Target masks do not create new exceptions;
+        // the coverage check above preserves existing descendant exceptions.
+        struct Child { const PinnedMount* mount; Fd view; };
+        std::vector<Child> children;
+        if (mask.check_identity && mask.directory) {
+            for (const auto& m : mounts) {
+                if (m.spec.target == mask.path || !within(m.spec.target, mask.path)) continue;
+                bool nested = false;
+                for (const auto& child : children) nested |= within(m.spec.target, child.mount->spec.target);
+                if (!nested) children.push_back({&m, target_fd(root.fd, m.spec.target)});
+            }
+        }
         struct stat expected{};
         expected.st_dev = mask.device;
         expected.st_ino = mask.inode;
-        bind_fd(root.fd, mask.directory ? empty_directory.fd : empty_file.fd, mask.path, false, true,
-                true, mask.check_identity ? &expected : nullptr);
+        if (children.empty()) {
+            bind_fd(root.fd, mask.directory ? empty_directory.fd : empty_file.fd, mask.path, false, true,
+                    true, mask.check_identity ? &expected : nullptr);
+        } else {
+            const auto staging = "/.agent-vm/mask-" + std::to_string(masked_ancestors.size());
+            make_dirs(root.fd, staging);
+            Fd directory = target_fd(root.fd, staging);
+            for (const auto& child : children)
+                placeholder(directory.fd, child.mount->spec.target.substr(mask.path.size()), child.mount->directory);
+            bind_fd(root.fd, directory.fd, mask.path, false, false, true, &expected);
+            for (const auto& child : children) {
+                bind_fd(root.fd, child.view.fd, child.mount->spec.target, child.mount->directory, false);
+                restored.push_back(child.mount->spec.target);
+            }
+            attributes(root.fd, mask.path, MOUNT_ATTR_RDONLY, false);
+        }
         masked_ancestors.push_back(mask.path);
     }
 
@@ -689,7 +727,12 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // IPC is VMM-private: never add it to the virtio-fs object catalog.
     for (const auto& m : mounts) {
         bool hidden = false;
-        for (const auto& path : masked_ancestors) hidden |= within(m.spec.target, path);
+        for (const auto& path : masked_ancestors) {
+            bool exposed = false;
+            for (const auto& child : restored)
+                exposed |= within(m.spec.target, child) && within(child, path) && child != path;
+            hidden |= within(m.spec.target, path) && !exposed;
+        }
         if (!hidden) export_object(m.spec.target);
     }
     // Masks within a share are already part of that share's host view. Masks

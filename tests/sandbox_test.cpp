@@ -1,5 +1,6 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/protocol.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -102,6 +103,85 @@ struct Fixture {
         return avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep);
     }
 };
+static void masked_child_test() {
+    Fixture fixture;
+    write_file(fixture.source / ".ssh/known_hosts", "public hosts");
+    auto spec = fixture.run_spec();
+    spec.mounts.push_back({(fixture.source / ".ssh/known_hosts").string(), "/work/.ssh/known_hosts", true});
+    spec.mounts.push_back({(fixture.source / ".ssh/known_hosts").string(), "/hosts", true});
+    require(child_status([&] {
+        fixture.enter(spec);
+        require(read_file("/work/.ssh/known_hosts") == "public hosts", "masked child not restored");
+        require(read_file("/hosts") == "public hosts", "masked child alias not shared");
+        require(!fs::exists("/work/.ssh/key"), "masked sibling exposed");
+        require(fs::is_empty("/copy/.ssh"), "exception leaked into another alias");
+        int fd = open("/work/.ssh/known_hosts", O_WRONLY);
+        require(fd < 0 && errno == EROFS, "child lost read-only policy");
+    }) == 0, "masked child regression failed");
+    require(read_file((fixture.source / ".ssh/key").c_str()) == "never expose", "host mask changed");
+}
+// A shared directory authorizes its contents only up to more specific masks.
+// Exercise both the assembled tree and every exported view of that directory.
+static void masked_descendant_test() {
+    for (int shape : {0, 1, 2}) for (bool target_mask : {false, true})
+    for (bool read_only : {false, true}) for (bool reverse : {false, true}) {
+        Fixture fixture;
+        fs::create_directories(fixture.source / ".ssh/allowed/secret");
+        write_file(fixture.source / ".ssh/allowed/visible", "allowed data");
+        write_file(fixture.source / ".ssh/allowed/secret/token", "private token");
+        write_file(fixture.source / ".ssh/allowed/secret-file", "private file");
+        auto spec = fixture.run_spec();
+        spec.mounts = {{fixture.source.string(), "/work", read_only},
+                       {fixture.source.string(), "/copy", read_only}};
+        spec.mask_sources.clear();
+        if (shape != 0)
+            spec.mounts.push_back({(fixture.source / ".ssh/allowed").string(), "/work/.ssh/allowed", !read_only});
+        if (shape == 2) spec.mask_sources.push_back((fixture.source / ".ssh").string());
+        const std::vector<std::string> hidden = shape == 0 ? std::vector<std::string>{".ssh"} :
+            std::vector<std::string>{".ssh/allowed/secret", ".ssh/allowed/secret-file"};
+        for (const auto& path : hidden) {
+            if (target_mask) {
+                spec.mask_targets.push_back("/work/" + path);
+                spec.mask_targets.push_back("/copy/" + path);
+            } else spec.mask_sources.push_back((fixture.source / path).string());
+        }
+        if (reverse) {
+            std::reverse(spec.mounts.begin(), spec.mounts.end());
+            std::reverse(spec.mask_sources.begin(), spec.mask_sources.end());
+            std::reverse(spec.mask_targets.begin(), spec.mask_targets.end());
+        }
+        avm::validate_spec(spec);
+        require(child_status([&] {
+            fixture.enter(spec);
+            for (const auto& parent : {std::string("/work"), std::string("/copy")}) {
+                require(!fs::exists(parent + "/.ssh/allowed/secret/token"), "parent share exposed masked child");
+                require(read_file((parent + "/.ssh/allowed/secret-file").c_str()).empty(), "parent share exposed masked file");
+            }
+            if (shape != 0)
+                require(read_file("/work/.ssh/allowed/visible") == "allowed data", "child mask hid allowed sibling");
+            unsigned checked = 0;
+            for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+                const auto tree = object.path() / "root";
+                if (fs::exists(tree / "public")) {
+                    ++checked;
+                    require(!fs::exists(tree / ".ssh/allowed/secret/token"), "parent export bypassed child mask");
+                    require(read_file((tree / ".ssh/allowed/secret-file").c_str()).empty(), "parent export bypassed file mask");
+                }
+                if (fs::exists(tree / "visible")) {
+                    ++checked;
+                    require(!fs::exists(tree / "secret/token"), "restored directory export bypassed child mask");
+                    require(read_file((tree / "secret-file").c_str()).empty(), "restored directory export bypassed file mask");
+                    int fd = open((tree / "secret/new").c_str(), O_WRONLY | O_CREAT, 0600);
+                    require(fd < 0 && errno == EROFS, "restored directory permits writes inside child mask");
+                }
+            }
+            require(checked >= 2, "expected shared exports missing");
+        }) == 0, "masked descendant regression failed");
+        require(read_file((fixture.source / ".ssh/allowed/secret/token").c_str()) == "private token",
+                "mask modified host contents");
+    }
+    std::cout << "masked descendants passed (24 combinations)\n";
+}
 static void nested_mount_modes_test() {
     Fixture fixture;
     const auto child = fixture.base / "child";
@@ -364,6 +444,8 @@ int main(int argc, char** argv) {
         seccomp_test();
         if (argc == 2 && std::string(argv[1]) == "--integration") {
             integration_test();
+            masked_child_test();
+            masked_descendant_test();
             nested_mount_modes_test();
             tmpfs_export_test();
         }
