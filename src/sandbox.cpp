@@ -354,6 +354,8 @@ void reject_mount_alias_conflicts(const RunSpec& spec, const std::vector<std::st
                 throw std::runtime_error("source mask overlaps an implicit /usr filesystem alias");
 }
 bool forbidden_target(const std::string& path, bool bind = false) {
+    if (bind && ((path != "/run" && within(path, "/run")) ||
+                 (path != "/usr" && within(path, "/usr")))) return false;
     if (bind && path != "/etc" && within(path, "/etc") &&
         !within(path, "/etc/resolv.conf")) return false;
     for (const char* protected_path : {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
@@ -400,6 +402,8 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
         check_absolute(m.source);
         check_absolute(m.target);
         if (forbidden_target(m.target, true)) throw std::runtime_error("mount overlaps protected target: " + m.target);
+        if (within("/run/user/" + std::to_string(spec.uid), m.target))
+            throw std::runtime_error("mount overlaps required guest directory: " + m.target);
         if (!m.read_only && (within(m.source, "/usr") || within("/usr", m.source)))
             throw std::runtime_error("host /usr must remain read-only through every mount alias");
         if (within(root_dir, m.source) || within(ipc_dir, m.source) || within(spec_file, m.source))

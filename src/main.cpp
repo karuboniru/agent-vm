@@ -337,7 +337,11 @@ int doctor() {
         for (const auto& object : exports)
             check_krun(krun_add_virtiofs3(context, object.tag.c_str(), object.path.c_str(), 0, false), "virtio-fs object");
         const char* args[] = {nullptr};
-        const char* environment[] = {"PATH=/usr/bin:/bin", "HOME=/", "HOSTNAME=agent-vm", nullptr};
+        // libkrun 1.19 places these entries on the kernel command line before
+        // "--". Recognized kernel parameters are consumed by the kernel.
+        // panic=-1 alone does not turn an Oops during task exit into a panic.
+        const char* environment[] = {"PATH=/usr/bin:/bin", "HOME=/", "HOSTNAME=agent-vm",
+                                     "oops=panic", "panic=-1", nullptr};
         check_krun(krun_set_workdir(context, "/"), "bootstrap cwd");
         check_krun(krun_set_exec(context, AVM_GUEST_HELPER, args, environment), "guest helper");
         avm::install_vmm_seccomp();

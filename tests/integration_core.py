@@ -66,6 +66,36 @@ assert '/.agent-vm/ipc' not in open('/proc/self/mountinfo').read()
 """])
     check(True, "host IPC absent from guest filesystem and mount table")
 
+    run(["python3", "-c", """from pathlib import Path
+cmdline = Path('/proc/cmdline').read_text().split(' -- ', 1)[0]
+assert 'oops=panic' in cmdline and 'panic=-1' in cmdline, cmdline
+assert Path('/proc/sys/kernel/panic_on_oops').read_text().strip() == '1'
+assert Path('/proc/sys/kernel/panic').read_text().strip() == '-1'
+"""])
+    check(True, "guest kernel enables panic on Oops and immediate reset on panic")
+
+    mount_targets = ["/run/media/test-volume/project", "/usr/share/misc", "/etc/custom"]
+    mount_options = []
+    for target in mount_targets:
+        mount_options += ["--mount", f"src={home},dst={target},rw"]
+    run(["/usr/bin/python3", "-c", """import pathlib, sys
+for target in sys.argv[1:]:
+ p = pathlib.Path(target)
+ assert (p / 'public').read_text() == 'fixture-public'
+ (p / 'mounted-write').write_text('shared')
+""", *mount_targets], mount_options + ["--workdir", mount_targets[0]])
+    check((home / "mounted-write").read_text() == "shared", "writable binds beneath runtime and system directories")
+
+    run(["/usr/bin/python3", "-c", """import pathlib
+for target in ('/usr/share/misc', '/etc/custom'):
+ p = pathlib.Path(target)
+ (p / 'private').write_text('temporary')
+ assert (p / 'child/public').read_text() == 'fixture-public'
+"""], ["--tmpfs", "target=/usr/share/misc", "--tmpfs", "target=/etc/custom",
+       "--mount", f"src={home},dst=/usr/share/misc/child,ro",
+       "--mount", f"src={home},dst=/etc/custom/child,ro"])
+    check(not (home / "private").exists(), "system subtree tmpfs permits private files and explicit bind children")
+
     ca_sources = [Path(p) for p in ("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
                                   "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem")]
     ca_source = next((p for p in ca_sources if p.is_file()), None)

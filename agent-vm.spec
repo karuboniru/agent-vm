@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,10 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Mon Sep 21 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.4-1
+- Allow bind and tmpfs mounts beneath runtime and system directories
+- Fail promptly on guest kernel Oops instead of hanging or reporting success
+
 * Mon Sep 21 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.3-1
 - Update to 0.1.3
 - Fix missing Fedora CA bundle path in the guest

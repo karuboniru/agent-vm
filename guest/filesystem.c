@@ -68,6 +68,8 @@ static bool within(const char *path, const char *parent)
 }
 static bool protected_target(const char *path)
 {
+    if (strcmp(path, "/usr") && within(path, "/usr")) return false;
+    if (strcmp(path, "/etc") && within(path, "/etc") && !within(path, "/etc/resolv.conf")) return false;
     const char *protected[] = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
         "/.oldroot", "/bin", "/sbin", "/lib", "/lib64", "/ipc"};
     for (size_t i = 0; i < sizeof(protected) / sizeof(protected[0]); ++i)

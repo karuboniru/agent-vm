@@ -138,10 +138,24 @@ int main() {
         for (const auto& target : {"/etc", "/etc/resolv.conf", "/etc/resolv.conf/child"})
             reject({"--no-config", "--mount", "src=" + home + ",dst=" + target}, "generated etc root and DHCP resolver protected");
         reject({"--no-config", "--mount", "src=/usr,dst=/system,rw"}, "writable alias of /usr refused");
-        reject({"--no-config", "--mount", "src=" + home + ",dst=/usr/local"}, "reserved system subtree protected");
+        parse({"--no-config", "--mount", "src=" + home + ",dst=/usr/share/misc"});
+        parse({"--no-config", "--tmpfs", "target=/usr/share/misc", "--mount", "src=" + home + ",dst=/usr/share/misc/custom"});
+        parse({"--no-config", "--tmpfs", "target=/etc/custom"});
+        reject({"--no-config", "--mount", "src=" + home + ",dst=/usr/agent-vm-missing-test-target"}, "implicit read-only usr requires existing mountpoints");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/"}, "reserved system ancestors protected");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/var/../etc"}, "target normalization prevents traversal bypass");
         reject({"--no-config", "--mount", "src=" + home + ",dst=/run"}, "runtime path protected");
+        for (const auto& target : {"/run/media/test-user/test-volume/project", "/run/custom", "/tmp/custom", "/var/tmp/custom", "/mnt/custom", "/media/custom"}) {
+            for (const auto& mode : {"ro", "rw"}) {
+                auto mounted = parse({"--no-config", "--cwd-mode", "none", "--mount",
+                                      "src=" + cwd + ",dst=" + target + "," + mode, "--workdir", target});
+                check(mounted.spec.cwd == target && mounted.spec.mounts.size() == 1,
+                      "workdir bind beneath a built-in filesystem accepted");
+            }
+        }
+        for (const auto& target : {std::string("/run/user"), "/run/user/" + std::to_string(getuid())})
+            reject({"--no-config", "--mount", "src=" + home + ",dst=" + target}, "managed runtime directory protected");
+        parse({"--no-config", "--mount", "src=" + home + ",dst=/run/user/" + std::to_string(getuid()) + "/custom"});
         reject({"--no-config", "--mount", "src=" + home + ",dst=relative"}, "relative target refused");
         reject({"--no-config", "--mount", "src=" + home + ",dst=" + cwd}, "explicit duplicate default target refused");
         parse({"--no-config", "--mount", "src=" + home + ",dst=/data,rw", "--mount", "src=" + home + ",dst=/data/new,ro"});
@@ -203,7 +217,7 @@ int main() {
         }
         for (const auto& value : {"-1", "+700", "", "888", "10000", "0o700", "700 ", "7.0"})
             reject({"--no-config", "--tmpfs", "target=/cache,mode=" + std::string(value)}, "invalid tmpfs octal mode rejected");
-        for (const auto& target : {"relative", "/", "/usr/local", "/etc/cache", "/proc/cache", "/sys/cache", "/dev/cache",
+        for (const auto& target : {"relative", "/", "/proc/cache", "/sys/cache", "/dev/cache",
                                    "/.agent-vm/cache", "/.oldroot/cache", "/ipc/cache", "/run", "/run/user", "/tmp", "/var", "/var/tmp"})
             reject({"--no-config", "--tmpfs", "target=" + std::string(target)}, "protected tmpfs target rejected: " + std::string(target));
         reject({"--no-config", "--tmpfs", "target=/run/user/" + std::to_string(getuid())}, "tmpfs cannot replace runtime user directory");

@@ -212,11 +212,17 @@ static void tmpfs_export_test() {
 static void integration_test() {
     Fixture fixture;
     auto s = fixture.run_spec();
+    const std::string removable_target = "/run/media/test-user/test-volume/project";
+    s.mounts.push_back({fixture.source.string(), removable_target, false});
     write_file(fixture.ipc / "private-marker", "host IPC");
     int leaked = open(fixture.source.c_str(), O_PATH | O_CLOEXEC);
     require(leaked >= 0, "open inherited fixture descriptor failed");
     require(child_status([&] {
         fixture.enter(s);
+        require(read_file((removable_target + "/public").c_str()) == "public data",
+                "bind below /run missing from host staging tree");
+        require(read_file((std::string(AVM_BOOTSTRAP) + AVM_MOUNT_SPEC).c_str()).find(removable_target) != std::string::npos,
+                "bind below /run missing from guest mount manifest");
         // Inspect the actual host export roots, independent of guest mounts
         // or guest privilege. The IPC bind must remain available only to VMM.
         require(read_file("/.agent-vm/ipc/private-marker") == "host IPC", "VMM lost private IPC");
@@ -253,7 +259,7 @@ static void integration_test() {
             const int fd = open((tree / ".ssh/new").c_str(), O_WRONLY | O_CREAT, 0600);
             require(fd == -1 && (errno == EROFS || errno == EACCES), "VMM can write through export mask");
         }
-        require(shared_objects == 2, "shared aliases missing from object registry");
+        require(shared_objects == 3, "shared aliases missing from object registry");
         require(read_file(AVM_BOOTSTRAP AVM_GUEST_HELPER) == "helper fixture", "bootstrap helper truncated");
         require(read_file(AVM_BOOTSTRAP AVM_GUEST_SPEC) == "config fixture", "bootstrap spec truncated");
         require(!fs::exists(AVM_BOOTSTRAP "/dev/kvm"), "bootstrap exports host KVM node");

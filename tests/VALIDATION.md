@@ -54,6 +54,17 @@ Integration findings affected the implementation:
    in the nested-mount test. The implementation uses two fixed devices: a
    bootstrap root and a confined object catalog, with guest bind mounts selecting
    objects according to the host-generated description.
+4. On 2026-09-21, libkrunfw 5.5.0's Linux 6.12.91 reproduced an exit-time
+   virtiofs submount crash (`generic_shutdown_super`, busy inodes), matching
+   upstream fix `06b41351779e9289e8785694ade9042ae85e41ea`, included in
+   Linux 6.12.95. Before mitigation the core test timed out after 20 seconds;
+   with `oops=panic panic=-1` and a seeded failure status, two subsequent
+   occurrences exited with status 125 and a fatal-exception panic instead.
+   The added core check verifies the command line and effective panic sysctls.
+   Ordinary statuses 0, 37, 127 and forwarded SIGTERM status 143 were also
+   verified. The toolbox build and config/network/seccomp tests passed; D-Bus
+   was skipped. The full core suite still fails when the underlying race fires;
+   fixing that race requires a patched guest kernel in libkrunfw.
 
 This record does not constitute an independent security audit. In particular,
 host-side mutation of masked paths is outside the agreed trusted-host boundary;

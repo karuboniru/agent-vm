@@ -361,11 +361,12 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
 }
 const std::vector<std::string> reserved = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
                                          "/bin", "/sbin", "/lib", "/lib64", "/run", "/ipc"};
-void check_target(const std::string& target, const char* kind, bool bind = false) {
+void check_target(const std::string& target, const char* kind, bool custom_mount = false) {
     if (target.empty() || target[0] != '/' || normalize(target) != target)
         fail(std::string(kind) + " target must be a normalized absolute path: " + target);
     for (const auto& path : reserved) {
-        if (bind && path == "/etc" && target != path && path_within(target, path) &&
+        if (custom_mount && (path == "/run" || path == "/usr") && target != path && path_within(target, path)) continue;
+        if (custom_mount && path == "/etc" && target != path && path_within(target, path) &&
             !path_within(target, "/etc/resolv.conf")) continue;
         if (path_within(target, path) || path_within(path, target))
             fail(std::string(kind) + " target overlaps a reserved guest path: " + target);
@@ -649,6 +650,8 @@ void validate_spec(const RunSpec& spec) {
     std::set<std::string> targets;
     for (const auto& mount : spec.mounts) {
         check_target(mount.target, "mount", true);
+        if (path_within("/run/user/" + std::to_string(spec.uid), mount.target))
+            fail("mount target overlaps a required guest directory: " + mount.target);
         if (!targets.insert(mount.target).second) fail("duplicate mount target: " + mount.target + "; remove one mount or disable the default CWD/home mount");
         if (mount.source.empty() || mount.source[0] != '/' || normalize(mount.source) != mount.source)
             fail("mount source must be a normalized absolute path: " + mount.source);
@@ -664,14 +667,15 @@ void validate_spec(const RunSpec& spec) {
             auto tmpfs = nearest_tmpfs(spec, mount.target, false);
             if (!tmpfs || tmpfs->target.size() < parent->target.size())
                 check_existing_target(*parent, mount.target, fs::is_directory(status), true);
+        } else if (path_within(mount.target, "/usr") && !nearest_tmpfs(spec, mount.target, false)) {
+            check_existing_target({"/usr", "/usr", true}, mount.target, fs::is_directory(status));
         }
     }
     if (spec.tmpfs.size() > 65536) fail("too many tmpfs mounts");
     std::set<std::string> tmpfs_targets;
     for (const auto& tmpfs : spec.tmpfs) {
         if (tmpfs.target.find('\0') != std::string::npos) fail("tmpfs target cannot contain NUL bytes");
-        if (tmpfs.target == "/run" || !path_within(tmpfs.target, "/run")) check_target(tmpfs.target, "tmpfs");
-        else if (normalize(tmpfs.target) != tmpfs.target) fail("tmpfs target must be a normalized absolute path: " + tmpfs.target);
+        check_target(tmpfs.target, "tmpfs", true);
         if (paths_overlap(tmpfs.target, "/.oldroot")) fail("tmpfs target overlaps a private runtime path: " + tmpfs.target);
         for (const auto& required : {std::string("/tmp"), std::string("/var/tmp"), spec.home,
                                      "/run/user/" + std::to_string(spec.uid)})
@@ -685,6 +689,9 @@ void validate_spec(const RunSpec& spec) {
             if (!parent || parent->target.size() < mount->target.size())
                 check_existing_target(*mount, tmpfs.target, true, true);
         }
+        if (path_within(tmpfs.target, "/usr") && !nearest_mount(spec, tmpfs.target, true) &&
+            !nearest_tmpfs(spec, tmpfs.target, false))
+            check_existing_target({"/usr", "/usr", true}, tmpfs.target, true);
         for (const auto& mask : spec.mask_targets)
             if (paths_overlap(tmpfs.target, mask)) fail("tmpfs target overlaps a masked target: " + tmpfs.target);
         for (const auto& mask : spec.mask_sources) {

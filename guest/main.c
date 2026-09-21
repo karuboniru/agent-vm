@@ -686,6 +686,17 @@ static int supervise(pid_t workload, const struct run_spec *spec, int listener, 
 
 int main(void)
 {
+    /* libkrun otherwise treats a reset without a reported status as success.
+     * Seed a failure before filesystem assembly; PID 1 replaces it with the
+     * actual status only after this helper has completely exited, including
+     * mount namespace teardown. This ioctl belongs to libkrun's boot export.
+     */
+    int boot_root = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (boot_root < 0)
+        fail("open bootstrap root for fallback exit status");
+    if (ioctl(boot_root, 0x7602 /* KRUN_EXIT_CODE_IOCTL */, 125) < 0)
+        fail("set fallback VM exit status");
+    close(boot_root);
     struct run_spec spec = read_spec();
     if (geteuid() != 0) {
         fprintf(stderr, "agent-vm guest: helper must start as guest root\n");
