@@ -460,6 +460,37 @@ int main() {
         check(options.spec.environment.at("OVERRIDE") == "cli" && options.spec.mounts[0].read_only, "config env and cwd defaults");
         options = parse({"--no-config"});
         check(options.spec.cpus == 2 && !options.spec.network, "no-config ignores user file");
+        write(root / "config/agent-vm/test.toml", "[vm]\ncpus = 5\n");
+        write(root / "home/work/test.toml", "[vm]\ncpus = 9\n");
+        options = parse({"--profile", "test"});
+        check(options.spec.cpus == 5 && options.spec.memory_mib == 2048 && !options.spec.network,
+              "profile selects XDG filename without loading default or project config");
+        options = parse({"plan", "--profile=test", "--cpus", "6"});
+        check(options.action == avm::Options::Action::Plan && options.spec.cpus == 6,
+              "inline profile works with plan and CLI overrides");
+        options = parse({"--no-config", "--", "echo", "--profile", "test"});
+        check(options.spec.command == std::vector<std::string>{"echo", "--profile", "test"},
+              "profile after command separator is preserved");
+        reject({"--profile"}, "profile requires a value");
+        reject({"--profile="}, "empty profile rejected");
+        for (const auto& name : {".", "..", "../test", "/tmp/test", "nested/test"})
+            reject({"--profile", name}, "profile path components rejected");
+        reject({"--profile", "test", "--profile=test"}, "duplicate profile rejected");
+        reject({"--profile", "test", "--config", config.string()}, "profile and config conflict");
+        reject({"--no-config", "--profile", "test"}, "profile and no-config conflict");
+        reject({"--profile", "missing"}, "missing explicit profile rejected");
+        fs::create_symlink(root / "missing.toml", root / "config/agent-vm/dangling.toml");
+        reject({"--profile", "dangling"}, "dangling profile symlink rejected");
+        fs::create_directories(root / "home/.config/agent-vm");
+        write(root / "home/.config/agent-vm/test.toml", "[vm]\ncpus = 7\n");
+        unsetenv("XDG_CONFIG_HOME");
+        check(parse({"--profile", "test"}).spec.cpus == 7, "profile uses home fallback when XDG is unset");
+        for (const auto& xdg : {"", "relative"}) {
+            setenv("XDG_CONFIG_HOME", xdg, 1);
+            check(parse({"--profile", "test"}).spec.cpus == 7,
+                  "profile uses home fallback when XDG is empty or relative");
+        }
+        setenv("XDG_CONFIG_HOME", (root / "config").c_str(), 1);
         write(config, "unknown = 1\n");
         reject({}, "unknown top-level config field rejected");
         write(config, "[filesystem]\nunknown = 1\n");

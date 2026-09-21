@@ -473,6 +473,7 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     std::optional<std::string> config;
+    std::optional<std::string> profile;
     bool no_config = false;
     std::vector<std::string> args;
     for (int i = start; i < argc; ++i) {
@@ -489,9 +490,20 @@ Options parse_options(int argc, char** argv) {
                 if (++i == argc) fail("--config requires a file");
                 config = argv[i];
             } else config = a.substr(9);
+        } else if (a == "--profile" || a.starts_with("--profile=")) {
+            if (profile) fail("--profile can only be specified once");
+            if (a == "--profile") {
+                if (++i == argc) fail("--profile requires a name");
+                profile = argv[i];
+            } else profile = a.substr(10);
+            if (profile->empty() || profile->find('/') != std::string::npos ||
+                profile->find('\0') != std::string::npos || *profile == "." || *profile == "..")
+                fail("--profile requires a non-empty name without path components");
         } else args.push_back(a);
     }
     if (no_config && config) fail("--config and --no-config cannot be combined");
+    if (profile && config) fail("--profile and --config cannot be combined");
+    if (profile && no_config) fail("--profile and --no-config cannot be combined");
     auto& spec = options.spec;
     spec.uid = getuid(); spec.gid = getgid();
     if (getuid() != geteuid() || getgid() != getegid()) fail("agent-vm must not run as a setuid/setgid executable");
@@ -518,7 +530,7 @@ Options parse_options(int argc, char** argv) {
         else {
             auto xdg = env("XDG_CONFIG_HOME");
             fs::path base = xdg.empty() || !fs::path(xdg).is_absolute() ? fs::path(spec.home) / ".config" : fs::path(xdg);
-            file = base / "agent-vm/config.toml";
+            file = base / "agent-vm" / (profile ? *profile + ".toml" : "config.toml");
         }
         std::error_code error;
         bool exists = fs::exists(file, error);
@@ -526,7 +538,7 @@ Options parse_options(int argc, char** argv) {
             fail("configuration is a dangling symlink: " + file.string());
         if (error) fail("cannot inspect configuration: " + error.message());
         if (exists) load_config(file, spec, home_setting, cwd_setting, workdir);
-        else if (config) fail("configuration file does not exist: " + file.string());
+        else if (config || profile) fail("configuration file does not exist: " + file.string());
     }
     for (size_t i = 0; i < args.size(); ++i) {
         std::string token = args[i];
@@ -852,6 +864,7 @@ void print_help() {
        agent-vm doctor | --help | --version
 
   --config FILE          Read an explicit TOML configuration
+  --profile NAME         Read NAME.toml from the per-user configuration directory
   --no-config            Ignore the per-user configuration
   --cpus N               Virtual CPUs (default 2)
   --memory MiB           Guest RAM (default 2048)
@@ -873,6 +886,8 @@ void print_help() {
 
 Default configuration: $XDG_CONFIG_HOME/agent-vm/config.toml, otherwise
 $HOME/.config/agent-vm/config.toml. Project configuration is never read.
+--profile replaces config.toml with NAME.toml; the file must exist.
+--config, --profile and --no-config are mutually exclusive.
 CLI scalars and environment keys override configuration; mounts, tmpfs, sockets
 and masks are combined. Conflicting filesystem targets are errors.
 Disable default mounts with --cwd-mode none

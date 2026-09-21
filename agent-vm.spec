@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,10 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Mon Sep 21 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.2-1
+- Update to 0.1.2
+- Add named configuration profiles via --profile
+
 * Sun Sep 20 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.1-1
 - Update to 0.1.1
 - Assemble guest filesystems from confined host exports
