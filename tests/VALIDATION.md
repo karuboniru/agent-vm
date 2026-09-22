@@ -3,12 +3,16 @@
 Validated on 2026-09-20 with Fedora 45 x86_64, Linux 7.2.6, libkrun 1.19.0,
 libkrunfw 5.5.0 and passt 20260728. KVM and namespace tests ran outside the
 tool sandbox as the ordinary invoking user; no sudo was needed.
+The socket broker and process-title rows below were updated on 2026-09-23 for
+the shared controller, independent data processes and descriptive process titles.
 
 | Check | Result |
 | --- | --- |
 | CMake/Ninja RelWithDebInfo build | Passed, no compiler warnings |
 | `config-test` | 272 parser and policy checks passed |
-| `network-test` | Concurrent framed streams, 8 × 2 MiB, backpressure, half-close, reconnect, invalid frames, FD/worker/process-group cleanup passed |
+| `network-test` | Concurrent framed streams, 8 × 2 MiB, backpressure, half-close, reconnect, truncated/invalid frames, persistent data-process reuse, live capability/seccomp checks, FD/process-group cleanup and data-process failure propagation passed |
+| `process-title-test` | Short/full titles, preserved argv/environment, fork isolation, control-character escaping and bounded truncation passed |
+| `socket-sandbox-test` | Empty read-only data root, read-only upstream directory, data PID namespace, and denied file/socket/process/namespace syscalls for each plane passed |
 | `sandbox-test` | Seccomp denies dangerous operations while allowing threads |
 | `sandbox-test --integration` | Single-ID mapping, PID namespace, capabilities, read-only host policy placeholders, writable DNS, export-object masks and nested ro/rw, tmpfs-covered export isolation, bootstrap contents, FD cleanup, bind-alias negative tests passed |
 | `integration_core.py` | 47 real-VM checks passed |
@@ -65,6 +69,26 @@ Integration findings affected the implementation:
    verified. The toolbox build and config/network/seccomp tests passed; D-Bus
    was skipped. The full core suite still fails when the underlying race fires;
    fixing that race requires a patched guest kernel in libkrunfw.
+
+On 2026-09-22 the socket broker confinement change built without warnings in
+toolbox. Host `ctest --test-dir build --output-on-failure` passed all five
+tests: config, D-Bus, network, socket-sandbox and VMM seccomp. Real-VM `integration_network.py --case sockets` and `--case ssh` passed.
+The D-Bus VM suite completed its enabled-bus filtering and independent-switch
+checks, then reproduced the existing libkrunfw `generic_shutdown_super` panic
+in the final both-buses-disabled case (no socket brokers), returning 125.
+The socket sandbox regression also covers inherited locked directory/file
+submounts (as with desktop gvfs/doc mounts), an upstream socket that is itself a
+bind mount, and staging beneath the upstream directory. The installed binary
+was verified with the invoking user's default configuration after this fix.
+An ASan/UBSan build could not configure because toolbox lacks the libasan and
+libubsan runtime libraries; sanitizer results are not claimed.
+
+On 2026-09-23 host ctest passed all six tests after merging the controllers.
+The network test additionally verifies three routes through one controller,
+independent data PID namespaces, path-bearing process titles, overlapping source
+parents, a saturated upstream backlog, route identity across socket replacement,
+and cleanup of all data children when one fails. Real-VM socket integration
+passed with the shared controller.
 
 This record does not constitute an independent security audit. In particular,
 host-side mutation of masked paths is outside the agreed trusted-host boundary;

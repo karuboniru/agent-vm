@@ -29,6 +29,12 @@ struct NetworkProcess { int fd = -1; pid_t pid = -1; };
 // Returned fd is the readiness/lifetime pipe and must remain open while in use.
 NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path);
 NetworkProcess start_passt(const RunSpec& spec);
+struct SocketBrokerSpec {
+    std::string listen_path, upstream_path, guest_path;
+};
+// One confined controller for all forwards, one empty-root data process each.
+// stop_child also removes the listener pathname, even after the caller reaps it.
+pid_t start_socket_brokers(const std::vector<SocketBrokerSpec>& sockets);
 pid_t start_socket_broker(const std::string& listen_path, const std::string& upstream_path);
 // Helpers must exit when their parent dies and close all unrelated FDs.
 void stop_child(pid_t pid);

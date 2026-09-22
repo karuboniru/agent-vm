@@ -1,5 +1,6 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/protocol.h"
+#include "agent_vm/process_title.h"
 
 #include <algorithm>
 #include <array>
@@ -10,7 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -59,7 +62,7 @@ bool write_all(int fd, const char* data, size_t size) {
 
 // Every connection streams bytes back and appends a marker after reading EOF.
 // The marker verifies that a client SHUT_WR doesn't discard its response side.
-pid_t echo_server(const std::string& path) {
+pid_t echo_server(const std::string& path, const std::string& marker = "<EOF>") {
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     require(listener >= 0, "create echo listener");
     sockaddr_un target = address(path);
@@ -89,7 +92,7 @@ pid_t echo_server(const std::string& path) {
                     if (!count) break;
                     if (!write_all(client, data.data(), static_cast<size_t>(count))) _exit(1);
                 }
-                if (!write_all(client, "<EOF>", 5)) _exit(1);
+                if (!write_all(client, marker.data(), marker.size())) _exit(1);
                 shutdown(client, SHUT_WR);
                 close(client);
                 _exit(0);
@@ -101,7 +104,7 @@ pid_t echo_server(const std::string& path) {
     return server;
 }
 
-void round_trip(const std::string& path, size_t size, unsigned seed) {
+void round_trip(const std::string& path, size_t size, unsigned seed, const std::string& marker = "<EOF>") {
     int client = connect_to(path);
     require(fcntl(client, F_SETFL, O_NONBLOCK) == 0, "nonblock client");
     std::string payload(size, '\0');
@@ -162,7 +165,7 @@ void round_trip(const std::string& path, size_t size, unsigned seed) {
     }
     close(client);
     require(sent == wire.size() && remote_eof && ack, "whole request acknowledged");
-    require(received == payload + "<EOF>", "response and post-half-close marker match");
+    require(received == payload + marker, "response and post-half-close marker match");
 }
 
 template <typename Callback> void expect_failure(Callback callback, const char* message) {
@@ -183,6 +186,148 @@ void reject_frame(const std::string& path, uint32_t length) {
     close(client);
 }
 
+pid_t data_process(pid_t broker) {
+    std::ifstream children("/proc/" + std::to_string(broker) + "/task/" + std::to_string(broker) + "/children");
+    pid_t data = -1, extra = -1;
+    require(bool(children >> data) && !(children >> extra), "exactly one persistent data process");
+    return data;
+}
+
+void check_process_policy(pid_t pid, bool data) {
+    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+    require(bool(status), "read live broker status");
+    std::string line;
+    unsigned seen = 0;
+    while (std::getline(status, line)) {
+        std::istringstream fields(line);
+        std::string key, value;
+        fields >> key >> value;
+        if (key == "CapInh:" || key == "CapPrm:" || key == "CapEff:" || key == "CapBnd:" || key == "CapAmb:") {
+            require(std::stoull(value, nullptr, 16) == 0, "live broker retains capabilities");
+            ++seen;
+        } else if (key == "NoNewPrivs:") {
+            require(value == "1", "live broker lacks no_new_privs"); ++seen;
+        } else if (key == "Seccomp:") {
+            require(value == "2", "live broker lacks seccomp filter"); ++seen;
+        } else if (key == "NSpid:" && data) {
+            std::string next;
+            bool nested = false;
+            while (fields >> next) { value = next; nested = true; }
+            require(nested && value == "1", "live data process lacks private PID namespace"); ++seen;
+        }
+    }
+    require(seen == (data ? 8u : 7u), "missing live broker confinement fields");
+}
+
+void malformed_connections(const std::string& path) {
+    // Partial headers and payloads must not retain framing state in a reused
+    // session slot or take down the other sessions in the persistent process.
+    for (size_t truncated = 1; truncated <= 7; ++truncated) {
+        int client = connect_to(path);
+        uint32_t encoded = htonl(17);
+        std::string wire(reinterpret_cast<char*>(&encoded), sizeof(encoded));
+        wire += "abc";
+        require(write_all(client, wire.data(), truncated), "send truncated request");
+        close(client);
+    }
+    int client = connect_to(path);
+    const char after_eof[5]{};
+    require(write_all(client, after_eof, sizeof(after_eof)), "send data after EOF");
+    pollfd event{client, POLLIN, 0};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        require(std::chrono::steady_clock::now() < deadline, "data after EOF not rejected");
+        require(poll(&event, 1, 100) >= 0, "poll malformed EOF");
+        if (!(event.revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        char buffer[128];
+        ssize_t got = recv(client, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (got == 0 || (got < 0 && errno == ECONNRESET)) break;
+        require(got > 0 || errno == EAGAIN, "receive malformed EOF response");
+    }
+    close(client);
+    round_trip(path, AVM_STREAM_MAX + 1, 19);
+}
+
+std::string process_text(pid_t pid, const char* file) {
+    std::ifstream input("/proc/" + std::to_string(pid) + "/" + file);
+    require(bool(input), "read process label");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void grouped_brokers(const std::string& dir) {
+    std::filesystem::create_directories(dir + "/group/nested");
+    const std::string first = dir + "/group/service", second = dir + "/group/nested/service";
+    const std::string first_listener = dir + "/first.sock", second_listener = dir + "/second.sock";
+    const std::string third_listener = dir + "/third.sock", slow_path = dir + "/group/slow";
+    pid_t a = -1, b = -1, controller = -1;
+    int slow = -1;
+    std::vector<int> queued;
+    try {
+        a = echo_server(first, "<FIRST>"); b = echo_server(second, "<SECOND>");
+        slow = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        auto slow_address = address(slow_path);
+        require(slow >= 0 && bind(slow, reinterpret_cast<sockaddr*>(&slow_address), sizeof(slow_address)) == 0 &&
+                listen(slow, 1) == 0, "create slow upstream");
+        // Fill its Unix listen backlog without accepting. It must not hold up
+        // connections to either of the independent healthy routes.
+        queued.push_back(connect_to(slow_path)); queued.push_back(connect_to(slow_path));
+        controller = avm::start_socket_brokers({
+            {first_listener, first, "/run/first.sock"},
+            {second_listener, second, "/run/second.sock"},
+            {third_listener, slow_path, "/run/slow.sock"}});
+        std::ifstream children("/proc/" + std::to_string(controller) + "/task/" + std::to_string(controller) + "/children");
+        std::vector<pid_t> data;
+        pid_t child;
+        while (children >> child) data.push_back(child);
+        require(data.size() == 3, "one controller must have one data child per route");
+        require(process_text(controller, "comm") == "avm-sock-ctl\n", "controller short name");
+        require(process_text(controller, "cmdline").starts_with("agent-vm: socket controller (3 forwards)"), "controller full title");
+        const std::string sources[]{first, second, slow_path};
+        for (size_t i = 0; i < data.size(); ++i) {
+            check_process_policy(data[i], true); // Each must independently be PID 1.
+            require(process_text(data[i], "comm") == "avm-sock-" + std::to_string(i) + "\n", "data short name");
+            auto title = process_text(data[i], "cmdline");
+            require(title.find(sources[i]) != std::string::npos && title.find("guest:/run/") != std::string::npos,
+                    "data title must describe both paths");
+        }
+        int blocked_client = connect_to(third_listener);
+        auto started = std::chrono::steady_clock::now();
+        round_trip(first_listener, 100001, 2, "<FIRST>");
+        round_trip(second_listener, 100003, 3, "<SECOND>");
+        close(blocked_client);
+        require(std::chrono::steady_clock::now() - started < std::chrono::seconds(2), "slow upstream blocked unrelated routes");
+        reject_frame(first_listener, AVM_STREAM_ACK);
+        round_trip(second_listener, 31, 4, "<SECOND>");
+        avm::stop_child(a); a = -1;
+        require(unlink(first.c_str()) == 0, "replace grouped upstream");
+        a = echo_server(first, "<REPLACED>");
+        round_trip(first_listener, 10000, 5, "<REPLACED>");
+        round_trip(second_listener, 10000, 6, "<SECOND>");
+        const pid_t group = controller;
+        require(kill(data[0], SIGKILL) == 0, "kill grouped data process");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        int status = 0;
+        pid_t reaped;
+        while ((reaped = waitpid(controller, &status, WNOHANG)) == 0) {
+            require(std::chrono::steady_clock::now() < deadline, "group controller missed child failure");
+            usleep(1000);
+        }
+        require(reaped == controller && WIFEXITED(status) && WEXITSTATUS(status) == 125, "group failure status");
+        avm::stop_child(controller); controller = -1;
+        require(kill(-group, 0) < 0 && errno == ESRCH, "group failure left data processes behind");
+        for (const auto& path : {first_listener, second_listener, third_listener})
+            require(access(path.c_str(), F_OK) < 0 && errno == ENOENT, "group listener cleanup");
+        avm::stop_child(a); a = -1; avm::stop_child(b); b = -1;
+        for (int fd : queued) close(fd);
+        close(slow);
+    } catch (...) {
+        avm::stop_child(controller); avm::stop_child(a); avm::stop_child(b);
+        for (int fd : queued) close(fd);
+        if (slow >= 0) close(slow);
+        throw;
+    }
+}
+
 void wait_ok(pid_t child) {
     int status;
     pid_t result;
@@ -191,7 +336,8 @@ void wait_ok(pid_t child) {
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (avm_process_title_init(argc, argv)) return 1;
     alarm(45);
     char temp[] = "/tmp/agent-vm-network-test.XXXXXX";
     char* directory = mkdtemp(temp);
@@ -215,6 +361,9 @@ int main() {
         sigaddset(&blocked, SIGTERM);
         require(sigprocmask(SIG_BLOCK, &blocked, &previous) == 0, "block parent termination signal");
         broker = avm::start_socket_broker(broker_path, upstream);
+        pid_t persistent_data = data_process(broker);
+        check_process_policy(broker, false);
+        check_process_policy(persistent_data, true);
         require(getpgid(broker) == broker && getpgid(broker) != getpgrp(),
                 "broker is outside the caller's foreground process group");
         require(sigprocmask(SIG_SETMASK, &previous, nullptr) == 0, "restore parent signals");
@@ -232,6 +381,7 @@ int main() {
         round_trip(broker_path, 17, 1);
         reject_frame(broker_path, AVM_STREAM_MAX + 1);
         reject_frame(broker_path, AVM_STREAM_ACK); // Guest may never send host ACK.
+        malformed_connections(broker_path);
         std::vector<pid_t> clients;
         for (unsigned index = 0; index < 8; ++index) {
             pid_t client = fork();
@@ -243,6 +393,7 @@ int main() {
             clients.push_back(client);
         }
         for (pid_t client : clients) wait_ok(client);
+        require(data_process(broker) == persistent_data, "data process was replaced per connection");
 
         // A fixed endpoint is reconnected by pathname for each client. Replacing
         // that endpoint is supported without exposing the directory to the VM.
@@ -251,6 +402,7 @@ int main() {
         require(unlink(upstream.c_str()) == 0, "remove original agent socket");
         server = echo_server(upstream);
         round_trip(broker_path, 90001, 5);
+        require(data_process(broker) == persistent_data, "upstream reconnect restarted data process");
 
         active = connect_to(broker_path);
         uint32_t active_header = htonl(7);
@@ -288,8 +440,27 @@ int main() {
         avm::stop_child(server);
         server = -1;
         avm::stop_child(server); // Negative and already reaped children are harmless.
+        // A crashed data plane must fail the controller and allow the caller
+        // to reclaim the listener even after it has reaped the controller.
+        server = echo_server(dir + "/failure.sock");
+        broker = avm::start_socket_broker(broker_path, dir + "/failure.sock");
+        pid_t failed_data = data_process(broker);
+        require(kill(failed_data, SIGKILL) == 0, "kill data process for lifecycle test");
+        const auto failure_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        int failed_status = 0;
+        pid_t reaped;
+        while ((reaped = waitpid(broker, &failed_status, WNOHANG)) == 0) {
+            require(std::chrono::steady_clock::now() < failure_deadline, "controller missed data-plane death");
+            usleep(1000);
+        }
+        require(reaped == broker, "reap failed controller");
+        require(WIFEXITED(failed_status) && WEXITSTATUS(failed_status) == 125, "data failure must fail controller");
+        avm::stop_child(broker); broker = -1;
+        require(lstat(broker_path.c_str(), &info) < 0 && errno == ENOENT, "reaped controller left listener behind");
+        avm::stop_child(server); server = -1;
+        grouped_brokers(dir);
         std::filesystem::remove_all(dir);
-        std::cout << "network tests passed: relay, concurrency, backpressure, half-close, reconnect, FD and process cleanup\n";
+        std::cout << "network tests passed: persistent relay, confinement, malformed frames, concurrency, backpressure, half-close, reconnect and cleanup\n";
         return 0;
     } catch (const std::exception& error) {
         if (active >= 0) close(active);

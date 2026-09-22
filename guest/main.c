@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "agent_vm/protocol.h"
+#include "agent_vm/process_title.h"
 #include "relay.h"
 #include "filesystem.h"
 
@@ -684,8 +685,10 @@ static int supervise(pid_t workload, const struct run_spec *spec, int listener, 
     return 125;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (avm_process_title_init(argc, argv) || avm_process_title("avm-guest-setup", "agent-vm: guest filesystem setup"))
+        fail("name guest setup");
     /* libkrun otherwise treats a reset without a reported status as success.
      * Seed a failure before filesystem assembly; PID 1 replaces it with the
      * actual status only after this helper has completely exited, including
@@ -710,6 +713,7 @@ int main(void)
         if (avm_relay_prepare(spec.sockets[i], (uid_t)spec.header.uid,
                               (gid_t)spec.header.gid) < 0)
             fail(spec.sockets[i]);
+    if (avm_process_title("avm-guest", "agent-vm: guest supervisor")) fail("name guest supervisor");
     int listener = control_listener();
     sigset_t blocked;
     sigemptyset(&blocked);

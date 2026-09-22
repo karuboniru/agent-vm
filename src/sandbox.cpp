@@ -1,4 +1,5 @@
 #include "agent_vm/runtime.hpp"
+#include "agent_vm/process_title.h"
 #include "agent_vm/protocol.h"
 
 #include <algorithm>
@@ -509,12 +510,14 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     pid_t child = fork();
     if (child < 0) fail("fork PID namespace init");
     if (child) {
+        if (avm_process_title("avm-vmm-wait", "agent-vm: VMM lifecycle monitor")) fail("name VMM monitor");
         int status = 0;
         while (waitpid(child, &status, 0) < 0) {
             if (errno != EINTR) _exit(125);
         }
         _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
     }
+    if (avm_process_title("avm-vmm", "agent-vm: virtual machine")) fail("name VMM");
     if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set VMM parent-death signal");
     // The supervisor forwards these over the guest control channel. Do not let
     // terminal process-group delivery kill the waiting parent or VMM first.

@@ -177,6 +177,20 @@ libkrunfw 5.5.0 embeds Linux 6.12.91, which can crash during virtiofs submount t
 - Passt uses a connected socket, without a host TAP device. IPv4 and IPv6 are enabled by default when available on the host. The first version supports one NIC and IPv4 TCP/UDP publications; IPv6 publication addresses, multiple NICs, full DHCP lease management and destination allowlists are not implemented. Passt networking can access host/LAN destinations available to its host context.
 - The host IPC directory is never exported through virtio-fs. Control, readiness and broker sockets stay in the private host/VMM filesystem; the guest reaches only their fixed vsock ports. Readiness is a connection on its own port, not a file in a shared directory. This boundary does not depend on guest mount permissions.
 - Socket forwarding grants the guest access to the authorized host service's capabilities. SSH forwarding grants agent signing operations even when `.ssh` is masked. Each bridge connects only to its configured host socket through a fixed authorized vsock port; it does not provide arbitrary host-path RPC. Only filesystem Unix stream byte transport is supported, without datagrams, abstract sockets or `SCM_RIGHTS` file descriptor passing. An internal bounded framing protocol preserves EOF and drains data across libkrun's vsock backend.
+- All socket forwards of a VM share one controller, with one persistent data process per forward (N + 1 processes for N forwards). The controller enters private user, mount, network, IPC and UTS namespaces and sees only read-only mounts of the authorized upstream parent directories in its private root, with unrelated submounts masked. Identical parent directories are mounted once. Its seccomp allowlist permits accepting clients, selecting a preopened confined directory, connecting Unix streams and handing off pairs of FDs, but no stream reads, file opens or execution. Mounting the parent preserves reconnection when the host replaces the socket within that directory; replacing the parent directory itself is not tracked. Sibling sockets in that directory are within the controller's filesystem boundary, although normal operation connects only the configured basename.
+- Each data process runs as PID 1 in its own PID namespace with its own empty, read-only root, no proc/dev mounts, no standard streams and no host directory or listening FDs. It receives connected FD pairs through a private, one-way `SCM_RIGHTS` channel; this is internal host plumbing, not guest FD forwarding. Its seccomp allowlist permits receiving those FDs and relaying existing streams, but denies opening files, creating/connecting sockets, exec, fork, ptrace and namespace changes. Both processes clear all capability sets, including the bounding set, and set `no_new_privs` before readiness. The fixed pool retains the existing 64-connection limit per forward; there are no new idle timeouts or aggregate host resource limits. This broker confinement does not add a sandbox around the separate `xdg-dbus-proxy` executable or change passt's own sandbox.
+
+Host processes use descriptive short names (`avm-supervisor`, `avm-sock-ctl`,
+`avm-sock-N`, `avm-vmm-wait`) and process titles visible with
+`ps -eo pid,ppid,comm,args`. Socket data titles include both the host source and
+guest destination. The VMM title is `agent-vm: virtual machine`; libkrun sets its
+own main-thread name (`libkrun VM`). Inside the guest, `avm-guest`, `avm-relay-N`
+and `avm-stream-N` identify the supervisor, socket listeners and stream workers.
+Passt and xdg-dbus-proxy retain their executable names, and workloads retain
+their own names. Titles are set before confinement, escape control characters,
+and are bounded by the original argv/environment storage (very small launch
+environments can truncate long titles). Original argv and environment strings
+are preserved separately before that storage is reused.
 
 The runner is an initial implementation with integration coverage, not an independently audited sandbox. Run guest code only with the writable paths, environment variables, network access and host socket capabilities it should have.
 

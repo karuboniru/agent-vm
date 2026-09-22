@@ -1,4 +1,5 @@
 #include "agent_vm/runtime.hpp"
+#include "agent_vm/process_title.h"
 #include "agent_vm/protocol.h"
 #include <libkrun.h>
 #include <linux/kvm.h>
@@ -314,6 +315,7 @@ int doctor() {
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(125);
         sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, nullptr);
         for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGCHLD, SIGWINCH}) signal(sig, SIG_DFL);
+        if (avm_process_title("avm-vmm-setup", "agent-vm: VMM sandbox setup")) system_error("name VMM setup");
         auto exports = avm::enter_sandbox(spec, (runtime / "root").string(), (runtime / "ipc").string(),
                            (runtime / "spec.bin").string(), helper, net_fd >= 0 ? std::vector<int>{net_fd} : std::vector<int>{});
         clearenv(); setenv("PATH", "/usr/bin:/bin", 1);
@@ -351,6 +353,7 @@ int doctor() {
     }
 }
 int run(avm::RunSpec spec) {
+    if (avm_process_title("avm-supervisor", "agent-vm: host supervisor")) system_error("name supervisor");
     maximize_nofile();
     avm::validate_spec(spec);
     if (access("/dev/kvm", R_OK | W_OK)) system_error("/dev/kvm unavailable in this execution environment; run agent-vm doctor");
@@ -381,14 +384,12 @@ int run(avm::RunSpec spec) {
     pid_t vm = -1;
     std::vector<avm::NetworkProcess> proxies;
     proxies.reserve(2);
-    std::vector<pid_t> brokers;
-    brokers.reserve(spec.sockets.size());
+    pid_t broker = -1;
     auto cleanup = [&] {
         if (vm > 0) { avm::stop_child(vm); vm = -1; }
         if (network.fd >= 0) { close(network.fd); network.fd = -1; }
         if (network.pid > 0) { avm::stop_child(network.pid); network.pid = -1; }
-        for (auto& broker : brokers)
-            if (broker > 0) { avm::stop_child(broker); broker = -1; }
+        if (broker > 0) { avm::stop_child(broker); broker = -1; }
         for (auto& proxy : proxies) {
             avm::stop_child(proxy.pid); proxy.pid = -1;
             if (proxy.fd >= 0) { close(proxy.fd); proxy.fd = -1; }
@@ -407,10 +408,12 @@ int run(avm::RunSpec spec) {
         write_spec(spec, runtime.path / "spec.bin");
         write_worker_spec(spec, runtime.path / "worker.bin");
         if (spec.network) network = avm::start_passt(spec);
+        std::vector<avm::SocketBrokerSpec> forwards;
         for (size_t i = 0; i < spec.sockets.size(); ++i) {
             auto path = runtime.path / "ipc" / ("socket-" + std::to_string(i) + ".sock");
-            brokers.push_back(avm::start_socket_broker(path.string(), spec.sockets[i].source));
+            forwards.push_back({path.string(), spec.sockets[i].source, spec.sockets[i].target});
         }
+        broker = avm::start_socket_brokers(forwards);
         avm::isolate_supervisor_network();
         pid_t parent = getpid();
         vm = fork(); if (vm < 0) system_error("fork VM");
@@ -438,14 +441,14 @@ int run(avm::RunSpec spec) {
             auto check_helper = [&](pid_t& pid, const std::string& name) {
                 if (pid > 0 && waitpid(pid, &status, WNOHANG) == pid) {
                     std::cerr << "agent-vm: " << name << " exited before the VM (status " << status_code(status) << ")\n";
+                    avm::stop_child(pid); // Reaped already; release any broker pathname ownership.
                     pid = -1; helper_failed = true; requested_signal = SIGTERM;
                     deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::seconds(3));
                 }
             };
             check_helper(network.pid, "passt");
             for (auto& proxy : proxies) check_helper(proxy.pid, "xdg-dbus-proxy");
-            for (size_t i = 0; i < brokers.size(); ++i)
-                check_helper(brokers[i], "socket broker for " + spec.sockets[i].target);
+            check_helper(broker, "socket controller");
             if (!guest_ready) {
                 Fd notification(accept4(readiness.value, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
                 if (notification.value >= 0) {
@@ -487,6 +490,7 @@ int run(avm::RunSpec spec) {
 
 int main(int argc, char** argv) {
     try {
+        if (avm_process_title_init(argc, argv)) system_error("initialize process title");
         if (argc == 6 && std::string(argv[1]) == "--internal-worker") {
             auto spec = read_worker_spec(argv[2]);
             vmm(spec, fs::path(argv[2]).parent_path(), argv[5], std::stoi(argv[3]), static_cast<pid_t>(std::stol(argv[4])));

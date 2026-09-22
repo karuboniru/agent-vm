@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "relay.h"
 #include "agent_vm/protocol.h"
+#include "agent_vm/process_title.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -13,6 +14,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -490,6 +492,10 @@ static void relay_supervisor(const char *path, uint32_t port, int ready_fd, pid_
                     close(listener);
                     close(signal_fd);
                     close(parent_fd);
+                    char name[16], title[256];
+                    snprintf(name, sizeof(name), "avm-stream-%u", port - AVM_SOCKET_PORT_BASE);
+                    snprintf(title, sizeof(title), "agent-vm: guest stream[%u] %s", port - AVM_SOCKET_PORT_BASE, path);
+                    if (avm_process_title(name, title)) _exit(125);
                     run_worker(client, supervisor, port);
                 }
                 close(client);
@@ -541,6 +547,14 @@ pid_t avm_relay_start(const char *socket_path, uint32_t port)
     pid_t child = fork();
     if (child == 0) {
         close(readiness[0]);
+        char name[16], title[256];
+        snprintf(name, sizeof(name), "avm-relay-%u", port - AVM_SOCKET_PORT_BASE);
+        snprintf(title, sizeof(title), "agent-vm: guest socket[%u] %s", port - AVM_SOCKET_PORT_BASE, socket_path);
+        if (avm_process_title(name, title)) {
+            int error = errno;
+            (void)write(readiness[1], &error, sizeof(error));
+            _exit(125);
+        }
         relay_supervisor(socket_path, port, readiness[1], parent);
     }
     int saved = errno;

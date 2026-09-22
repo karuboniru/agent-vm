@@ -241,7 +241,15 @@ krun_add_vsock_port2(ctx, P, "/.agent-vm/ipc/socket-0.sock", false);
 
 `--socket src=SOURCE,dst=TARGET` 可重复指定，TOML 使用 `[[sockets]]` 的 `source`、`target` 字段。source 必须解析为现存 socket 文件，并固定为规范化后的宿主绝对路径；target 必须为绝对路径，经过路径规范化。两端 socket pathname 最长 107 字节，转发总数最多 256（包含 SSH agent 别名），重复 guest target 报错。路径含逗号时使用 TOML，避免 CLI 字段分隔歧义。
 
-每个转发有独立的 host broker、guest relay 和固定授权的 vsock port。broker 在隔离后仍能按固定宿主路径重新连接服务，不共享整个宿主 runtime 目录。broker 路径和 endpoint 在启动时授权，guest 不可传任意宿主目标。转发不依赖 passt，`--network none` 也可使用。
+每个转发有独立的 host 数据进程、guest relay 和固定授权的 vsock port；同一 VM 的所有转发共享一个 host 控制进程。broker 在隔离后仍能连接固定授权的宿主服务，不把宿主 runtime 目录共享给 guest。broker 路径和 endpoint 在启动时授权，guest 不可传任意宿主目标。转发不依赖 passt，`--network none` 也可使用。
+
+host broker 使用一个常驻控制进程和每个转发一个常驻数据进程，共 N+1 个进程，不再每连接 fork：
+
+- 控制进程在切根前创建所有 listener，然后进入单用户 userns、mount/net/ipc/uts namespace。根中挂载所有授权上游 socket 父目录的并集，相同目录去重（只读、nosuid/nodev/noexec；递归克隆后遮蔽无关子挂载），没有 proc/dev 或旧根目录 FD；为每个隔离后的授权目录保留 O_PATH FD，并通过仅允许这些 FD 的 fchdir 选择连接目录。正常代码仅按固定 basename 连接；同一父目录内 socket 被删除重建后仍可重连，父目录自身被替换则不跟踪。为保留这种语义，隔离边界包含该目录的其他 socket，而非仅一个 inode。控制进程保留原 PID namespace，供宿主 supervisor 直接管理。
+- 控制进程为每路创建单向 SOCK_SEQPACKET 通道，用 clone(CLONE_NEWPID) 启动数据进程；每个数据进程是自己独立 PID namespace 中的 PID 1，另建 mount namespace 并 pivot 到空的只读 tmpfs 根。关闭 stdio、listener 和其他继承 FD；仅保留 FD 接收通道，随后接收已经连接的 guest/upstream FD 对。控制端关闭通道读方向、数据端关闭写方向，控制进程不读取数据进程的命令或 guest 字节。
+- 双方清空 effective/permitted/inheritable/ambient/bounding capabilities，设置 no_new_privs，分别安装默认拒绝的 seccomp allowlist 后才报告就绪。控制端可 accept/connect/sendmsg 和切换至预打开的授权目录，但不能 read/recv/open/exec；数据端只允许固定通道上的 recvmsg、既有连接收发、poll/shutdown/close 与退出等必要调用，不能 socket/connect/accept/exec/fork/ptrace 或变更 namespace。控制端只可向已启动的数据子进程发 SIGKILL 并 waitpid。所有连接使用非阻塞 socket；EINPROGRESS 通过统一 poll 循环等待，最长 10 秒；某一路 backlog 满不会阻塞其他路由。
+- 数据端用预分配的 64 个 session 和单线程 poll 循环实现帧解析、背压与半关闭；畸形帧只关闭对应连接，连接槽位复用时重置全部协议状态。FD 传递仅用于宿主内部，不向 guest 提供 SCM_RIGHTS。没有新增连接空闲超时、速率限制或全局 cgroup 预算。
+- 数据进程退出使私有通道 HUP，控制进程回收全部数据子进程后以失败状态退出；控制进程退出触发数据进程 PDEATHSIG。监听 pathname 由宿主调用者在 stop_child 中清理，因为控制进程切根后已无法访问它。此边界保护自写的 socket broker，不额外隔离 xdg-dbus-proxy 或修改 passt 自身的沙箱。
 
 guest helper 先以 root 为 target 创建缺失的父目录（0700），并将新目录 owner 设为 U/G，再降权，以 U/G 创建监听 socket（0600）。已有父目录的 owner 和权限保持不变；已有目标一律报错，不删除或替换。target 必须位于可写 guest 文件系统，例如 `/run`、`/tmp`、`/var/tmp`、临时 home、自定义 tmpfs 或显式 rw 共享；不为 socket 解锁只读根骨架。目录和 socket 文件写入最近的挂载层：rw bind 对应宿主源，tmpfs 对应 guest 临时存储。
 

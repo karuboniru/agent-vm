@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.6
+Version:        0.1.7
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,11 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Wed Sep 23 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.7-1
+- Confine socket forwarding with a shared controller and isolated data processes
+- Handle locked runtime submounts and preserve socket replacement reconnects
+- Add descriptive host and guest process names and forwarding paths
+
 * Tue Sep 22 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.6-1
 - Install VMM seccomp before sandbox return and synchronize existing threads
 - Isolate the supervisor network namespace after starting host helpers
