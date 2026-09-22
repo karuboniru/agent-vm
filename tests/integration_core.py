@@ -346,7 +346,9 @@ print('alternating-layers-ok')
               for path, before in layered_before.items() for after in [path.stat()]),
           "alternating layers persist only explicit writable-child writes and preserve covered host paths")
 
-    single_file = base / "single-file"
+    single_directory = base / "single-files"
+    single_directory.mkdir()
+    single_file = single_directory / "file"
     single_file.write_text("original")
     long_target = "/long-" + "x" * 80 + "/file"
     out, _ = run(["python3", "-c", """import errno,pathlib,sys
@@ -363,12 +365,21 @@ print('files-ok')
     check(out.strip() == "files-ok" and single_file.read_text() == "updated",
           "single-file objects preserve independent ro/rw modes and long target paths")
 
-    out, _ = run(["python3", "-c", """import pathlib
-assert not pathlib.Path('/single-hidden').read_bytes()
+    _, err = run(["true"], ["--mount", f"src={single_file},dst=/single-hidden,rw",
+                           "--mask-target", "/single-hidden"], expected=125)
+    check("a target cannot be both shared and masked: /single-hidden" in err,
+          "target mask rejects an explicitly shared file at the same target")
+
+    out, _ = run(["python3", "-c", """import errno,pathlib
+hidden=pathlib.Path('/masked-files/file')
+assert not hidden.read_bytes()
+try: hidden.write_bytes(b'forbidden')
+except OSError as e: assert e.errno in (errno.EROFS,errno.EACCES),e
+else: raise AssertionError('masked file writable')
 assert not list(pathlib.Path('/tmp/hidden').iterdir())
 print('private-masks-ok')
-"""], ["--mount", f"src={single_file},dst=/single-hidden,rw",
-        "--mask-target", "/single-hidden", "--mask-target", "/tmp/hidden"])
+"""], ["--mount", f"src={single_directory},dst=/masked-files,rw",
+        "--mask-target", "/masked-files/file", "--mask-target", "/tmp/hidden"])
     check(out.strip() == "private-masks-ok" and single_file.read_text() == "updated",
           "whole-file and private-tmpfs target masks survive guest assembly")
 

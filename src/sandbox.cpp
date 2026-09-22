@@ -373,6 +373,18 @@ void verify_identity_text(const std::string& text) {
 }
 } // namespace
 
+void isolate_supervisor_network() {
+    const auto uid = getuid(), gid = getgid();
+    if (geteuid() != uid || getegid() != gid)
+        throw std::runtime_error("supervisor requires matching real/effective UID and GID");
+    if (unshare(CLONE_NEWUSER)) fail("create supervisor user namespace");
+    proc_write("/proc/self/uid_map", std::to_string(uid) + " " + std::to_string(uid) + " 1\n");
+    proc_write("/proc/self/setgroups", "deny\n");
+    proc_write("/proc/self/gid_map", std::to_string(gid) + " " + std::to_string(gid) + " 1\n");
+    if (unshare(CLONE_NEWNET)) fail("create supervisor network namespace");
+    drop_capabilities();
+}
+
 std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                    const std::string& ipc_dir, const std::string& spec_file,
                    const std::string& helper, const std::vector<int>& keep_fds) {
@@ -800,6 +812,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     resolv = Fd(); proc = Fd(); empty_directory = Fd(); empty_file = Fd(); root = Fd();
     close_unlisted(keep_fds);
     drop_capabilities();
+    install_vmm_seccomp();
     return {{AVM_EXPORT_TAG, AVM_EXPORT_TAG}};
 }
 
@@ -807,6 +820,8 @@ void install_vmm_seccomp() {
     scmp_filter_ctx filter = seccomp_init(SCMP_ACT_ALLOW);
     if (!filter) throw std::runtime_error("cannot allocate VMM seccomp filter");
     try {
+        int rc = seccomp_attr_set(filter, SCMP_FLTATR_CTL_TSYNC, 1);
+        if (rc < 0) throw std::system_error(-rc, std::generic_category(), "enable VMM seccomp thread synchronization");
         for (const char* name : {"mount", "umount", "umount2", "pivot_root", "chroot", "setns", "unshare", "execve", "execveat",
                                  "ptrace", "process_vm_readv", "process_vm_writev", "open_by_handle_at", "name_to_handle_at",
                                  "bpf", "perf_event_open", "init_module", "finit_module", "delete_module", "reboot",
@@ -831,7 +846,7 @@ void install_vmm_seccomp() {
                                       SCMP_A0(SCMP_CMP_MASKED_EQ, flag, flag));
             if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp namespace clone");
         }
-        int rc = seccomp_load(filter);
+        rc = seccomp_load(filter);
         if (rc < 0) throw std::system_error(-rc, std::generic_category(), "load VMM seccomp");
     } catch (...) { seccomp_release(filter); throw; }
     seccomp_release(filter);

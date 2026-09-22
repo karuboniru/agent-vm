@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.5
+Version:        0.1.6
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,11 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Tue Sep 22 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.6-1
+- Install VMM seccomp before sandbox return and synchronize existing threads
+- Isolate the supervisor network namespace after starting host helpers
+- Correct conflicting target mask integration coverage
+
 * Mon Sep 21 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.5-1
 - Allow explicit shared descendants as source mask exceptions
 - Reuse existing CWD mounts and prefer CWD sharing over conflicting mounts

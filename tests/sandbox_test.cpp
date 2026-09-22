@@ -1,6 +1,7 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/protocol.h"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -41,10 +42,31 @@ template<class F> static int child_status(F function) {
     while (waitpid(child, &status, 0) < 0) require(errno == EINTR, "waitpid failed");
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
+static bool namespace_changes_denied() {
+    // unshare(0) needs no capabilities: EPERM proves the filter is active.
+    errno = 0;
+    if (unshare(0) != -1 || errno != EPERM) return false;
+    errno = 0;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != -1 || errno != EPERM) return false;
+    errno = 0;
+    return umount2("/work/.ssh", MNT_DETACH) == -1 && errno == EPERM;
+}
 static void seccomp_test() {
     require(child_status([] {
         require(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, "no_new_privs failed");
+        std::atomic<bool> installed{false};
+        bool synchronized = false;
+        std::jthread existing([&](std::stop_token stop) {
+            while (!installed.load()) {
+                if (stop.stop_requested()) return;
+                std::this_thread::yield();
+            }
+            synchronized = namespace_changes_denied();
+        });
         avm::install_vmm_seccomp();
+        installed.store(true);
+        existing.join();
+        require(synchronized, "existing thread did not receive VMM filter");
         errno = 0;
         require(syscall(SYS_mount, nullptr, nullptr, nullptr, 0, nullptr) == -1 && errno == EPERM, "mount was not denied");
         errno = 0;
@@ -56,9 +78,35 @@ static void seccomp_test() {
         require(syscall(SYS_clone3, nullptr, 0) == -1 && errno == ENOSYS, "clone3 did not request fallback");
 #endif
         bool ran = false;
-        std::thread thread([&] { ran = true; }); thread.join();
-        require(ran, "pthread creation failed under VMM filter");
+        std::thread thread([&] { ran = namespace_changes_denied(); }); thread.join();
+        require(ran, "new thread did not inherit VMM filter");
+        require(child_status([] {
+            require(namespace_changes_denied(), "fork child did not inherit VMM filter");
+        }) == 0, "seccomp fork inheritance failed");
     }) == 0, "seccomp regression failed");
+}
+static void supervisor_network_test() {
+    require(child_status([] {
+        const auto uid = getuid(), gid = getgid();
+        int original = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+        require(original >= 0, "open original network namespace failed");
+        struct stat before{}, after{};
+        require(fstat(original, &before) == 0, "stat original network namespace failed");
+        avm::isolate_supervisor_network();
+        require(stat("/proc/self/ns/net", &after) == 0, "stat supervisor network namespace failed");
+        require(before.st_ino != after.st_ino, "supervisor retained host network namespace");
+        require(getuid() == uid && geteuid() == uid && getgid() == gid && getegid() == gid,
+                "supervisor identity changed");
+        require(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1, "supervisor lacks no_new_privs");
+        __user_cap_header_struct header{_LINUX_CAPABILITY_VERSION_3, 0};
+        __user_cap_data_struct caps[2]{};
+        require(syscall(SYS_capget, &header, caps) == 0, "supervisor capget failed");
+        for (const auto& cap : caps)
+            require(!(cap.effective | cap.permitted | cap.inheritable), "supervisor capabilities remain");
+        errno = 0;
+        require(setns(original, CLONE_NEWNET) == -1 && errno == EPERM, "supervisor can rejoin host network");
+        close(original);
+    }) == 0, "supervisor network isolation failed");
 }
 static void outer_mount_namespace() {
     const uid_t uid = getuid(); const gid_t gid = getgid();
@@ -363,7 +411,7 @@ static void integration_test() {
         require(access(fixture.base.c_str(), F_OK) == -1, "old root remains visible");
         require(access("/.oldroot", F_OK) == -1, "old-root mountpoint remains");
         require(read_file("/proc/self/uid_map").find(std::to_string(s.uid)) != std::string::npos, "private proc lacks namespace process");
-        avm::install_vmm_seccomp();
+        require(namespace_changes_denied(), "sandbox returned without VMM filter");
     }) == 0, "sandbox integration failed");
     close(leaked);
     require(fs::exists(fixture.source / "created"), "shared output not visible on host");
@@ -443,6 +491,7 @@ int main(int argc, char** argv) {
     try {
         seccomp_test();
         if (argc == 2 && std::string(argv[1]) == "--integration") {
+            supervisor_network_test();
             integration_test();
             masked_child_test();
             masked_descendant_test();

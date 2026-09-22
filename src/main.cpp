@@ -344,7 +344,6 @@ int doctor() {
                                      "oops=panic", "panic=-1", nullptr};
         check_krun(krun_set_workdir(context, "/"), "bootstrap cwd");
         check_krun(krun_set_exec(context, AVM_GUEST_HELPER, args, environment), "guest helper");
-        avm::install_vmm_seccomp();
         check_krun(krun_start_enter(context), "start VM");
         _exit(125);
     } catch (const std::exception& e) {
@@ -412,6 +411,7 @@ int run(avm::RunSpec spec) {
             auto path = runtime.path / "ipc" / ("socket-" + std::to_string(i) + ".sock");
             brokers.push_back(avm::start_socket_broker(path.string(), spec.sockets[i].source));
         }
+        avm::isolate_supervisor_network();
         pid_t parent = getpid();
         vm = fork(); if (vm < 0) system_error("fork VM");
         if (vm == 0) {
