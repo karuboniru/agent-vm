@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "filesystem.h"
+#include "paths.h"
 #include "agent_vm/protocol.h"
 
 #include <errno.h>
@@ -52,29 +53,7 @@ static char *string(struct reader *r)
 }
 static bool path_valid(const char *path)
 {
-    if (path[0] != '/' || !path[1]) return false;
-    for (const char *p = path + 1; ; ) {
-        const char *end = strchr(p, '/');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        if (!n || (n == 1 && *p == '.') || (n == 2 && !memcmp(p, "..", 2))) return false;
-        if (!end) return true;
-        p = end + 1;
-    }
-}
-static bool within(const char *path, const char *parent)
-{
-    size_t size = strlen(parent);
-    return !strncmp(path, parent, size) && (!path[size] || path[size] == '/');
-}
-static bool protected_target(const char *path)
-{
-    if (strcmp(path, "/usr") && within(path, "/usr")) return false;
-    if (strcmp(path, "/etc") && within(path, "/etc") && !within(path, "/etc/resolv.conf")) return false;
-    const char *protected[] = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
-        "/.oldroot", "/bin", "/sbin", "/lib", "/lib64", "/ipc"};
-    for (size_t i = 0; i < sizeof(protected) / sizeof(protected[0]); ++i)
-        if (within(path, protected[i]) || within(protected[i], path)) return true;
-    return false;
+    return avm_path_valid(path) && strcmp(path, "/");
 }
 static int target_fd(int root, const char *path)
 {
@@ -165,7 +144,7 @@ void avm_mount_filesystems(void)
         } else if (e->kind == AVM_MOUNT_DIRECTORY || e->kind == AVM_MOUNT_FILE) {
             if (!path_valid(e->object) || e->mode || e->uid || e->gid) invalid();
         } else if (e->kind == AVM_MOUNT_USER_TMPFS) {
-            if (e->object[0] || (e->mode & ~07777u) || protected_target(e->target)) invalid();
+            if (e->object[0] || (e->mode & ~07777u) || avm_protected_target(e->target, true)) invalid();
         } else invalid();
         layers_started = true;
         for (uint32_t j = 0; j < i; ++j) {
@@ -173,8 +152,8 @@ void avm_mount_filesystems(void)
             // Layers must install parents first. Only shared mounts may cover
             // built-in tmpfs, as happens when sharing the user's home.
             if (((prior->kind != AVM_MOUNT_TMPFS || e->kind == AVM_MOUNT_USER_TMPFS) &&
-                 within(prior->target, e->target)) ||
-                (prior->kind == AVM_MOUNT_FILE && within(e->target, prior->target))) invalid();
+                 avm_path_within(prior->target, e->target)) ||
+                (prior->kind == AVM_MOUNT_FILE && avm_path_within(e->target, prior->target))) invalid();
         }
     }
     if (r.offset != r.size) invalid();
@@ -205,7 +184,7 @@ void avm_mount_filesystems(void)
             const struct entry *prior = &entries[j];
             // Later containing mounts hide earlier ones, including an export
             // replacing or covering the built-in private home filesystem.
-            if (within(e->target, prior->target)) parent = prior;
+            if (avm_path_within(e->target, prior->target)) parent = prior;
         }
         if (!parent) placeholder(root, e->target, e->kind != AVM_MOUNT_FILE);
         else if (parent->kind == AVM_MOUNT_TMPFS || parent->kind == AVM_MOUNT_USER_TMPFS) {

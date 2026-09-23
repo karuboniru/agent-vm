@@ -18,6 +18,9 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <seccomp.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -77,6 +80,21 @@ static void seccomp_test() {
         errno = 0;
         require(syscall(SYS_clone3, nullptr, 0) == -1 && errno == ENOSYS, "clone3 did not request fallback");
 #endif
+        for (const char* name : {"io_uring_setup", "io_uring_register", "io_uring_enter", "userfaultfd", "quotactl_fd", "kcmp"}) {
+            int call = seccomp_syscall_resolve_name(name);
+            require(call != __NR_SCMP_ERROR, "missing syscall definition");
+            errno = 0;
+            require(syscall(call, -1, 0, 0, 0, 0, 0) == -1 && errno == EPERM, name);
+        }
+        for (int family : {AF_VSOCK, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET}) {
+            errno = 0;
+            require(socket(family, SOCK_STREAM, 0) == -1 && errno == EPERM, "host socket family escaped filter");
+            int pair[2];
+            require(socketpair(family, SOCK_STREAM, 0, pair) == -1 && errno == EPERM, "socketpair family escaped filter");
+        }
+        int pair[2];
+        require(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "Unix stream backend denied");
+        close(pair[0]); close(pair[1]);
         bool ran = false;
         std::thread thread([&] { ran = namespace_changes_denied(); }); thread.join();
         require(ran, "new thread did not inherit VMM filter");
@@ -136,6 +154,12 @@ struct Fixture {
         fs::create_directories(root); fs::create_directory(ipc);
         write_file(source / ".ssh/key", "never expose");
         write_file(source / "public", "public data");
+        int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_un address{}; address.sun_family = AF_UNIX;
+        auto ready = (ipc / "ready.sock").string();
+        std::strcpy(address.sun_path, ready.c_str());
+        require(bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "bind fixture readiness");
+        close(listener);
         write_file(helper, "helper fixture"); write_file(spec, "config fixture");
     }
     ~Fixture() { std::error_code ec; fs::remove_all(base, ec); }
@@ -148,7 +172,8 @@ struct Fixture {
         return s;
     }
     std::vector<avm::FilesystemExport> enter(avm::RunSpec s, const std::vector<int>& keep = {}) const {
-        return avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep);
+        int control = avm::isolate_supervisor_network(true);
+        return avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep, control);
     }
 };
 static void masked_child_test() {
@@ -353,7 +378,30 @@ static void integration_test() {
                 "bind below /run missing from guest mount manifest");
         // Inspect the actual host export roots, independent of guest mounts
         // or guest privilege. The IPC bind must remain available only to VMM.
-        require(read_file("/.agent-vm/ipc/private-marker") == "host IPC", "VMM lost private IPC");
+        require(!fs::exists("/.agent-vm/ipc/private-marker"), "VMM retains host IPC directory");
+        require(unlink(AVM_READY_SOCKET) == -1, "VMM can replace readiness inode");
+        require(symlink("/work/other.sock", AVM_READY_SOCKET) == -1, "VMM can redirect readiness");
+        require(open("/.agent-vm/ipc/new", O_CREAT | O_WRONLY, 0600) == -1, "IPC parent is writable");
+        struct statvfs control_fs{};
+        require(statvfs("/.agent-vm/ipc/control", &control_fs) == 0, "stat control tmpfs");
+        require(control_fs.f_blocks * control_fs.f_frsize <= 65536 && control_fs.f_files <= 16,
+                "control storage lacks byte/inode bounds");
+        int quota = open("/.agent-vm/ipc/control/quota", O_CREAT | O_WRONLY, 0600);
+        require(quota >= 0, "control tmpfs not writable");
+        std::string bytes(128 * 1024, 'x');
+        ssize_t written = write(quota, bytes.data(), bytes.size());
+        require(written > 0 && written <= 65536, "control tmpfs exceeded byte quota");
+        require(write(quota, bytes.data(), 1) == -1 && errno == ENOSPC, "control byte quota not enforced");
+        close(quota);
+        require(unlink("/.agent-vm/ipc/control/quota") == 0, "remove quota fixture");
+        unsigned created = 0;
+        for (; created < 32; ++created) {
+            auto path = "/.agent-vm/ipc/control/inode-" + std::to_string(created);
+            if (mkdir(path.c_str(), 0700)) break;
+        }
+        require(created < 16 && errno == ENOSPC, "control inode quota not enforced");
+        require(socket(AF_VSOCK, SOCK_STREAM, 0) == -1 && errno == EPERM,
+                "isolated VMM can create a host vsock socket");
         struct stat ipc_info{};
         require(stat("/.agent-vm/ipc", &ipc_info) == 0, "stat private IPC failed");
         for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
@@ -415,6 +463,7 @@ static void integration_test() {
     }) == 0, "sandbox integration failed");
     close(leaked);
     require(fs::exists(fixture.source / "created"), "shared output not visible on host");
+    require(!fs::exists(fixture.ipc / "control"), "control data leaked to host runtime storage");
     require(fs::is_empty(fixture.root), "namespace mount leaked to supervisor");
     require(read_file((fixture.source / ".ssh/key").c_str()) == "never expose", "host secret changed");
     require(!fs::exists(fixture.source / ".ssh/new"), "mask modified source");

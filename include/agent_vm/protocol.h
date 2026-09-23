@@ -51,7 +51,7 @@ struct avm_mount_header {
 };
 /* Host/VMM paths only: these are never exported to the guest. */
 #define AVM_READY_SOCKET "/.agent-vm/ipc/ready.sock"
-#define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control.sock"
+#define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control/control.sock"
 #define AVM_SOCKET_PREFIX "/.agent-vm/ipc/socket-"
 
 struct avm_spec_header {

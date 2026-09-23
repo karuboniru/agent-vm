@@ -22,7 +22,9 @@ CTest does not start real VMs, but network/socket-sandbox tests create namespace
 | `dbus` | Proxy readiness, lifetime FD, startup failure, reaping; missing xdg-dbus-proxy returns 77 and CTest marks it skipped |
 | `network` | Concurrent streams, backpressure, half-close, frame validation, reconnection, shared controller, data-process reuse and failure cleanup |
 | `socket-sandbox` | Controller/data filesystem and syscall boundaries, independent PID namespace, locked submounts, socket binds |
-| `sandbox-seccomp` | Dangerous-syscall rejection and thread compatibility |
+| `control` | Pinned control inode, symlink rejection, parent replacement and rename races |
+| `paths` | C/C++ reserved-path, normalization and containment parity |
+| `sandbox-seccomp` | Dangerous-syscall and host socket-family rejection; thread compatibility |
 
 `sandbox-test --integration` additionally checks single-ID mappings, namespaces, capabilities, read-only and nested ro/rw mounts, masks/alias rejection, tmpfs coverage, bootstrap contents, and FD cleanup.
 

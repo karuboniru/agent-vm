@@ -468,7 +468,7 @@ def test_sockets(binary: Path, case: Path) -> None:
     readonly_cache.chmod(0o751)
     (readonly_cache / "host-only").write_text("host-data", encoding="ascii")
     readonly_before = readonly_cache.stat()
-    # A 74-byte runtime directory fits control.sock but not socket-0.sock
+    # A 74-byte runtime directory fits ready.sock but not socket-0.sock
     # after the private directory suffix, so startup must select a fallback.
     runtime = case / ("runtime-" + "x" * (74 - len(str(case.resolve())) - len("/runtime-")))
     runtime.mkdir(mode=0o700)

@@ -25,7 +25,7 @@ worker 以精简环境重新 exec，隔离配置解析留下的地址空间与�
 
 安全边界是 **guest 与整个 VMM 能访问的宿主资源集合**。virtio-fs export path 不构成独立隔离边界；guest 内的 mount 权限也不承担宿主资源隔离。宿主只读属性、mask、切根和 FD 清理在创建文件共享后端之前完成。
 
-VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。VMM seccomp 使用 denylist，socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
+VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。VMM seccomp 使用 denylist，包含全部三个 io_uring syscall、userfaultfd、quotactl_fd 和 kcmp；宿主 socket/socketpair 仅允许 AF_UNIX，guest AF_VSOCK 使用 libkrun 的 Unix backend，passt 使用继承的 Unix stream。socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
 
 宿主是可信的；运行期间宿主重命名、替换或重建被 mask 的路径不在保证范围内。mask 保护共享入口，不隐藏其他位置已有的硬链接、副本或已授出的 FD。可写共享授予直接修改对应宿主源的权限。
 
@@ -87,7 +87,7 @@ passt 留在宿主 network namespace，通过预连接 Unix stream FD 与 libkru
 | 1025–1280 | 至多 256 个授权 socket 转发 |
 | 1281 | 一次性 guest readiness 连接 |
 
-IPC 目录仅存在于宿主/VMM 私有树，不进入 bootstrap 或 export catalog。readiness 无 payload，不使用共享文件标记，只是生命周期提示，不是 guest 可信证明。控制协议不接收宿主路径或任意命令。
+IPC 不进入 bootstrap 或 export catalog。已监听的 broker/readiness socket 逐个按 inode 只读 bind，父目录只读；broker upstream socket 替换后的重连仍经过 broker。宿主 runtime IPC 目录不再挂入 VMM。libkrun 延迟创建的 control listener 位于 supervisor 创建的 detached tmpfs（64 KiB、16 个 inode），supervisor 保留 dirfd，VMM 挂载同一文件系统。它不占用宿主 runtime 文件系统路径，VM 和 supervisor 释放引用后自动回收。控制消息通过固定 dirfd，以 `O_PATH | O_NOFOLLOW` 打开 `control.sock`，`fstat` 确认 socket，并保持 inode FD 存活，通过 `/proc/self/fd/<fd>` 连接，避免路径替换竞态。受攻陷的 VMM 仍可破坏自身控制通道；supervisor 五秒后的强制终止机制保留。readiness 无 payload，不使用共享文件标记，只是生命周期提示，不是 guest 可信证明。控制协议不接收宿主路径或任意命令。
 
 `include/agent_vm/protocol.h` 定义协议：启动格式版本 2、挂载格式版本 3，使用本机字节序，要求同架构 host/guest；配置大小上限为 1 MiB，字符串带长度。stream relay 使用网络字节序的长度、DATA/EOF/ACK 帧，单帧数据最多 65536 字节。EOF 与确认保证半关闭及尾部数据排空后再关闭内部传输。
 

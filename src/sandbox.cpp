@@ -1,3 +1,4 @@
+#include "agent_vm/paths.hpp"
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/process_title.h"
 #include "agent_vm/protocol.h"
@@ -27,6 +28,7 @@
 #include <signal.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -51,16 +53,10 @@ struct Fd {
     ~Fd() { if (fd >= 0) close(fd); }
 };
 std::string fd_path(int fd) { return "/proc/self/fd/" + std::to_string(fd); }
-bool within(const std::string& path, const std::string& parent) {
-    return path == parent || (parent == "/" && path.starts_with('/')) ||
-           (path.size() > parent.size() && path.starts_with(parent) && path[parent.size()] == '/');
-}
-void check_absolute(const std::string& path) {
-    if (path.empty() || path[0] != '/' || path.find('\0') != std::string::npos ||
-        std::filesystem::path(path).lexically_normal().string() != path ||
-        (path.size() > 1 && path.back() == '/'))
-        throw std::runtime_error("sandbox path must be absolute and normalized: " + path);
-}
+using paths::within;
+using paths::check_absolute;
+using paths::forbidden_target;
+
 Fd open_source(const std::string& path, int flags = O_PATH) {
     // Sources are canonicalized by the policy layer. Do not follow replacements
     // with symlinks, including a changed ancestor, during sandbox setup.
@@ -358,66 +354,50 @@ void reject_mount_alias_conflicts(const RunSpec& spec, const std::vector<std::st
             if (overlaps(usr, mask))
                 throw std::runtime_error("source mask overlaps an implicit /usr filesystem alias");
 }
-bool forbidden_target(const std::string& path, bool bind = false) {
-    if (bind && ((path != "/run" && within(path, "/run")) ||
-                 (path != "/usr" && within(path, "/usr")))) return false;
-    if (bind && path != "/etc" && within(path, "/etc") &&
-        !within(path, "/etc/resolv.conf")) return false;
-    for (const char* protected_path : {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
-                                       "/bin", "/sbin", "/lib", "/lib64", "/run", "/ipc"})
-        if (within(path, protected_path) || within(protected_path, path)) return true;
-    return false;
-}
-void verify_identity_text(const std::string& text) {
-    if (text.empty() || text.find_first_of(":\n\r") != std::string::npos || text.find('\0') != std::string::npos)
-        throw std::runtime_error("identity text contains passwd delimiters");
-}
-} // namespace
 
-void isolate_supervisor_network() {
-    const auto uid = getuid(), gid = getgid();
-    if (geteuid() != uid || getegid() != gid)
-        throw std::runtime_error("supervisor requires matching real/effective UID and GID");
-    if (unshare(CLONE_NEWUSER)) fail("create supervisor user namespace");
-    proc_write("/proc/self/uid_map", std::to_string(uid) + " " + std::to_string(uid) + " 1\n");
-    proc_write("/proc/self/setgroups", "deny\n");
-    proc_write("/proc/self/gid_map", std::to_string(gid) + " " + std::to_string(gid) + " 1\n");
-    if (unshare(CLONE_NEWNET)) fail("create supervisor network namespace");
-    drop_capabilities();
-}
+struct Endpoint { std::string source, target; Fd fd; };
+struct Layer {
+    std::string target;
+    const PinnedMount* bind;
+    const TmpfsSpec* tmpfs;
+};
+struct PinnedSources {
+    Fd usr, alternatives, kvm, control;
+    std::vector<Endpoint> endpoints;
+    Fd configuration, executable;
+    std::vector<PinnedMount> mounts;
+    std::vector<TmpfsSpec> tmpfs;
+    std::vector<Layer> layers;
+    std::vector<Mask> masks;
+    std::vector<Fd> mask_pins;
+};
+PinnedSources pin_sources(const RunSpec& spec, const std::string& root_dir,
+                         const std::string& ipc_dir, const std::string& spec_file,
+                         const std::string& helper, int control_directory) {
+    PinnedSources sources;
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
+    usr = open_source("/usr");
 
-std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
-                   const std::string& ipc_dir, const std::string& spec_file,
-                   const std::string& helper, const std::vector<int>& keep_fds) {
-    if (getuid() != spec.uid || getgid() != spec.gid || geteuid() != spec.uid || getegid() != spec.gid)
-        throw std::runtime_error("sandbox identity must match the invoking real/effective UID and GID");
-    for (int fd : {0, 1, 2}) {
-        struct stat st{};
-        if (fstat(fd, &st) == -1 && errno == EBADF) continue;
-        if (S_ISDIR(st.st_mode) || (fcntl(fd, F_GETFL) & O_PATH))
-            throw std::runtime_error("standard descriptors cannot retain directories or O_PATH handles");
-    }
-    check_absolute(root_dir);
-    check_absolute(ipc_dir);
-    check_absolute(spec.home);
-    if (forbidden_target(spec.home) || spec.home == "/tmp" || spec.home == "/var" || spec.home == "/var/tmp")
-        throw std::runtime_error("home overlaps a sandbox runtime directory");
-    verify_identity_text(spec.username);
-    verify_identity_text(spec.home);
-    if (!spec.tmp_mib) throw std::runtime_error("private tmpfs size must be positive");
-
-    Fd usr = open_source("/usr");
-    Fd alternatives;
     if (std::filesystem::is_directory("/etc/alternatives"))
         alternatives = open_source("/etc/alternatives");
-    Fd kvm = open_source("/dev/kvm");
+    kvm = open_source("/dev/kvm");
     if (!S_ISCHR(info(kvm.fd).st_mode)) throw std::runtime_error("/dev/kvm is not a character device");
-    Fd ipc = open_source(ipc_dir);
-    Fd configuration = open_source(spec_file, O_RDONLY | O_NONBLOCK);
-    Fd executable = open_source(helper, O_RDONLY | O_NONBLOCK);
-    if (!S_ISDIR(info(ipc.fd).st_mode)) throw std::runtime_error("IPC source is not a directory");
+    control = Fd(dup(control_directory));
+    if (control.fd < 0 || !S_ISDIR(info(control.fd).st_mode))
+        throw std::runtime_error("missing pinned control directory");
 
-    std::vector<PinnedMount> mounts;
+    auto pin_endpoint = [&](const std::string& name) {
+        auto source = ipc_dir + "/" + name;
+        Fd fd = open_source(source);
+        if (!S_ISSOCK(info(fd.fd).st_mode)) throw std::runtime_error("IPC endpoint is not a socket: " + source);
+        endpoints.push_back({source, "/.agent-vm/ipc/" + name, std::move(fd)});
+    };
+    pin_endpoint("ready.sock");
+    for (size_t i = 0; i < spec.sockets.size(); ++i)
+        pin_endpoint("socket-" + std::to_string(i) + ".sock");
+    configuration = open_source(spec_file, O_RDONLY | O_NONBLOCK);
+    executable = open_source(helper, O_RDONLY | O_NONBLOCK);
+
     for (const auto& m : spec.mounts) {
         check_absolute(m.source);
         check_absolute(m.target);
@@ -437,28 +417,23 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     std::sort(mounts.begin(), mounts.end(), [](const auto& a, const auto& b) {
         return a.spec.target.size() < b.spec.target.size();
     });
-    auto tmpfs = spec.tmpfs;
+    tmpfs = spec.tmpfs;
     for (const auto& mount : tmpfs) {
         check_absolute(mount.target);
+        if (forbidden_target(mount.target, true)) throw std::runtime_error("tmpfs overlaps protected target: " + mount.target);
         if (mount.uid == UINT32_MAX || mount.gid == UINT32_MAX || (mount.mode & ~07777u))
             throw std::runtime_error("invalid tmpfs ownership or mode: " + mount.target);
     }
     std::sort(tmpfs.begin(), tmpfs.end(), [](const auto& a, const auto& b) {
         return a.target.size() < b.target.size();
     });
-    struct Layer {
-        std::string target;
-        const PinnedMount* bind;
-        const TmpfsSpec* tmpfs;
-    };
-    std::vector<Layer> layers;
+
     for (const auto& mount : mounts) layers.push_back({mount.spec.target, &mount, nullptr});
     for (const auto& mount : tmpfs) layers.push_back({mount.target, nullptr, &mount});
     std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
         return a.target.size() < b.target.size();
     });
-    std::vector<Mask> masks;
-    std::vector<Fd> mask_pins;
+
     for (const auto& path : spec.mask_sources) {
         check_absolute(path);
         if (within(path, "/usr") || within("/usr", path))
@@ -487,67 +462,10 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
         if (forbidden_target(path)) throw std::runtime_error("mask overlaps protected target: " + path);
     }
 
-    // A parent-death signal is cleared by fork. Set it for both generations;
-    // pidfds close the race even where getppid() is 0 across PID namespaces.
-    const pid_t original_parent = getppid();
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set setup parent-death signal");
-    if (getppid() != original_parent) _exit(125);
-    if (unshare(CLONE_NEWUSER)) fail("create user namespace");
-    proc_write("/proc/self/uid_map", std::to_string(spec.uid) + " " + std::to_string(spec.uid) + " 1\n");
-    proc_write("/proc/self/setgroups", "deny\n");
-    proc_write("/proc/self/gid_map", std::to_string(spec.gid) + " " + std::to_string(spec.gid) + " 1\n");
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("restore setup parent-death signal");
-    if (getppid() != original_parent) _exit(125);
-    if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET))
-        fail("create mount/pid/ipc/uts/net namespaces");
-    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) fail("make mount propagation private");
-    Fd parentfd(static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0)));
-    if (parentfd.fd < 0) fail("pin namespace parent");
-    sigset_t forwarded_signals, previous_mask;
-    sigemptyset(&forwarded_signals);
-    for (int signal : {SIGINT, SIGTERM, SIGHUP, SIGQUIT}) sigaddset(&forwarded_signals, signal);
-    if (sigprocmask(SIG_BLOCK, &forwarded_signals, &previous_mask)) fail("block namespace-parent control signals");
-    pid_t child = fork();
-    if (child < 0) fail("fork PID namespace init");
-    if (child) {
-        if (avm_process_title("avm-vmm-wait", "agent-vm: VMM lifecycle monitor")) fail("name VMM monitor");
-        int status = 0;
-        while (waitpid(child, &status, 0) < 0) {
-            if (errno != EINTR) _exit(125);
-        }
-        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
-    }
-    if (avm_process_title("avm-vmm", "agent-vm: virtual machine")) fail("name VMM");
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set VMM parent-death signal");
-    // The supervisor forwards these over the guest control channel. Do not let
-    // terminal process-group delivery kill the waiting parent or VMM first.
-    struct sigaction ignore{};
-    ignore.sa_handler = SIG_IGN;
-    sigemptyset(&ignore.sa_mask);
-    for (int signal : {SIGINT, SIGTERM, SIGHUP, SIGQUIT})
-        if (sigaction(signal, &ignore, nullptr)) fail("ignore host process-group control signal in VMM");
-    if (sigprocmask(SIG_SETMASK, &previous_mask, nullptr)) fail("restore VMM signal mask");
-    pollfd parent_poll{parentfd.fd, POLLIN, 0};
-    int alive = poll(&parent_poll, 1, 0);
-    if (alive < 0) fail("check namespace parent");
-    if (alive != 0) _exit(125);
-    parentfd = Fd();
-    if (sethostname("agent-vm", 8)) fail("set private hostname");
-    // Bind sources must refer to the cloned mount tree owned by this userns.
-    // An O_PATH FD into the previous mount namespace cannot be recursively
-    // bound here. Reopen in the private namespace and verify inode identity.
-    repin(usr, "/usr");
-    if (alternatives.fd >= 0) repin(alternatives, "/etc/alternatives");
-    repin(kvm, "/dev/kvm");
-    repin(ipc, ipc_dir);
-    for (auto& mount : mounts) repin(mount.fd, mount.spec.source);
-    std::vector<std::string> private_paths{root_dir, ipc_dir, spec_file};
-    const auto runtime_parent = std::filesystem::path(root_dir).parent_path();
-    if (runtime_parent == std::filesystem::path(ipc_dir).parent_path() &&
-        runtime_parent == std::filesystem::path(spec_file).parent_path())
-        private_paths.push_back(runtime_parent.string());
-    reject_mount_alias_conflicts(spec, private_paths);
-
+    return sources;
+}
+Fd build_policy_tree(const RunSpec& spec, const std::string& root_dir, PinnedSources& sources) {
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
     Fd root_mountpoint = open_source(root_dir);
     if (!S_ISDIR(info(root_mountpoint.fd).st_mode)) throw std::runtime_error("root source is not a directory");
     if (mount("tmpfs", fd_path(root_mountpoint.fd).c_str(), "tmpfs", MS_NOSUID | MS_NODEV,
@@ -649,11 +567,23 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // filesystem containing /etc becomes read-only.
     Fd resolv = target_fd(root.fd, "/.agent-vm/resolv.conf");
     bind_fd(root.fd, resolv.fd, "/etc/resolv.conf", false, false);
-    bind_fd(root.fd, ipc.fd, "/.agent-vm/ipc", true, false);
+    for (const auto& endpoint : endpoints) {
+        placeholder(root.fd, endpoint.target, false);
+        // A read-only socket bind still permits connect; its inode and parent
+        // cannot be replaced even by a compromised VMM.
+        bind_fd(root.fd, endpoint.fd.fd, endpoint.target, false, true);
+    }
+    make_dirs(root.fd, "/.agent-vm/ipc/control");
+    bind_fd(root.fd, control.fd, "/.agent-vm/ipc/control", false, false);
     bind_fd(root.fd, kvm.fd, "/dev/kvm", false, false, false);
     Fd proc = target_fd(root.fd, "/proc");
     if (mount("proc", fd_path(proc.fd).c_str(), "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr))
         fail("mount PID-namespace proc");
+    return root;
+}
+struct MaskResult { std::vector<std::string> ancestors, restored; };
+MaskResult apply_masks(const Fd& root, const RunSpec& spec,
+                       const std::vector<PinnedMount>& mounts, std::vector<Mask>& masks) {
     for (const auto& path : spec.mask_targets) {
         Fd target = target_fd(root.fd, path);
         const auto st = info(target.fd);
@@ -664,8 +594,8 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     std::sort(masks.begin(), masks.end(), [](const auto& a, const auto& b) { return a.path.size() < b.path.size(); });
     Fd empty_directory = target_fd(root.fd, "/.agent-vm/empty-dir");
     Fd empty_file = target_fd(root.fd, "/.agent-vm/empty-file");
-    std::vector<std::string> masked_ancestors;
-    std::vector<std::string> restored;
+    MaskResult result;
+    auto& [masked_ancestors, restored] = result;
     for (const auto& mask : masks) {
         bool covered = false;
         for (const auto& ancestor : masked_ancestors) {
@@ -711,6 +641,12 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
         masked_ancestors.push_back(mask.path);
     }
 
+    return result;
+}
+void export_catalog(const Fd& root, const RunSpec& spec, const std::vector<PinnedMount>& mounts,
+                    const std::vector<TmpfsSpec>& tmpfs, const MaskResult& mask_result,
+                    const Fd& configuration, const Fd& executable) {
+    const auto& [masked_ancestors, restored] = mask_result;
     // Only the final, masked tree may supply export objects. In particular,
     // never export a pinned original source: it bypasses masks and child binds.
     struct Object { std::string target, path; };
@@ -801,6 +737,131 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
             if (symlinkat((std::string("usr/") + name).c_str(), boot_fd.fd, name)) fail("bootstrap FHS symlink");
     }
     boot_fd = Fd();
+}
+
+void verify_identity_text(const std::string& text) {
+    if (text.empty() || text.find_first_of(":\n\r") != std::string::npos || text.find('\0') != std::string::npos)
+        throw std::runtime_error("identity text contains passwd delimiters");
+}
+} // namespace
+
+int isolate_supervisor_network(bool control_directory) {
+    const auto uid = getuid(), gid = getgid();
+    if (geteuid() != uid || getegid() != gid)
+        throw std::runtime_error("supervisor requires matching real/effective UID and GID");
+    if (unshare(CLONE_NEWUSER)) fail("create supervisor user namespace");
+    proc_write("/proc/self/uid_map", std::to_string(uid) + " " + std::to_string(uid) + " 1\n");
+    proc_write("/proc/self/setgroups", "deny\n");
+    proc_write("/proc/self/gid_map", std::to_string(gid) + " " + std::to_string(gid) + " 1\n");
+    if (unshare(CLONE_NEWNET)) fail("create supervisor network namespace");
+    Fd control;
+    if (control_directory) {
+        if (unshare(CLONE_NEWNS)) fail("create supervisor mount namespace");
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) fail("make supervisor mounts private");
+        // A detached tmpfs has no pathname in the host runtime filesystem.
+        Fd context(static_cast<int>(syscall(SYS_fsopen, "tmpfs", FSOPEN_CLOEXEC)));
+        if (context.fd < 0) fail("create control tmpfs context");
+        for (const auto& [key, value] : std::array<std::pair<const char*, const char*>, 3>{
+                 {{"size", "64k"}, {"nr_inodes", "16"}, {"mode", "0700"}}})
+            if (syscall(SYS_fsconfig, context.fd, FSCONFIG_SET_STRING, key, value, 0))
+                fail("configure control tmpfs");
+        if (syscall(SYS_fsconfig, context.fd, FSCONFIG_CMD_CREATE, nullptr, nullptr, 0))
+            fail("create control tmpfs");
+        control = Fd(static_cast<int>(syscall(SYS_fsmount, context.fd, FSMOUNT_CLOEXEC,
+                                             MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)));
+        if (control.fd < 0) fail("pin detached control tmpfs");
+    }
+    drop_capabilities();
+    return std::exchange(control.fd, -1);
+}
+
+std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
+                   const std::string& ipc_dir, const std::string& spec_file,
+                   const std::string& helper, const std::vector<int>& keep_fds, int control_directory) {
+    if (getuid() != spec.uid || getgid() != spec.gid || geteuid() != spec.uid || getegid() != spec.gid)
+        throw std::runtime_error("sandbox identity must match the invoking real/effective UID and GID");
+    for (int fd : {0, 1, 2}) {
+        struct stat st{};
+        if (fstat(fd, &st) == -1 && errno == EBADF) continue;
+        if (S_ISDIR(st.st_mode) || (fcntl(fd, F_GETFL) & O_PATH))
+            throw std::runtime_error("standard descriptors cannot retain directories or O_PATH handles");
+    }
+    check_absolute(root_dir);
+    check_absolute(ipc_dir);
+    check_absolute(spec.home);
+    if (forbidden_target(spec.home) || spec.home == "/tmp" || spec.home == "/var" || spec.home == "/var/tmp")
+        throw std::runtime_error("home overlaps a sandbox runtime directory");
+    verify_identity_text(spec.username);
+    verify_identity_text(spec.home);
+    if (!spec.tmp_mib) throw std::runtime_error("private tmpfs size must be positive");
+
+    auto sources = pin_sources(spec, root_dir, ipc_dir, spec_file, helper, control_directory);
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
+
+    // A parent-death signal is cleared by fork. Set it for both generations;
+    // pidfds close the race even where getppid() is 0 across PID namespaces.
+    const pid_t original_parent = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set setup parent-death signal");
+    if (getppid() != original_parent) _exit(125);
+    if (unshare(CLONE_NEWUSER)) fail("create user namespace");
+    proc_write("/proc/self/uid_map", std::to_string(spec.uid) + " " + std::to_string(spec.uid) + " 1\n");
+    proc_write("/proc/self/setgroups", "deny\n");
+    proc_write("/proc/self/gid_map", std::to_string(spec.gid) + " " + std::to_string(spec.gid) + " 1\n");
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("restore setup parent-death signal");
+    if (getppid() != original_parent) _exit(125);
+    if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET))
+        fail("create mount/pid/ipc/uts/net namespaces");
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) fail("make mount propagation private");
+    Fd parentfd(static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0)));
+    if (parentfd.fd < 0) fail("pin namespace parent");
+    sigset_t forwarded_signals, previous_mask;
+    sigemptyset(&forwarded_signals);
+    for (int signal : {SIGINT, SIGTERM, SIGHUP, SIGQUIT}) sigaddset(&forwarded_signals, signal);
+    if (sigprocmask(SIG_BLOCK, &forwarded_signals, &previous_mask)) fail("block namespace-parent control signals");
+    pid_t child = fork();
+    if (child < 0) fail("fork PID namespace init");
+    if (child) {
+        if (avm_process_title("avm-vmm-wait", "agent-vm: VMM lifecycle monitor")) fail("name VMM monitor");
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0) {
+            if (errno != EINTR) _exit(125);
+        }
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+    }
+    if (avm_process_title("avm-vmm", "agent-vm: virtual machine")) fail("name VMM");
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set VMM parent-death signal");
+    // The supervisor forwards these over the guest control channel. Do not let
+    // terminal process-group delivery kill the waiting parent or VMM first.
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    for (int signal : {SIGINT, SIGTERM, SIGHUP, SIGQUIT})
+        if (sigaction(signal, &ignore, nullptr)) fail("ignore host process-group control signal in VMM");
+    if (sigprocmask(SIG_SETMASK, &previous_mask, nullptr)) fail("restore VMM signal mask");
+    pollfd parent_poll{parentfd.fd, POLLIN, 0};
+    int alive = poll(&parent_poll, 1, 0);
+    if (alive < 0) fail("check namespace parent");
+    if (alive != 0) _exit(125);
+    parentfd = Fd();
+    if (sethostname("agent-vm", 8)) fail("set private hostname");
+    // Bind sources must refer to the cloned mount tree owned by this userns.
+    // An O_PATH FD into the previous mount namespace cannot be recursively
+    // bound here. Reopen in the private namespace and verify inode identity.
+    repin(usr, "/usr");
+    if (alternatives.fd >= 0) repin(alternatives, "/etc/alternatives");
+    repin(kvm, "/dev/kvm");
+    for (auto& endpoint : endpoints) repin(endpoint.fd, endpoint.source);
+    for (auto& mount : mounts) repin(mount.fd, mount.spec.source);
+    std::vector<std::string> private_paths{root_dir, ipc_dir, spec_file};
+    const auto runtime_parent = std::filesystem::path(root_dir).parent_path();
+    if (runtime_parent == std::filesystem::path(ipc_dir).parent_path() &&
+        runtime_parent == std::filesystem::path(spec_file).parent_path())
+        private_paths.push_back(runtime_parent.string());
+    reject_mount_alias_conflicts(spec, private_paths);
+
+    Fd root = build_policy_tree(spec, root_dir, sources);
+    auto mask_result = apply_masks(root, spec, mounts, masks);
+    export_catalog(root, spec, mounts, tmpfs, mask_result, configuration, executable);
     if (fchdir(root.fd)) fail("chdir private root");
     if (syscall(SYS_pivot_root, ".", ".oldroot")) fail("pivot_root");
     if (chdir("/")) fail("chdir new root");
@@ -811,8 +872,9 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // descriptor sweep also removes caller inheritance not explicitly allowed.
     mounts.clear();
     mask_pins.clear();
-    usr = Fd(); kvm = Fd(); ipc = Fd(); configuration = Fd(); executable = Fd();
-    resolv = Fd(); proc = Fd(); empty_directory = Fd(); empty_file = Fd(); root = Fd();
+    endpoints.clear(); control = Fd();
+    usr = Fd(); kvm = Fd(); configuration = Fd(); executable = Fd();
+    root = Fd();
     close_unlisted(keep_fds);
     drop_capabilities();
     install_vmm_seccomp();
@@ -829,12 +891,20 @@ void install_vmm_seccomp() {
                                  "ptrace", "process_vm_readv", "process_vm_writev", "open_by_handle_at", "name_to_handle_at",
                                  "bpf", "perf_event_open", "init_module", "finit_module", "delete_module", "reboot",
                                  "kexec_load", "kexec_file_load", "swapon", "swapoff", "syslog", "iopl", "ioperm",
-                                 "keyctl", "add_key", "request_key", "acct", "quotactl", "fsopen", "fsconfig",
+                                 "keyctl", "add_key", "request_key", "acct", "quotactl", "quotactl_fd", "kcmp",
+                                 "io_uring_setup", "io_uring_register", "io_uring_enter", "userfaultfd", "fsopen", "fsconfig",
                                  "fsmount", "fspick", "open_tree", "move_mount", "mount_setattr"}) {
             int number = seccomp_syscall_resolve_name(name);
             if (number == __NR_SCMP_ERROR) continue;
             int rc = seccomp_rule_add(filter, SCMP_ACT_ERRNO(EPERM), number, 0);
             if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp deny " + std::string(name));
+        }
+        // Unix backend only: passt uses an inherited AF_UNIX stream. Block
+        // all other host families, including AF_VSOCK outside netns isolation.
+        for (int call : {SCMP_SYS(socket), SCMP_SYS(socketpair)}) {
+            int rc = seccomp_rule_add(filter, SCMP_ACT_ERRNO(EPERM), call, 1,
+                                      SCMP_A0(SCMP_CMP_NE, AF_UNIX));
+            if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp socket family");
         }
         // clone3 carries flags behind a userspace pointer, which seccomp cannot
         // inspect. ENOSYS makes pthread implementations fall back to clone.

@@ -22,7 +22,9 @@ CTest 不启动真实 VM，但 network/socket-sandbox 测试会创建 namespaces
 | `dbus` | proxy readiness、lifetime FD、启动失败和回收；缺少 xdg-dbus-proxy 返回 77，CTest 记为跳过 |
 | `network` | 并发 stream、背压、半关闭、帧校验、重连、共享 controller、data 进程复用及故障清理 |
 | `socket-sandbox` | controller/data 文件树与 syscall 边界、独立 PID namespace、锁定子挂载和 socket bind |
-| `sandbox-seccomp` | 危险 syscall 拒绝及线程兼容性 |
+| `control` | 控制端点 inode 固定、符号链接拒绝、父目录替换与 rename 竞态 |
+| `paths` | C/C++ 保留路径、规范化与包含关系对照 |
+| `sandbox-seccomp` | 危险 syscall 和宿主 socket 地址族拒绝、线程兼容性 |
 
 `sandbox-test --integration` 额外检查单 ID 映射、namespace、capabilities、只读与嵌套 ro/rw、mask/别名负测、tmpfs 覆盖、bootstrap 与 FD 清理。
 

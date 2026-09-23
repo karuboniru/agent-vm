@@ -1,5 +1,6 @@
 #pragma once
 #include "spec.hpp"
+#include "protocol.h"
 #include <string>
 #include <sys/types.h>
 
@@ -14,16 +15,21 @@ struct FilesystemExport {
 // in the fully confined VMM process, after cap clearing and seccomp installation.
 // Guest-private writable filesystems and the final guest root are assembled
 // by the guest helper.
-// root_dir and ipc_dir are empty private directories owned by supervisor.
+// root_dir is empty; ipc_dir contains already-listening broker/readiness sockets.
+// control_directory pins the supervisor's bounded detached tmpfs.
 // spec_file and helper are trusted regular files to copy before guest launch.
 // keep_fds is the complete explicit allowlist in addition to 0, 1, 2.
 std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                    const std::string& ipc_dir, const std::string& spec_file,
-                   const std::string& helper, const std::vector<int>& keep_fds);
+                   const std::string& helper, const std::vector<int>& keep_fds, int control_directory);
 void install_vmm_seccomp();
+// Resolve only a socket inode relative to a pinned directory; never follow symlinks.
+bool send_control(int directory, const avm_control_message& message);
 // Call after starting host helpers, before forking the VMM. Preserves UID/GID
 // in a new user namespace, creates an empty netns, then drops capabilities.
-void isolate_supervisor_network();
+// With control_directory, also creates a private mount namespace and tmpfs.
+// When requested, returns a CLOEXEC mount FD for a 64 KiB / 16 inode control tmpfs.
+int isolate_supervisor_network(bool control_directory = false);
 
 struct NetworkProcess { int fd = -1; pid_t pid = -1; };
 // Returned fd is the readiness/lifetime pipe and must remain open while in use.

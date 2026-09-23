@@ -1,3 +1,4 @@
+#include "agent_vm/paths.hpp"
 #include "agent_vm/spec.hpp"
 #include "agent_vm/protocol.h"
 
@@ -26,11 +27,8 @@ namespace {
 namespace fs = std::filesystem;
 [[noreturn]] void fail(const std::string& message) { throw std::runtime_error(message); }
 std::string env(const char* name) { const char* v = std::getenv(name); return v ? v : ""; }
-std::string normalize(const fs::path& path) {
-    auto s = path.lexically_normal().string();
-    while (s.size() > 1 && s.back() == '/') s.pop_back();
-    return s;
-}
+using paths::normalize;
+
 std::string expand(const std::string& value, const std::string& home) {
     if (value == "~") return home;
     if (value.starts_with("~/")) return home + value.substr(1);
@@ -359,19 +357,12 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
         if (auto v = bool_at(*t, "enabled")) spec.ssh_agent = *v;
     }
 }
-const std::vector<std::string> reserved = {"/usr", "/etc", "/proc", "/sys", "/dev", "/.agent-vm",
-                                         "/bin", "/sbin", "/lib", "/lib64", "/run", "/ipc"};
 void check_target(const std::string& target, const char* kind, bool custom_mount = false) {
-    if (target.empty() || target[0] != '/' || normalize(target) != target)
-        fail(std::string(kind) + " target must be a normalized absolute path: " + target);
-    for (const auto& path : reserved) {
-        if (custom_mount && (path == "/run" || path == "/usr") && target != path && path_within(target, path)) continue;
-        if (custom_mount && path == "/etc" && target != path && path_within(target, path) &&
-            !path_within(target, "/etc/resolv.conf")) continue;
-        if (path_within(target, path) || path_within(path, target))
-            fail(std::string(kind) + " target overlaps a reserved guest path: " + target);
-    }
+    paths::check_absolute(target);
+    if (paths::forbidden_target(target, custom_mount))
+        fail(std::string(kind) + " target overlaps a reserved guest path: " + target);
 }
+
 void check_existing_target(const MountSpec& parent, const std::string& target, bool want_directory, bool allow_create = false) {
     fs::path relative = fs::path(target).lexically_relative(parent.target);
     fs::path physical(parent.source);
@@ -444,10 +435,7 @@ void deduplicate(std::vector<std::string>& values) {
 } // namespace
 
 bool path_within(const std::string& path, const std::string& parent) {
-    if (path.empty() || parent.empty()) return false;
-    auto p = normalize(path), base = normalize(parent);
-    return p == base || (base == "/" && p.starts_with('/')) ||
-           (p.size() > base.size() && p.starts_with(base) && p[base.size()] == '/');
+    return paths::within(path, parent);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -686,7 +674,6 @@ void validate_spec(const RunSpec& spec) {
     for (const auto& tmpfs : spec.tmpfs) {
         if (tmpfs.target.find('\0') != std::string::npos) fail("tmpfs target cannot contain NUL bytes");
         check_target(tmpfs.target, "tmpfs", true);
-        if (paths_overlap(tmpfs.target, "/.oldroot")) fail("tmpfs target overlaps a private runtime path: " + tmpfs.target);
         for (const auto& required : {std::string("/tmp"), std::string("/var/tmp"), spec.home,
                                      "/run/user/" + std::to_string(spec.uid)})
             if (path_within(required, tmpfs.target)) fail("tmpfs target overlaps a required guest directory: " + tmpfs.target);

@@ -63,7 +63,7 @@ struct Terminal {
 struct RuntimeDirectory {
     fs::path path;
     explicit RuntimeDirectory(const avm::RunSpec& spec) {
-        std::string socket_suffix = "/ipc/control.sock";
+        std::string socket_suffix = "/ipc/ready.sock";
         if (!spec.sockets.empty()) {
             auto broker_suffix = "/ipc/socket-" + std::to_string(spec.sockets.size() - 1) + ".sock";
             if (broker_suffix.size() > socket_suffix.size()) socket_suffix = std::move(broker_suffix);
@@ -232,38 +232,7 @@ std::string find_guest_helper() {
     }
     throw std::runtime_error("agent-vm-guest is missing; build both executables or install the project");
 }
-bool send_control(const fs::path& path, const avm_control_message& message) {
-    if (path.string().size() >= sizeof(sockaddr_un::sun_path)) return false;
-    Fd fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
-    if (fd.value < 0) return false;
-    sockaddr_un address{}; address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.string().size() + 1);
-    int result = connect(fd.value, reinterpret_cast<sockaddr*>(&address), sizeof(address));
-    if (result && errno != EINPROGRESS) return false;
-    pollfd p{fd.value, POLLOUT, 0};
-    if (poll(&p, 1, 100) <= 0) return false;
-    int error = 0; socklen_t size = sizeof(error);
-    if (getsockopt(fd.value, SOL_SOCKET, SO_ERROR, &error, &size) || error) return false;
-    if (send(fd.value, &message, sizeof(message), MSG_NOSIGNAL) != sizeof(message)) return false;
-    // Do not close the Unix transport until the guest has consumed this message.
-    // libkrun 1.19 handles HUP before pending IN and can drop data on early close.
-    uint32_t acknowledgement = 0;
-    size_t used = 0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (used < sizeof(acknowledgement)) {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0) return false;
-        pollfd incoming{fd.value, POLLIN, 0};
-        int ready = poll(&incoming, 1, static_cast<int>(remaining));
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready <= 0) return false;
-        ssize_t n = recv(fd.value, reinterpret_cast<char*>(&acknowledgement) + used, sizeof(acknowledgement) - used, 0);
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-        if (n <= 0) return false;
-        used += static_cast<size_t>(n);
-    }
-    return acknowledgement == AVM_CONTROL_ACK_MAGIC;
-}
+
 int status_code(int status) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 125;
 }
@@ -310,14 +279,14 @@ int doctor() {
     return good ? 0 : 1;
 }
 [[noreturn]] void vmm(const avm::RunSpec& spec, const fs::path& runtime,
-                      const std::string& helper, int net_fd, pid_t parent) {
+                      const std::string& helper, int net_fd, pid_t parent, int control_directory) {
     try {
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(125);
         sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, nullptr);
         for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGCHLD, SIGWINCH}) signal(sig, SIG_DFL);
         if (avm_process_title("avm-vmm-setup", "agent-vm: VMM sandbox setup")) system_error("name VMM setup");
         auto exports = avm::enter_sandbox(spec, (runtime / "root").string(), (runtime / "ipc").string(),
-                           (runtime / "spec.bin").string(), helper, net_fd >= 0 ? std::vector<int>{net_fd} : std::vector<int>{});
+                           (runtime / "spec.bin").string(), helper, net_fd >= 0 ? std::vector<int>{net_fd} : std::vector<int>{}, control_directory);
         clearenv(); setenv("PATH", "/usr/bin:/bin", 1);
         check_krun(krun_set_log_level(spec.debug ? 4 : 1), "libkrun log");
         int context = krun_create_ctx(); check_krun(context, "libkrun context");
@@ -414,15 +383,17 @@ int run(avm::RunSpec spec) {
             forwards.push_back({path.string(), spec.sockets[i].source, spec.sockets[i].target});
         }
         broker = avm::start_socket_brokers(forwards);
-        avm::isolate_supervisor_network();
+        Fd control_directory(avm::isolate_supervisor_network(true));
         pid_t parent = getpid();
         vm = fork(); if (vm < 0) system_error("fork VM");
         if (vm == 0) {
             if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(125);
             if (network.fd >= 0 && fcntl(network.fd, F_SETFD, 0) < 0) _exit(125);
+            if (fcntl(control_directory.value, F_SETFD, 0) < 0) _exit(125);
+            const auto control = std::to_string(control_directory.value);
             const auto job = (runtime.path / "worker.bin").string();
             const auto net = std::to_string(network.fd), owner = std::to_string(parent);
-            const char* args[] = {"agent-vm", "--internal-worker", job.c_str(), net.c_str(), owner.c_str(), helper.c_str(), nullptr};
+            const char* args[] = {"agent-vm", "--internal-worker", job.c_str(), net.c_str(), owner.c_str(), helper.c_str(), control.c_str(), nullptr};
             const char* env[] = {"PATH=/usr/bin:/bin", "LANG=C.UTF-8", nullptr};
             execve("/proc/self/exe", const_cast<char* const*>(args), const_cast<char* const*>(env));
             perror("agent-vm: exec isolated worker"); _exit(125);
@@ -459,12 +430,12 @@ int run(avm::RunSpec spec) {
                 }
             }
             if (guest_ready) {
-                if (requested_signal && send_control(runtime.path / "ipc/control.sock",
+                if (requested_signal && avm::send_control(control_directory.value,
                     {AVM_CONTROL_MAGIC, AVM_CONTROL_SIGNAL, static_cast<uint32_t>(requested_signal), 0, 0})) requested_signal = 0;
                 if (resize_pending) {
                     winsize size{};
                     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &size)) resize_pending = false;
-                    else if (send_control(runtime.path / "ipc/control.sock", {AVM_CONTROL_MAGIC, AVM_CONTROL_RESIZE, 0, size.ws_row, size.ws_col})) resize_pending = false;
+                    else if (avm::send_control(control_directory.value, {AVM_CONTROL_MAGIC, AVM_CONTROL_RESIZE, 0, size.ws_row, size.ws_col})) resize_pending = false;
                 }
             }
             if (std::chrono::steady_clock::now() >= deadline) {
@@ -491,9 +462,9 @@ int run(avm::RunSpec spec) {
 int main(int argc, char** argv) {
     try {
         if (avm_process_title_init(argc, argv)) system_error("initialize process title");
-        if (argc == 6 && std::string(argv[1]) == "--internal-worker") {
+        if (argc == 7 && std::string(argv[1]) == "--internal-worker") {
             auto spec = read_worker_spec(argv[2]);
-            vmm(spec, fs::path(argv[2]).parent_path(), argv[5], std::stoi(argv[3]), static_cast<pid_t>(std::stol(argv[4])));
+            vmm(spec, fs::path(argv[2]).parent_path(), argv[5], std::stoi(argv[3]), static_cast<pid_t>(std::stol(argv[4])), std::stoi(argv[6]));
         }
         auto options = avm::parse_options(argc, argv);
         switch (options.action) {
