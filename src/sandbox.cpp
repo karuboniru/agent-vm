@@ -26,6 +26,7 @@
 #include <sched.h>
 #include <seccomp.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -803,6 +804,13 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     const pid_t original_parent = getppid();
     if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)) fail("set setup parent-death signal");
     if (getppid() != original_parent) _exit(125);
+    // Process groups span PID namespaces: kill(0, sig) from the confined VMM
+    // would otherwise stop or kill the supervisor. A separate session also
+    // leaves the VMM without a controlling terminal, so TIOCSTI cannot inject
+    // keystrokes into the caller's shell and terminal job control cannot stop
+    // the VMM's ancestors while the PID-namespace init itself ignores SIGTTOU.
+    // libkrun's console only needs the inherited standard descriptors.
+    if (setsid() < 0) fail("detach VMM session from the supervisor");
     if (unshare(CLONE_NEWUSER)) fail("create user namespace");
     proc_write("/proc/self/uid_map", std::to_string(spec.uid) + " " + std::to_string(spec.uid) + " 1\n");
     proc_write("/proc/self/setgroups", "deny\n");
@@ -898,6 +906,16 @@ void install_vmm_seccomp() {
             if (number == __NR_SCMP_ERROR) continue;
             int rc = seccomp_rule_add(filter, SCMP_ACT_ERRNO(EPERM), number, 0);
             if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp deny " + std::string(name));
+        }
+        // The VMM keeps the caller's terminal descriptors for the guest console.
+        // Deny the ioctls that push input into a terminal (TIOCSTI, and the
+        // console selection paste in TIOCLINUX), independently of whether the
+        // kernel still honours them for a non-controlling terminal. The kernel
+        // reads the request as 32 bits, so compare only those bits.
+        for (unsigned long request : {static_cast<unsigned long>(TIOCSTI), static_cast<unsigned long>(TIOCLINUX)}) {
+            int rc = seccomp_rule_add(filter, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1,
+                                      SCMP_A1(SCMP_CMP_MASKED_EQ, 0xffffffffu, request));
+            if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp terminal input ioctl");
         }
         // Unix backend only: passt uses an inherited AF_UNIX stream. Block
         // all other host families, including AF_VSOCK outside netns isolation.

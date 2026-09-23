@@ -8,11 +8,13 @@ namespace avm {
 struct FilesystemExport {
     std::string tag, path;
 };
-// Called in a dedicated child, before any libkrun threads exist. This enters a
-// userns, mountns, pidns, ipcns, utsns and netns, forks the namespace init, and
-// builds the confined policy tree, bootstrap and export catalog. The intermediate
-// parent waits and _exit's with the child status. Returns the export devices only
-// in the fully confined VMM process, after cap clearing and seccomp installation.
+// Called in a dedicated child, before any libkrun threads exist. This starts a
+// new session (no shared process group or controlling terminal with the
+// supervisor), enters a userns, mountns, pidns, ipcns, utsns and netns, forks
+// the namespace init, and builds the confined policy tree, bootstrap and export
+// catalog. The intermediate parent waits and _exit's with the child status.
+// Returns the export devices only in the fully confined VMM process, after cap
+// clearing and seccomp installation.
 // Guest-private writable filesystems and the final guest root are assembled
 // by the guest helper.
 // root_dir is empty; ipc_dir contains already-listening broker/readiness sockets.

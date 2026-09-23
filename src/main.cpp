@@ -333,6 +333,14 @@ int run(avm::RunSpec spec) {
     if (sigprocmask(SIG_BLOCK, &blocked, &previous)) system_error("block supervisor signals");
     struct RestoreSignals { sigset_t mask; ~RestoreSignals() { sigprocmask(SIG_SETMASK, &mask, nullptr); } } restore{previous};
     // Restore the caller's signal mask last, after terminal and directory cleanup.
+    // The VMM changes the terminal from its own session, outside job control, so
+    // the supervisor must be able to restore it even from a background process
+    // group (for example under `timeout`). Keep this out of the signalfd mask:
+    // a blocked SIGTTOU would otherwise be forwarded to the guest as a request.
+    struct sigaction ignore_output{};
+    ignore_output.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_output.sa_mask);
+    if (sigaction(SIGTTOU, &ignore_output, nullptr)) system_error("ignore terminal output stop signal");
     RuntimeDirectory runtime(spec);
     // Bind before starting the VMM; CLOEXEC keeps the host listener out of it.
     Fd readiness(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));

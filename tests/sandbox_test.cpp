@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/socket.h>
@@ -94,6 +95,18 @@ static void seccomp_test() {
         }
         int pair[2];
         require(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "Unix stream backend denied");
+        // Without the filter these fail with ENOTTY on a socket; EPERM proves the
+        // rule matched, including with junk above the kernel's 32-bit request.
+        for (unsigned long request : {static_cast<unsigned long>(TIOCSTI), static_cast<unsigned long>(TIOCLINUX)}) {
+            char byte = 'x';
+            errno = 0;
+            require(ioctl(pair[0], request, &byte) == -1 && errno == EPERM, "terminal input injection ioctl escaped filter");
+            errno = 0;
+            require(syscall(SYS_ioctl, pair[0], 0xdeadbeef00000000ul | request, &byte) == -1 && errno == EPERM,
+                    "terminal input ioctl bypassed filter through upper request bits");
+        }
+        int pending = -1;
+        require(ioctl(pair[0], FIONREAD, &pending) == 0 && pending == 0, "unrelated ioctl denied");
         close(pair[0]); close(pair[1]);
         bool ran = false;
         std::thread thread([&] { ran = namespace_changes_denied(); }); thread.join();
@@ -362,6 +375,43 @@ static void tmpfs_export_test() {
             "sealing tmpfs staging broke an authorized writable child");
     std::cout << "tmpfs export isolation passed\n";
 }
+// The confined VMM and its namespace parent must not share the supervisor's
+// process group or session: kill(0, sig) crosses PID namespaces along the
+// process group, and a controlling terminal enables TIOCSTI and job control.
+static void session_isolation_test() {
+    Fixture fixture;
+    auto s = fixture.run_spec();
+    int ready[2], release[2];
+    require(pipe2(ready, O_CLOEXEC) == 0 && pipe2(release, O_CLOEXEC) == 0, "session test pipes failed");
+    pid_t child = fork(); require(child >= 0, "fork failed");
+    if (child == 0) {
+        close(ready[0]); close(release[1]);
+        try {
+            fixture.enter(s, {ready[1], release[0]});
+            char byte = 1;
+            require(write(ready[1], &byte, 1) == 1, "report confined VMM");
+            // Hold the session open until the parent has inspected it.
+            (void)!read(release[0], &byte, 1);
+            _exit(0);
+        } catch (const std::exception& error) { dprintf(2, "sandbox test: %s\n", error.what()); _exit(1); }
+    }
+    close(ready[1]); close(release[0]);
+    char byte = 0;
+    const bool confined = read(ready[0], &byte, 1) == 1;
+    // Only the namespace parent is visible here; it shares the VMM's session.
+    std::string stat = read_file(("/proc/" + std::to_string(child) + "/stat").c_str());
+    close(release[1]);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) require(errno == EINTR, "waitpid failed");
+    require(confined && WIFEXITED(status) && WEXITSTATUS(status) == 0, "session test sandbox failed");
+    const auto fields = stat.substr(stat.rfind(')') + 2);
+    char state = 0; int ppid = 0, pgrp = 0, session = 0;
+    require(sscanf(fields.c_str(), "%c %d %d %d", &state, &ppid, &pgrp, &session) == 4, "parse VMM parent stat");
+    require(ppid == getpid(), "unexpected VMM parent");
+    require(pgrp == child && session == child, "VMM worker is not its own session and process group leader");
+    require(pgrp != getpgrp() && session != getsid(0), "VMM shares the supervisor's process group or session");
+    std::cout << "session isolation passed\n";
+}
 static void integration_test() {
     Fixture fixture;
     auto s = fixture.run_spec();
@@ -541,6 +591,7 @@ int main(int argc, char** argv) {
         seccomp_test();
         if (argc == 2 && std::string(argv[1]) == "--integration") {
             supervisor_network_test();
+            session_isolation_test();
             integration_test();
             masked_child_test();
             masked_descendant_test();

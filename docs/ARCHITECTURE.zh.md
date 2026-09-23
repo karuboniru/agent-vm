@@ -19,13 +19,13 @@ agent-vm supervisor
 
 supervisor 解析 TOML/CLI，形成 `RunSpec`，准备私有运行目录、启动配置和固定通信端点。D-Bus proxy 完成 readiness 后才建立 socket broker；passt 和 brokers 启动后，supervisor 进入仅映射调用者的 user namespace 和空 network namespace，清 capabilities、设置 `no_new_privs`，然后 fork/re-exec VMM worker。网络关闭时也隔离 supervisor。
 
-worker 以精简环境重新 exec，隔离配置解析留下的地址空间与宿主原始环境。它建立 user、mount、PID、IPC、UTS、network namespaces，装配受限根，关闭非白名单 FD、清 capabilities 并安装 seccomp denylist，再启动 libkrun。supervisor 管理信号、TTY、退出状态和 helper 清理；helper 意外退出会结束 VM。
+worker 以精简环境重新 exec，隔离配置解析留下的地址空间与宿主原始环境。它先创建新 session，使 VMM 与 supervisor 既不共享进程组也不共享控制终端：进程组跨越 PID namespace，受限 VMM 内的 `kill(0, sig)` 否则能到达 supervisor。随后它建立 user、mount、PID、IPC、UTS、network namespaces，装配受限根，关闭非白名单 FD、清 capabilities 并安装 seccomp denylist，再启动 libkrun。supervisor 管理信号、TTY、退出状态和 helper 清理；helper 意外退出会结束 VM。终端信号只到达 supervisor，由它经控制通道转发；supervisor 忽略 SIGTTOU，以便在后台进程组中也能恢复终端设置。
 
 ## 授权边界
 
 安全边界是 **guest 与整个 VMM 能访问的宿主资源集合**。virtio-fs export path 不构成独立隔离边界；guest 内的 mount 权限也不承担宿主资源隔离。宿主只读属性、mask、切根和 FD 清理在创建文件共享后端之前完成。
 
-VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。VMM seccomp 使用 denylist，包含全部三个 io_uring syscall、userfaultfd、quotactl_fd 和 kcmp；宿主 socket/socketpair 仅允许 AF_UNIX，guest AF_VSOCK 使用 libkrun 的 Unix backend，passt 使用继承的 Unix stream。socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
+VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。VMM seccomp 使用 denylist，包含全部三个 io_uring syscall、userfaultfd、quotactl_fd 和 kcmp，以及对继承的控制台描述符注入终端输入的 ioctl TIOCSTI 和 TIOCLINUX（独立 session 已使 VMM 没有控制终端）；宿主 socket/socketpair 仅允许 AF_UNIX，guest AF_VSOCK 使用 libkrun 的 Unix backend，passt 使用继承的 Unix stream。socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
 
 宿主是可信的；运行期间宿主重命名、替换或重建被 mask 的路径不在保证范围内。mask 保护共享入口，不隐藏其他位置已有的硬链接、副本或已授出的 FD。可写共享授予直接修改对应宿主源的权限。
 
