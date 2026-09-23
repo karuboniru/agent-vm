@@ -50,7 +50,7 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 
 %files
 %license LICENSE
-%doc README.md ARCHITECTURE.md
+%doc README.md README.zh.md docs examples LICENSE
 %{_bindir}/agent-vm
 %{_libexecdir}/agent-vm-guest
 %{_datadir}/agent-vm/
