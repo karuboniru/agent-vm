@@ -169,7 +169,7 @@ int main() {
         for (const auto& target : {std::string("/run/user"), "/run/user/" + std::to_string(getuid())})
             reject({"--no-config", "--mount", "src=" + home + ",dst=" + target}, "managed runtime directory protected");
         parse({"--no-config", "--mount", "src=" + home + ",dst=/run/user/" + std::to_string(getuid()) + "/custom"});
-        reject({"--no-config", "--mount", "src=" + home + ",dst=relative"}, "relative target refused");
+
         options = parse({"--no-config", "--mount", "src=" + home + ",dst=" + cwd});
         check(options.spec.mounts.size() == 1 && options.spec.mounts[0].source == cwd,
               "CWD wins over a conflicting source");
@@ -238,7 +238,7 @@ int main() {
         }
         for (const auto& value : {"-1", "+700", "", "888", "10000", "0o700", "700 ", "7.0"})
             reject({"--no-config", "--tmpfs", "target=/cache,mode=" + std::string(value)}, "invalid tmpfs octal mode rejected");
-        for (const auto& target : {"relative", "/", "/proc/cache", "/sys/cache", "/dev/cache",
+        for (const auto& target : {"/", "/proc/cache", "/sys/cache", "/dev/cache",
                                    "/.agent-vm/cache", "/.oldroot/cache", "/ipc/cache", "/run", "/run/user", "/tmp", "/var", "/var/tmp"})
             reject({"--no-config", "--tmpfs", "target=" + std::string(target)}, "protected tmpfs target rejected: " + std::string(target));
         reject({"--no-config", "--tmpfs", "target=/run/user/" + std::to_string(getuid())}, "tmpfs cannot replace runtime user directory");
@@ -388,7 +388,7 @@ int main() {
         reject({"--no-config", "--socket", "src=" + home + "/file,dst=/tmp/test.sock"}, "regular file socket source rejected");
         reject({"--no-config", "--socket", "src=" + home + ",dst=/tmp/test.sock"}, "directory socket source rejected");
         reject({"--no-config", "--socket", "src=" + home + "/missing.sock,dst=/tmp/test.sock"}, "missing socket source rejected");
-        for (const auto& target : {"relative.sock", "@abstract", "/", "/etc/service.sock", "/proc/service.sock",
+        for (const auto& target : {"/", "/etc/service.sock", "/proc/service.sock",
                                     "/dev/service.sock", "/.agent-vm/service.sock", "/ipc/service.sock",
                                     "/opt/new/service.sock", "/run", "/run/user", "/tmp", "/var/tmp"})
             reject({"--no-config", "--socket", "src=" + host_socket + ",dst=" + target}, "unavailable or protected socket target rejected: " + std::string(target));
@@ -546,15 +546,62 @@ int main() {
         reject({}, "dangling default config symlink does not drop policy silently");
         fs::remove(config);
         write(root / "machine-id", "fixture-machine-id");
-        write(root / "relative.toml", "[[mounts]]\nsource = 'machine-id'\ntarget = '/etc/machine-id'\nmode = 'ro'\n");
+        write(root / "relative.toml", "[[mounts]]\nsource = '../../machine-id'\ntarget = '/etc/machine-id'\nmode = 'ro'\n");
         options = parse({"--config", (root / "relative.toml").string()});
         check(options.spec.mounts[0].target == "/etc/machine-id" && options.spec.mounts[0].read_only,
               "TOML accepts read-only machine-id bind");
+        fs::create_directories(fs::path(cwd) / "data");
         write(root / "relative.toml", "[[mounts]]\nsource = 'data'\ntarget = '/dataset'\n");
         options = parse({"--config", (root / "relative.toml").string()});
-        check(options.spec.mounts[0].source == (root / "data").string(), "config-relative source uses config directory");
+        check(options.spec.mounts[0].source == (fs::path(cwd) / "data").string(), "config-relative source uses invoking working directory");
+        fs::create_directories(fs::path(cwd) / ".git");
+        const std::string mask_config = "[filesystem]\nmask_sources = ['.git']\nworkdir = '/tmp'\n";
+        write(root / "relative.toml", mask_config);
+        write(config, mask_config);
+        write(root / "config/agent-vm/mask.toml", mask_config);
+        for (const auto& args : std::vector<std::vector<std::string>>{
+                 {"--config", "../../relative.toml"}, {}, {"--profile", "mask"}}) {
+            options = parse(args);
+            check(options.spec.mask_sources == std::vector<std::string>{cwd + "/.git"} &&
+                  options.spec.cwd == "/tmp", "config mask uses invoking CWD independently of guest workdir and config selection");
+        }
+        fs::create_directories(fs::path(cwd) / "mount-here");
+        fs::create_directories(fs::path(cwd) / "cache-here");
+        fs::create_symlink("missing", fs::path(cwd) / "dangling");
+        fs::create_symlink("loop", fs::path(cwd) / "loop");
+        write(root / "relative.toml",
+              "[filesystem]\nworkdir = '.'\nmask_try_sources = ['.git', 'missing', 'dangling', '../../home/file/child']\n"
+              "mask_targets = ['data']\n"
+              "[[mounts]]\nsource = '../../data'\ntarget = 'mount-here'\n"
+              "[[tmpfs]]\ntarget = 'cache-here'\n"
+              "[[sockets]]\nsource = '../../agent.sock'\ntarget = 'service.sock'\n");
+        options = parse({"--config", "../../relative.toml", "--mask-try", ".git", "--mask-try", "missing"});
+        check(options.spec.cwd == cwd && options.spec.mounts[0].target == cwd + "/mount-here" &&
+              options.spec.tmpfs[0].target == cwd + "/cache-here" &&
+              options.spec.sockets[0].target == cwd + "/service.sock" &&
+              options.spec.mask_targets == std::vector<std::string>{cwd + "/data"},
+              "all TOML filesystem targets resolve against invoking CWD");
+        check(options.spec.mask_sources == std::vector<std::string>{cwd + "/.git"},
+              "optional masks include existing paths, skip missing paths and deduplicate with CLI");
+        options = parse({"--no-config", "--workdir", ".", "--mount", "src=../../data,dst=mount-here",
+                         "--tmpfs", "target=cache-here", "--socket", "src=../../agent.sock,dst=service.sock",
+                         "--mask-target", "data", "--mask-try", ".git"});
+        check(options.spec.cwd == cwd && options.spec.mounts[0].target == cwd + "/mount-here" &&
+              options.spec.tmpfs[0].target == cwd + "/cache-here" &&
+              options.spec.sockets[0].target == cwd + "/service.sock" &&
+              options.spec.mask_targets == std::vector<std::string>{cwd + "/data"},
+              "CLI filesystem targets use the same invoking CWD");
+        reject({"--no-config", "--mask-try", "loop"}, "optional mask does not ignore symlink loop errors");
+        reject({"--no-config", "--mask-try", ""}, "optional mask rejects empty source");
+        reject({"--no-config", "--mask-try", "."}, "optional mask retains shared source conflict validation");
+        for (const auto& content : {"[filesystem]\nmask_try_sources = 'wrong'\n",
+                                   "[filesystem]\nmask_try_sources = [1]\n"}) {
+            write(root / "relative.toml", content);
+            reject({"--config", "../../relative.toml"}, "optional mask rejects invalid TOML types");
+        }
+        fs::remove(config);
         write(root / "relative.toml", "[[tmpfs]]\ntarget = '~/.gnupg'\nuid = 1000\ngid = 1000\n"
-                                     "[[mounts]]\nsource = 'home/.gnupg/pubring.kbx'\ntarget = '~/.gnupg/pubring.kbx'\nmode = 'ro'\n");
+                                     "[[mounts]]\nsource = '../.gnupg/pubring.kbx'\ntarget = '~/.gnupg/pubring.kbx'\nmode = 'ro'\n");
         options = parse({"--config", (root / "relative.toml").string()});
         check(options.spec.tmpfs[0].target == home + "/.gnupg" && options.spec.tmpfs[0].uid == 1000 &&
               options.spec.mounts[0].target == home + "/.gnupg/pubring.kbx" && options.spec.mounts[0].read_only,
@@ -580,8 +627,8 @@ int main() {
             write(root / "relative.toml", "[[tmpfs]]\ntarget = '/cache'\n" + std::string(field) + "\n");
             reject({"--config", (root / "relative.toml").string()}, "invalid TOML tmpfs numeric property rejected");
         }
-        write(root / "relative.toml", "[[sockets]]\nsource = 'agent.sock'\ntarget = '/tmp/config.sock'\n"
-                                     "[[sockets]]\nsource = 'agent-link.sock'\ntarget = '/tmp/config-other.sock'\n"
+        write(root / "relative.toml", "[[sockets]]\nsource = '../../agent.sock'\ntarget = '/tmp/config.sock'\n"
+                                     "[[sockets]]\nsource = '../../agent-link.sock'\ntarget = '/tmp/config-other.sock'\n"
                                      "[ssh_agent]\nenabled = true\n");
         setenv("SSH_AUTH_SOCK", host_socket.c_str(), 1);
         options = parse({"--config", (root / "relative.toml").string(), "--socket", "src=" + host_socket + ",dst=/tmp/cli.sock"});
@@ -596,9 +643,9 @@ int main() {
         reject({"--config", (root / "relative.toml").string()}, "wrong TOML sockets type rejected");
         write(root / "relative.toml", "sockets = [1]\n");
         reject({"--config", (root / "relative.toml").string()}, "non-table TOML socket rejected");
-        write(root / "relative.toml", "[[sockets]]\nsource = 'agent.sock'\n");
+        write(root / "relative.toml", "[[sockets]]\nsource = '../../agent.sock'\n");
         reject({"--config", (root / "relative.toml").string()}, "incomplete TOML socket rejected");
-        write(root / "relative.toml", "[[sockets]]\nsource = 'agent.sock'\ntarget = '/tmp/config.sock'\nmode = 'rw'\n");
+        write(root / "relative.toml", "[[sockets]]\nsource = '../../agent.sock'\ntarget = '/tmp/config.sock'\nmode = 'rw'\n");
         reject({"--config", (root / "relative.toml").string()}, "unknown TOML socket fields rejected");
         write(root / "relative.toml", "[environment]\ninherit = ['KRUN_INIT']\n");
         reject({"--config", (root / "relative.toml").string()}, "config cannot inherit bootstrap settings");

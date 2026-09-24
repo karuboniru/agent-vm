@@ -45,10 +45,18 @@ std::string source_path(const std::string& value, const fs::path& base,
     if (error) fail("cannot resolve source '" + p.string() + "': " + error.message());
     return normalize(result);
 }
-std::string target_path(const std::string& value, const std::string& home) {
+void try_mask_source(const std::string& value, const fs::path& base, RunSpec& spec) {
+    auto path = source_path(value, base, spec.home, false);
+    std::error_code error;
+    auto status = fs::status(path, error);
+    if (error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory) return;
+    if (error) fail("cannot inspect optional mask source '" + path + "': " + error.message());
+    if (fs::exists(status)) spec.mask_sources.push_back(std::move(path));
+}
+std::string target_path(const std::string& value, const fs::path& base, const std::string& home) {
     if (value.empty() || value.find('\0') != std::string::npos) fail("target path must be nonempty and contain no NUL bytes");
     fs::path p(expand(value, home));
-    if (!p.is_absolute()) fail("guest target must be absolute: " + value);
+    if (p.is_relative()) p = base / p;
     return normalize(p);
 }
 bool env_key(const std::string& key) {
@@ -144,9 +152,9 @@ MountSpec mount_spec(const std::string& value, const fs::path& base, const std::
         } else fail("unknown mount field: " + key);
     }
     if (!source || !target) fail("mount requires src=SOURCE,dst=TARGET");
-    return {source_path(*source, base, home, true), target_path(*target, home), read_only.value_or(true)};
+    return {source_path(*source, base, home, true), target_path(*target, base, home), read_only.value_or(true)};
 }
-TmpfsSpec tmpfs_spec(const std::string& value, const RunSpec& spec) {
+TmpfsSpec tmpfs_spec(const std::string& value, const fs::path& base, const RunSpec& spec) {
     TmpfsSpec result{"", spec.uid, spec.gid, 0700};
     std::optional<std::string> target;
     std::set<std::string> fields;
@@ -164,7 +172,7 @@ TmpfsSpec tmpfs_spec(const std::string& value, const RunSpec& spec) {
         else fail("unknown tmpfs field: " + key);
     }
     if (!target) fail("tmpfs requires target=PATH");
-    result.target = target_path(*target, spec.home);
+    result.target = target_path(*target, base, spec.home);
     return result;
 }
 SocketSpec socket_spec(const std::string& value, const fs::path& base, const std::string& home) {
@@ -182,7 +190,7 @@ SocketSpec socket_spec(const std::string& value, const fs::path& base, const std
         } else fail("unknown socket field: " + key);
     }
     if (!source || !target) fail("socket requires src=SOURCE,dst=TARGET");
-    return {source_path(*source, base, home, true), target_path(*target, home)};
+    return {source_path(*source, base, home, true), target_path(*target, base, home)};
 }
 void keys(const toml::table& table, std::initializer_list<std::string_view> allowed, const std::string& context) {
     for (const auto& [key, value] : table) {
@@ -253,7 +261,7 @@ void cwd_mode(std::string& mode, const std::string& value) {
     if (value != "ro" && value != "rw" && value != "none") fail("cwd mode must be ro, rw or none");
     mode = value;
 }
-void load_config(const fs::path& file, RunSpec& spec, std::string& home,
+void load_config(const fs::path& file, const fs::path& host_cwd, RunSpec& spec, std::string& home,
                  std::string& cwd, std::optional<std::string>& workdir) {
     toml::table root;
     try { root = toml::parse_file(file.string()); }
@@ -269,13 +277,14 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
         if (auto v = int_at(*t, "tmp_mib", UINT32_MAX)) spec.tmp_mib = *v;
     }
     if (auto t = table_at(root, "filesystem")) {
-        keys(*t, {"cwd", "home", "workdir", "mask_sources", "mask_targets"}, "filesystem.");
+        keys(*t, {"cwd", "home", "workdir", "mask_sources", "mask_try_sources", "mask_targets"}, "filesystem.");
         if (auto v = string_at(*t, "cwd")) cwd_mode(cwd, *v);
         if (auto v = string_at(*t, "home")) home_mode(home, *v);
-        if (auto v = string_at(*t, "workdir")) workdir = target_path(*v, spec.home);
+        if (auto v = string_at(*t, "workdir")) workdir = target_path(*v, host_cwd, spec.home);
         for (const auto& v : array_at(*t, "mask_sources"))
-            spec.mask_sources.push_back(source_path(v, file.parent_path(), spec.home, false));
-        for (const auto& v : array_at(*t, "mask_targets")) spec.mask_targets.push_back(target_path(v, spec.home));
+            spec.mask_sources.push_back(source_path(v, host_cwd, spec.home, false));
+        for (const auto& v : array_at(*t, "mask_try_sources")) try_mask_source(v, host_cwd, spec);
+        for (const auto& v : array_at(*t, "mask_targets")) spec.mask_targets.push_back(target_path(v, host_cwd, spec.home));
     }
     if (auto n = root.get("mounts")) {
         auto array = n->as_array();
@@ -288,8 +297,8 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
             if (!source || !target) fail("each mount requires source and target");
             auto mode = string_at(*t, "mode").value_or("ro");
             if (mode != "ro" && mode != "rw") fail("mount mode must be ro or rw");
-            spec.mounts.push_back({source_path(*source, file.parent_path(), spec.home, true),
-                                   target_path(*target, spec.home), mode == "ro"});
+            spec.mounts.push_back({source_path(*source, host_cwd, spec.home, true),
+                                   target_path(*target, host_cwd, spec.home), mode == "ro"});
         }
     }
     if (auto n = root.get("tmpfs")) {
@@ -301,7 +310,7 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
             keys(*t, {"target", "uid", "gid", "mode"}, "tmpfs.");
             auto target = string_at(*t, "target");
             if (!target) fail("each tmpfs requires target");
-            spec.tmpfs.push_back({target_path(*target, spec.home),
+            spec.tmpfs.push_back({target_path(*target, host_cwd, spec.home),
                                  unsigned_int_at(*t, "uid", UINT32_MAX - 1).value_or(spec.uid),
                                  unsigned_int_at(*t, "gid", UINT32_MAX - 1).value_or(spec.gid),
                                  unsigned_int_at(*t, "mode", 07777).value_or(0700)});
@@ -316,8 +325,8 @@ void load_config(const fs::path& file, RunSpec& spec, std::string& home,
             keys(*t, {"source", "target"}, "sockets.");
             auto source = string_at(*t, "source"), target = string_at(*t, "target");
             if (!source || !target) fail("each socket requires source and target");
-            spec.sockets.push_back({source_path(*source, file.parent_path(), spec.home, true),
-                                    target_path(*target, spec.home)});
+            spec.sockets.push_back({source_path(*source, host_cwd, spec.home, true),
+                                    target_path(*target, host_cwd, spec.home)});
         }
     }
     if (auto t = table_at(root, "environment")) {
@@ -526,7 +535,7 @@ Options parse_options(int argc, char** argv) {
         if (!error && !exists && fs::is_symlink(fs::symlink_status(file)))
             fail("configuration is a dangling symlink: " + file.string());
         if (error) fail("cannot inspect configuration: " + error.message());
-        if (exists) load_config(file, spec, home_setting, cwd_setting, workdir);
+        if (exists) load_config(file, host_cwd, spec, home_setting, cwd_setting, workdir);
         else if (config || profile) fail("configuration file does not exist: " + file.string());
     }
     for (size_t i = 0; i < args.size(); ++i) {
@@ -554,12 +563,13 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--network") network_mode(spec, value());
         else if (option == "--home") home_mode(home_setting, value());
         else if (option == "--cwd-mode") cwd_mode(cwd_setting, value());
-        else if (option == "--workdir") workdir = target_path(value(), spec.home);
+        else if (option == "--workdir") workdir = target_path(value(), host_cwd, spec.home);
         else if (option == "--mount") spec.mounts.push_back(mount_spec(value(), host_cwd, spec.home));
-        else if (option == "--tmpfs") spec.tmpfs.push_back(tmpfs_spec(value(), spec));
+        else if (option == "--tmpfs") spec.tmpfs.push_back(tmpfs_spec(value(), host_cwd, spec));
         else if (option == "--socket") spec.sockets.push_back(socket_spec(value(), host_cwd, spec.home));
         else if (option == "--mask") spec.mask_sources.push_back(source_path(value(), host_cwd, spec.home, false));
-        else if (option == "--mask-target") spec.mask_targets.push_back(target_path(value(), spec.home));
+        else if (option == "--mask-try") try_mask_source(value(), host_cwd, spec);
+        else if (option == "--mask-target") spec.mask_targets.push_back(target_path(value(), host_cwd, spec.home));
         else if (option == "--env" || option == "-e") set_env(spec, value());
         else if (option == "--publish" || option == "-p") spec.ports.push_back(port_spec(value()));
         else if (option == "--ssh-agent") { flag(); spec.ssh_agent = true; }
@@ -881,12 +891,13 @@ void print_help() {
   --network none|passt   Network policy (default none)
   --home ephemeral|shared  Home policy (default ephemeral)
   --cwd-mode ro|rw|none  Share the invoking directory (default rw)
-  --workdir PATH         Absolute guest working directory
+  --workdir PATH         Guest working directory
   --mount SPEC           type=bind,src=SOURCE,dst=TARGET[,ro|rw] (default ro)
   --tmpfs SPEC           target=PATH[,uid=UID,gid=GID,mode=0700] (caller IDs)
   --socket SPEC          Forward a Unix stream socket: src=SOURCE,dst=TARGET
   --mask SOURCE          Hide a host source subtree through every shared mount
-  --mask-target TARGET   Hide one absolute guest target
+  --mask-try SOURCE      Hide a host source subtree only if it exists
+  --mask-target TARGET   Hide one guest target
   -e, --env KEY[=VALUE]   Set a workload variable, or inherit it from the host
   -p, --publish SPEC     [IPv4:]HOST:GUEST[/tcp|udp] (default 127.0.0.1, TCP)
   --ssh-agent            Forward SSH_AUTH_SOCK to /run/user/UID/ssh-agent.socket
@@ -899,6 +910,7 @@ $HOME/.config/agent-vm/config.toml. Project configuration is never read.
 --config, --profile and --no-config are mutually exclusive.
 CLI scalars and environment keys override configuration; mounts, tmpfs, sockets
 and masks are combined. Conflicting filesystem targets are errors.
+Relative filesystem paths in configuration and CLI options use the invoking CWD.
 Disable default mounts with --cwd-mode none
 or --home ephemeral when replacing them. All values are literal, without shell
 execution. Command defaults to /bin/sh. plan prints environment names, not values.

@@ -37,7 +37,7 @@ agent-vm --version
 - `--profile NAME`：加载同一用户配置目录中的 `NAME.toml`，替代而不合并 `config.toml`。名称非空且不含路径组件，文件必须存在。
 - `--no-config`：禁用配置文件。以上三个选项互斥。
 
-CLI 标量覆盖文件设置，环境变量按名称覆盖；bind、tmpfs、socket 和端口列表追加，mask 合并去重。未知字段报错。配置中的相对源路径相对于配置文件目录，CLI 中相对于调用时 CWD；`~` 展开为调用者 home，不做 shell 展开或命令替换。完整字段示例见 [config.toml](../examples/config.toml)。
+CLI 标量覆盖文件设置，环境变量按名称覆盖；bind、tmpfs、socket 和端口列表追加，mask 合并去重。未知字段报错。配置和 CLI 中的相对文件系统路径均相对于启动 `agent-vm` 时的宿主当前工作目录，适用于 mount、socket 的 source/target、tmpfs 的 target，以及 `filesystem.workdir`、`mask_sources`、`mask_try_sources`、`mask_targets` 和 `--config FILE`。修改 guest 的 `workdir` 不改变解析基准。宿主源路径解析符号链接，guest 目标路径仅做词法规范化。D-Bus 地址和环境变量值仍按字面字符串处理。`~` 展开为调用者 home，不做 shell 展开或命令替换。完整字段示例见 [config.toml](../examples/config.toml)。
 
 ```toml
 version = 1
@@ -87,7 +87,14 @@ tmpfs 可覆盖只读共享中的现有目录，遮住原子树而不修改宿�
 
 ## 路径 mask
 
-`--mask SOURCE` / `[filesystem].mask_sources` 在每个共享别名中遮挡宿主源子树；`--mask-target TARGET` / `mask_targets` 遮挡一个 guest 目标。共享树内缺失的 mask 路径报错，不为 mask 创建宿主占位文件。
+`--mask SOURCE` / `[filesystem].mask_sources` 在每个共享别名中遮挡宿主源子树；`--mask-target TARGET` / `mask_targets` 遮挡一个 guest 目标。例如在 `[filesystem]` 中设置 `mask_sources = [".git"]`，会遮挡调用时当前目录中的 `.git`，方便同一份用户配置用于不同项目。共享树内缺失的 mask 路径报错，不为 mask 创建宿主占位文件。
+
+`--mask-try SOURCE` / `[filesystem].mask_try_sources` 仅在配置解析时路径存在的情况下应用相同的源 mask。不存在的路径（含悬空符号链接）会被忽略；其他文件系统错误和普通 mask 冲突仍报错。存在的路径会与 `mask_sources` 合并去重，忽略的路径不会在后续创建时自动加入 mask。可复用的项目配置示例：
+
+```toml
+[filesystem]
+mask_try_sources = [".git", ".env"]
+```
 
 ```sh
 # .ssh 必须存在；共享 home，同时隐藏其 .ssh。
@@ -125,7 +132,7 @@ agent-vm run --no-config \
 agent-vm run --no-config --network passt --ssh-agent -- bash
 ```
 
-`--socket` 可重复；TOML 使用 `[[sockets]]` 的 `source` 和 `target`。源必须是存在的文件系统 Unix stream socket，源 symlink 解析为规范路径。目标是绝对路径，源和目标各最多 107 字节，总计最多 256 个转发（含 SSH/D-Bus）。冲突目标报错，含逗号路径使用 TOML。
+`--socket` 可重复；TOML 使用 `[[sockets]]` 的 `source` 和 `target`。源必须是存在的文件系统 Unix stream socket，源 symlink 解析为规范路径。相对目标路径以调用时的宿主当前目录为基准；解析后源和目标各最多 107 字节，总计最多 256 个转发（含 SSH/D-Bus）。冲突目标报错，含逗号路径使用 TOML。
 
 目标必须位于可写 guest 文件系统。helper 创建缺失父目录并设为调用者所有、0700；已有目录保持权限，直接父目录必须允许调用者创建 socket。用 `/run/service/client.sock` 等私有子目录，避免直接在 root 所有的 `/run` 创建。listener 以调用者运行，socket mode 为 0600，不替换已有目标。位于 `rw` bind 内的目录和 socket 会写入宿主，位于 tmpfs 内则保持 guest 私有。
 

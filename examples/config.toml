@@ -12,10 +12,15 @@ cwd = "rw"
 home = "ephemeral"
 # Source masks apply at every shared alias. Missing paths beneath a shared
 # directory are rejected, because creating placeholders would modify the host.
+# Optional masks skip missing paths (including dangling symlinks).
+# Existing paths use the same rules as mask_sources; other errors still fail.
+# mask_try_sources = [".git", ".env"]
 # mask_sources = ["~/.ssh", "~/.gnupg"]
 # mask_targets = ["/data/private"]
 
-# Relative source paths are resolved against this file's directory.
+# All relative filesystem paths use the invoking host working directory,
+# including sources, targets, masks and workdir. Guest workdir does not change it.
+# workdir = "."
 # [[mounts]]
 # source = "~/datasets"
 # target = "/data"
@@ -45,9 +50,9 @@ target = "/cache"
 # target = "~/.gnupg/pubring.kbx"
 # mode = "ro"
 
-# Forward an existing filesystem Unix stream socket. Relative sources use this
-# file's directory; ~ expands to the invoking user's home, as for mounts.
-# CLI --socket entries append to these. Targets must be absolute and writable.
+# Forward an existing filesystem Unix stream socket. Relative sources use the
+# invoking host working directory; ~ expands to the invoking user's home, as for mounts.
+# CLI --socket entries append to these. Targets must be writable.
 # Missing parent directories are created as guest root, then assigned to the
 # guest user before the relay drops privileges and creates a mode-0600 socket.
 # Existing parent ownership is unchanged; existing destinations are rejected.

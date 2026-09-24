@@ -37,7 +37,7 @@ The default file is `$XDG_CONFIG_HOME/agent-vm/config.toml`, falling back to `~/
 - `--profile NAME` loads `NAME.toml` from the same user configuration directory, replacing rather than merging with `config.toml`. The name must be nonempty without path components, and the file must exist.
 - `--no-config` disables configuration loading. These three options are mutually exclusive.
 
-CLI scalar settings override the file; environment variables override by name. Bind, tmpfs, socket, and port lists append; masks are combined and deduplicated. Unknown fields are errors. Relative source paths resolve against the configuration directory for TOML, and the invoking CWD for CLI options. `~` expands to the invoking user's home; no shell expansion or command substitution is performed. See [config.toml](../examples/config.toml) for the full example.
+CLI scalar settings override the file; environment variables override by name. Bind, tmpfs, socket, and port lists append; masks are combined and deduplicated. Unknown fields are errors. Relative filesystem paths in both TOML and CLI options resolve against the host working directory when invoking `agent-vm`. This applies to mount and socket sources/targets, tmpfs targets, `filesystem.workdir`, `mask_sources`, `mask_try_sources`, and `mask_targets`, as well as `--config FILE`. Changing guest `workdir` does not change this base. Host sources resolve symlinks; guest targets are normalized lexically. D-Bus addresses and environment values remain literal strings. `~` expands to the invoking user's home; no shell expansion or command substitution is performed. See [config.toml](../examples/config.toml) for the full example.
 
 ```toml
 version = 1
@@ -87,7 +87,14 @@ Tmpfs can cover an existing directory in a read-only share, hiding that subtree 
 
 ## Path masks
 
-`--mask SOURCE` / `[filesystem].mask_sources` hides a host source subtree through every shared alias. `--mask-target TARGET` / `mask_targets` hides one guest target. Missing mask paths inside shared trees are errors; masking does not create host placeholders.
+`--mask SOURCE` / `[filesystem].mask_sources` hides a host source subtree through every shared alias. `--mask-target TARGET` / `mask_targets` hides one guest target. For example, `[filesystem]` with `mask_sources = [".git"]` hides `.git` in the invoking working directory, allowing the same user configuration to apply to different projects. Missing mask paths inside shared trees are errors; masking does not create host placeholders.
+
+`--mask-try SOURCE` / `[filesystem].mask_try_sources` applies the same source mask only when the path exists at configuration parsing time. Missing paths (including dangling symlinks) are ignored; other filesystem errors and normal mask conflicts still fail. Existing paths are merged with `mask_sources` and deduplicated. Skipped paths are not watched for later creation. For a reusable project policy:
+
+```toml
+[filesystem]
+mask_try_sources = [".git", ".env"]
+```
 
 ```sh
 # .ssh must exist; share home while hiding its .ssh directory.
@@ -125,7 +132,7 @@ agent-vm run --no-config \
 agent-vm run --no-config --network passt --ssh-agent -- bash
 ```
 
-Repeat `--socket`, or use `[[sockets]]` with `source` and `target`. Sources must be existing filesystem Unix stream sockets; source symlinks resolve to canonical paths. Targets must be absolute. Each source/target path is limited to 107 bytes, with at most 256 forwards including SSH/D-Bus. Conflicting targets are errors; use TOML for comma-containing paths.
+Repeat `--socket`, or use `[[sockets]]` with `source` and `target`. Sources must be existing filesystem Unix stream sockets; source symlinks resolve to canonical paths. Relative targets use the invoking host working directory. Each source/target path is limited to 107 bytes, with at most 256 forwards including SSH/D-Bus. Conflicting targets are errors; use TOML for comma-containing paths.
 
 Targets must reside on writable guest filesystems. The helper creates missing parents with caller ownership and mode 0700. Existing directories retain permissions; the immediate parent must allow the caller to create the socket. Use a private subdirectory such as `/run/service/client.sock`, avoiding creation directly in root-owned `/run`. Listeners run as the caller with socket mode 0600 and never replace existing targets. Directories and sockets inside `rw` binds modify the host; those in tmpfs remain guest-private.
 

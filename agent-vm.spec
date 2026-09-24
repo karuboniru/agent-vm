@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.7
+Version:        0.1.8
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,13 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Thu Sep 24 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.8-1
+- Resolve relative configuration and CLI filesystem paths against the invoking CWD
+- Add optional source masks that skip missing paths
+- Harden VMM IPC and seccomp boundaries and unify path policy
+- Run the VMM in its own session and deny terminal input ioctls
+- Rewrite documentation as bilingual guides for current behavior
+
 * Wed Sep 23 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.7-1
 - Confine socket forwarding with a shared controller and isolated data processes
 - Handle locked runtime submounts and preserve socket replacement reconnects
