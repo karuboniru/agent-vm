@@ -79,12 +79,23 @@ static void placeholder(int root, const char *path, bool directory)
     while (part) {
         char *next = strtok_r(NULL, "/", &save);
         bool dir = next || directory;
-        if (dir && mkdirat(parent, part, 0755) < 0 && errno != EEXIST) fail(path);
+        bool created = false;
+        if (dir) {
+            if (mkdirat(parent, part, 0755) == 0) created = true;
+            else if (errno != EEXIST) fail(path);
+        }
         int fd = openat(parent, part, O_CLOEXEC | O_NOFOLLOW |
                         (dir ? O_RDONLY | O_DIRECTORY : O_WRONLY | O_CREAT), 0600);
         if (fd < 0) fail(path);
         struct stat st;
         if (fstat(fd, &st) < 0 || (dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))) invalid();
+        /* Setup runs as root, but private home/runtime/tmpfs descendants
+         * should belong to their parent owner. Only change directories we
+         * created; existing targets and shared source inodes retain ownership. */
+        if (created) {
+            struct stat owner;
+            if (fstat(parent, &owner) < 0 || fchown(fd, owner.st_uid, owner.st_gid) < 0) fail(path);
+        }
         close(parent);
         parent = fd;
         part = next;
@@ -109,7 +120,7 @@ static void mount_tmpfs(int root, const struct entry *e, uint32_t tmp_mib)
     mount_at(root, e->target, "tmpfs", "tmpfs", MS_NOSUID | MS_NODEV, options);
 }
 
-void avm_mount_filesystems(void)
+void avm_mount_filesystems(uid_t uid, gid_t gid)
 {
     int input = open(AVM_MOUNT_SPEC, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (input < 0) fail("open description");
@@ -175,6 +186,19 @@ void avm_mount_filesystems(void)
         placeholder(root, e->target, true);
         mount_tmpfs(root, e, tmp_mib);
     }
+    /* Set the runtime owner before creating any nested mount targets, so
+     * those directories inherit the caller identity just like private HOME.
+     * This is still private /run: no user-selected shares are mounted yet. */
+    char runtime_path[64];
+    snprintf(runtime_path, sizeof(runtime_path), "/run/user/%u", (unsigned)uid);
+    placeholder(root, runtime_path, true);
+    int runtime_target = target_fd(root, runtime_path);
+    int runtime = openat(runtime_target, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (runtime < 0) fail("open private user runtime directory");
+    close(runtime_target);
+    if (fchown(runtime, uid, gid) < 0 || fchmod(runtime, 0700) < 0)
+        fail("set private user runtime directory permissions");
+    close(runtime);
     mount_at(root, "/.agent-vm/objects", AVM_EXPORT_TAG, "virtiofs", MS_NOSUID | MS_NODEV, NULL);
     int objects = target_fd(root, "/.agent-vm/objects");
     for (uint32_t i = 0; i < count; ++i) {

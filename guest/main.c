@@ -281,30 +281,8 @@ static void check_network(void)
     }
 }
 
-/* Only /run/user is changed here. HOME, CWD, and arbitrary shared mounts are
- * deliberately never chmod/chown targets, even while this helper is root. */
-static void prepare_runtime(uid_t uid, gid_t gid)
+static void check_temporary_directories(void)
 {
-    int run = open("/run", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (run < 0)
-        fail("open private /run");
-    if (mkdirat(run, "user", 0755) < 0 && errno != EEXIST)
-        fail("create /run/user");
-    int user = openat(run, "user", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (user < 0)
-        fail("open /run/user");
-    close(run);
-    char name[32];
-    snprintf(name, sizeof(name), "%u", (unsigned)uid);
-    if (mkdirat(user, name, 0700) < 0 && errno != EEXIST)
-        fail("create private user runtime directory");
-    int runtime = openat(user, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (runtime < 0)
-        fail("open private user runtime directory");
-    close(user);
-    if (fchown(runtime, uid, gid) < 0 || fchmod(runtime, 0700) < 0)
-        fail("set private user runtime directory permissions");
-    close(runtime);
     const char *temporary[] = {"/tmp", "/var/tmp"};
     for (size_t i = 0; i < sizeof(temporary) / sizeof(temporary[0]); ++i) {
         struct stat status;
@@ -705,10 +683,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "agent-vm guest: helper must start as guest root\n");
         return 125;
     }
-    avm_mount_filesystems();
+    avm_mount_filesystems((uid_t)spec.header.uid, (gid_t)spec.header.gid);
     if (spec.header.flags & AVM_FLAG_NETWORK)
         check_network();
-    prepare_runtime((uid_t)spec.header.uid, (gid_t)spec.header.gid);
+    check_temporary_directories();
     for (uint32_t i = 0; i < spec.header.socket_count; ++i)
         if (avm_relay_prepare(spec.sockets[i], (uid_t)spec.header.uid,
                               (gid_t)spec.header.gid) < 0)

@@ -180,6 +180,50 @@ print(json.dumps({p:[(s:=os.stat(p)).st_uid,s.st_gid,stat.S_IMODE(s.st_mode)] fo
           "custom tmpfs applies caller defaults and explicit numeric ownership and modes")
     check(True, "custom tmpfs supports nested mounts in reverse order, workdir, and independent capacity limits")
 
+    ownership_dir = base / "ownership-source"
+    ownership_dir.mkdir(mode=0o750)
+    (ownership_dir / "payload").write_text("directory-source")
+    ownership_file = base / "ownership-file"
+    ownership_file.write_text("file-source")
+    ownership_file.chmod(0o640)
+    ownership_before = {path: path.stat() for path in (ownership_dir, ownership_file)}
+    runtime = Path(f"/run/user/{os.getuid()}")
+    root_tmpfs = runtime / "root-owned"
+    ownership_roots = (home, runtime, root_tmpfs)
+    ownership_options = ["--tmpfs", f"target={root_tmpfs},uid=0,gid=0,mode=0755"]
+    for root in ownership_roots:
+        parent = root / "mount-targets/deep"
+        ownership_options += ["--mount", f"src={ownership_dir},dst={parent / 'directory'},ro",
+                              "--mount", f"src={ownership_file},dst={parent / 'file'},ro"]
+    out, _ = run(["python3", "-c", """import os,pathlib,stat
+uid,gid=os.getuid(),os.getgid()
+home=pathlib.Path(os.environ['HOME'])
+runtime=pathlib.Path(f'/run/user/{uid}')
+root_tmpfs=runtime/'root-owned'
+for root,owner in ((home,(uid,gid)),(runtime,(uid,gid)),(root_tmpfs,(0,0))):
+ for path in (root,root/'mount-targets',root/'mount-targets/deep'):
+  info=path.stat()
+  assert stat.S_ISDIR(info.st_mode) and (info.st_uid,info.st_gid)==owner,(path,info)
+  if path!=root: assert stat.S_IMODE(info.st_mode)==0o755,(path,info)
+ parent=root/'mount-targets/deep'
+ directory=parent/'directory';file=parent/'file'
+ assert (directory/'payload').read_text()=='directory-source'
+ assert file.read_text()=='file-source'
+ assert (directory.stat().st_uid,directory.stat().st_gid)==(uid,gid)
+ assert (file.stat().st_uid,file.stat().st_gid)==(uid,gid)
+for root in (home,runtime):
+ (root/'mount-targets/deep/private').write_text('writable')
+assert stat.S_IMODE(root_tmpfs.stat().st_mode)==0o755
+print('mount-target-owners-ok')
+"""], ownership_options)
+    check(out.strip() == "mount-target-owners-ok",
+          "new home and runtime mount parents inherit ownership; explicit root tmpfs owns its descendants")
+    for path, before in ownership_before.items():
+        after = path.stat()
+        check((after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_mtime_ns, after.st_ctime_ns) ==
+              (before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+              f"mount target creation preserves bound source metadata: {path.name}")
+
     config = base / "tmpfs.toml"
     config.write_text("""version = 1
 [[tmpfs]]
