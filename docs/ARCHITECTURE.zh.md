@@ -29,7 +29,17 @@ VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后
 
 宿主是可信的；运行期间宿主重命名、替换或重建被 mask 的路径不在保证范围内。mask 保护共享入口，不隐藏其他位置已有的硬链接、副本或已授出的 FD。可写共享授予直接修改对应宿主源的权限。
 
-共享树内可达的宿主 Unix socket 也属于服务能力边界，即使共享目录是只读。guest 的显式 relay 只传字节；被控制的 VMM 若能直接连接可达服务，可使用该服务授予的能力，包括服务主动传来的 FD。因此 `--network none`、只读 bind 和路径 mask 不限制服务经已授权连接另行授予的权限。
+Landlock ABI 9 可用时，VMM 仅获准连接固定的 readiness/broker pathname Unix socket；通过共享目录（包括只读目录和 export 别名）可达的其他宿主 socket 默认拒绝。VMM 在 confinement 后创建的域内 socket（包括 control listener）仍可用。低于 ABI 9 时保留原有行为并告警：共享目录内可达的宿主 socket 仍属于服务能力边界。guest 的显式 relay 只传字节；已经授权的服务或继承的 FD 仍可授予额外能力，Landlock 不撤销它们。
+
+## Landlock confinement
+
+运行时探测内核 ABI。supervisor 和 D-Bus proxy 文件系统策略要求 ABI 3（包含 truncate 限制）；VMM pathname Unix socket 白名单要求 ABI 9。缺少所需 ABI 或 Landlock 未启用时明确告警，保留原有隔离；支持时若创建规则或安装策略失败，则启动失败。`doctor` 报告这两项能力。
+
+supervisor 只在 worker fork 后的父分支安装文件系统策略，避免 worker 继承后无法挂载／切根。它保留 runtime 清理所需权限；删除 runtime 本身还需在其父目录授予 `REMOVE_DIR`，因此也能删除该父目录下其他空目录，但不会因此得到读取、写文件或删除普通文件的权限。现有终端和通信 FD 保留。
+
+D-Bus proxy 在 exec 前安装内置文件白名单：`/usr`、存在的 `/lib`、`/lib64` 只读；执行授权 proxy 本身及已知的 x86_64/aarch64 ELF 加载器；`/etc` 仅逐文件授权 loader cache、NSS、账户、解析器、machine-id 和时区依赖，另有只读 `/dev/null`、`/dev/urandom`。每个 bus 使用独立的 caller-owned 0700 私有目录，仅允许枚举、创建 socket 和删除目录内文件，不授予普通文件写入。不会授权整个 home、`/etc` 或宿主 runtime 目录。上游地址仍由 D-Bus 配置决定；此策略不限制 proxy 的 socket 连接，依赖 home 认证文件的地址不在该文件授权范围内。
+
+VMM socket 策略在挂载、切根和 FD 清理完成后、libkrun 创建线程前安装；它不额外收紧普通文件权限，并显式保留原有跨目录 rename/link 行为。Landlock 不代替宿主只读挂载、mask、FD 清理或 seccomp，也不覆盖所有元数据操作。socket controller/data process 和 passt 本轮不添加 Landlock。
 
 ## UID/GID 与降权
 
@@ -101,7 +111,7 @@ controller 位于私有 user、mount、network、IPC、UTS namespaces。根中�
 
 每个 data process 是独立 PID namespace 的 PID 1，根为空且只读，无 proc/dev、标准流、宿主目录或 listener FD。它仅从私有单向通道接收已连接 FD 对并转发字节；allowlist 禁止文件打开、socket 创建/连接、exec、fork、ptrace 和 namespace 修改。controller 与 data process 均清空包括 bounding set 在内的 capabilities，设置 `no_new_privs` 后报告就绪。data process 失败会引发整个 broker 清理。
 
-内部 FD 交接使用 `SCM_RIGHTS`，不等于 guest FD 转发。没有额外 idle timeout 或宿主总资源配额。broker 隔离不为独立的 `xdg-dbus-proxy` 添加沙盒，也不改变 passt 自身沙盒。每个启用的 D-Bus 使用独立过滤 proxy；策略和 upstream 地址不序列化给 clean VMM worker，worker 只得到解析后的 socket 映射。
+内部 FD 交接使用 `SCM_RIGHTS`，不等于 guest FD 转发。没有额外 idle timeout 或宿主总资源配额。broker 隔离不改变 passt 自身沙盒；独立的 `xdg-dbus-proxy` 使用上文的 Landlock 文件系统策略。每个启用的 D-Bus 使用独立过滤 proxy；策略和 upstream 地址不序列化给 clean VMM worker，worker 只得到解析后的 socket 映射。
 
 ## 进程可观测性
 

@@ -17,6 +17,7 @@ CTest does not start real VMs, but network/socket-sandbox tests create namespace
 
 | CTest name | Coverage |
 | --- | --- |
+| `landlock` | Unavailable-support fallback/error handling, file read/write/truncate denial, existing FDs, supervisor cleanup and ABI 9 Unix socket allowlist; returns 77 without ABI 3 |
 | `config` | CLI/TOML, profiles, merge precedence, mounts/tmpfs/masks, environment, socket/D-Bus policy |
 | `process-title` | Short names/full titles, preserved argv/environment, fork isolation, escaping, truncation |
 | `dbus` | Proxy readiness, lifetime FD, startup failure, reaping; missing xdg-dbus-proxy returns 77 and CTest marks it skipped |

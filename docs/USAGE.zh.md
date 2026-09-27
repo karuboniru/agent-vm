@@ -160,6 +160,8 @@ args = ["--talk=org.freedesktop.UPower"]
 
 guest 地址为 `unix:path=/run/user/<uid>/dbus-user.socket` 和 `unix:path=/run/user/<uid>/dbus-system.socket`，分别写入对应环境变量。冲突的显式环境变量或 socket 目标报错。`plan` 显示过滤参数但不启动 proxy；proxy 意外退出会终止 VM。代理以调用者身份访问宿主 bus，过滤范围受其既有权限限制。转发不支持 Unix FD，因此需要 FD 的方法（包括许多 portal API）不可用。
 
+Landlock ABI 3 可用时，proxy 自动使用内置文件白名单，无需另配路径：运行依赖只读，只在每个 bus 的独立私有目录创建／删除 socket，不开放 home 或整个 `/etc`。上游地址保持原义，但需要 home 认证文件（例如 `.dbus-keyrings`）的认证方式不在授权范围内。支持缺失会告警；支持时策略安装失败会终止启动。
+
 ## 退出与诊断
 
 返回 workload 退出状态；运行器错误通常为 125。SIGINT、SIGTERM、SIGHUP、SIGQUIT 转发给 guest 进程组，SIGWINCH 同步终端大小；无响应关闭在五秒后强制终止。正常退出或处理到的信号会恢复终端，SIGKILL 后终端若停留在 raw 模式可执行 `stty sane`。

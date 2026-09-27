@@ -3,7 +3,7 @@
 %forgemeta
 
 Name:           agent-vm
-Version:        0.1.8
+Version:        0.1.9
 Release:        1%{?dist}
 Summary:        Rootless command runner using libkrun microVMs
 
@@ -56,6 +56,12 @@ access to /dev/kvm and permission to create unprivileged user namespaces.
 %{_datadir}/agent-vm/
 
 %changelog
+* Sun Sep 27 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.9-1
+- Confine the supervisor and D-Bus proxies with Landlock filesystem policies
+- Restrict VMM pathname Unix socket connections with Landlock ABI 9
+- Add Landlock capability diagnostics, regression tests and documentation
+- Synchronize CMake and RPM package versions
+
 * Thu Sep 24 2026 Qiyu Yan <yanqiyu@fedoraproject.org> - 0.1.8-1
 - Resolve relative configuration and CLI filesystem paths against the invoking CWD
 - Add optional source masks that skip missing paths

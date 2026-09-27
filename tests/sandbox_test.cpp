@@ -1,5 +1,6 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/protocol.h"
+#include "../src/landlock.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -189,6 +190,63 @@ struct Fixture {
         return avm::enter_sandbox(s, root.string(), ipc.string(), spec.string(), helper.string(), keep, control);
     }
 };
+static void landlock_socket_test() {
+    if (avm::detail::landlock_abi() < 9) {
+        std::cout << "SKIP VMM pathname socket confinement: Landlock ABI 9 unavailable\n";
+        return;
+    }
+    Fixture fixture;
+    auto listen_at = [](const fs::path& path) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        require(fd >= 0, "create Landlock fixture listener");
+        sockaddr_un address{}; address.sun_family = AF_UNIX;
+        require(path.string().size() < sizeof(address.sun_path), "Landlock fixture path too long");
+        std::strcpy(address.sun_path, path.c_str());
+        require(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(fd, 8) == 0,
+                "listen for Landlock fixture");
+        return fd;
+    };
+    fs::remove(fixture.ipc / "ready.sock");
+    int ready = listen_at(fixture.ipc / "ready.sock");
+    int broker = listen_at(fixture.ipc / "socket-0.sock");
+    int ambient = listen_at(fixture.source / "ambient.sock");
+    auto spec = fixture.run_spec();
+    spec.mounts[1].read_only = true;
+    spec.sockets.push_back({(fixture.source / "ambient.sock").string(), "/run/explicit.sock"});
+    int status = child_status([&] {
+        fixture.enter(spec);
+        auto connect_to = [](const std::string& path) {
+            int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            require(fd >= 0, "create confined Unix client");
+            sockaddr_un address{}; address.sun_family = AF_UNIX;
+            require(path.size() < sizeof(address.sun_path), "confined socket path too long");
+            std::strcpy(address.sun_path, path.c_str());
+            int result = connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+            int error = result == 0 ? 0 : errno;
+            close(fd);
+            return error;
+        };
+        require(connect_to(AVM_READY_SOCKET) == 0, "Landlock blocked readiness IPC");
+        require(connect_to(std::string(AVM_SOCKET_PREFIX) + "0.sock") == 0, "Landlock blocked broker IPC");
+        require(connect_to("/work/ambient.sock") == EACCES, "writable share leaked ambient socket");
+        require(connect_to("/copy/ambient.sock") == EACCES, "read-only share leaked ambient socket");
+        for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+            const auto socket_path = object.path() / "root/ambient.sock";
+            if (fs::exists(socket_path))
+                require(connect_to(socket_path.string()) == EACCES, "export alias leaked ambient socket");
+        }
+        int control = listen_at(AVM_CONTROL_SOCKET);
+        require(connect_to(AVM_CONTROL_SOCKET) == 0, "Landlock blocked new domain-local control socket");
+        close(control);
+        write_file("/work/rename-source", "data");
+        require(mkdir("/work/rename-dest", 0700) == 0, "create rename destination");
+        require(rename("/work/rename-source", "/work/rename-dest/rename-target") == 0,
+                "socket-only Landlock broke cross-directory rename");
+    });
+    close(ready); close(broker); close(ambient);
+    require(status == 0, "VMM Landlock socket policy failed");
+}
+
 static void masked_child_test() {
     Fixture fixture;
     write_file(fixture.source / ".ssh/known_hosts", "public hosts");
@@ -593,6 +651,7 @@ int main(int argc, char** argv) {
             supervisor_network_test();
             session_isolation_test();
             integration_test();
+            landlock_socket_test();
             masked_child_test();
             masked_descendant_test();
             nested_mount_modes_test();

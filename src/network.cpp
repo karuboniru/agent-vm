@@ -1,6 +1,7 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/protocol.h"
 #include "agent_vm/process_title.h"
+#include "landlock.hpp"
 #include "socket_sandbox.hpp"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -51,7 +53,7 @@ private:
 }
 
 enum class Stage : int { Ready, Signals, ProcessGroup, ParentDeath, Descriptors, Privileges,
-                         Stdin, Output, Exec, Socket, Bind, Listen, Sandbox };
+                         Stdin, Output, Exec, Socket, Bind, Listen, Sandbox, DbusSandbox };
 struct Status { Stage stage; int error; char detail[256]{}; };
 const char* stage_name(Stage stage) {
     switch (stage) {
@@ -68,6 +70,7 @@ const char* stage_name(Stage stage) {
     case Stage::Bind: return "bind broker socket";
     case Stage::Listen: return "listen on broker socket";
     case Stage::Sandbox: return "confine socket broker";
+    case Stage::DbusSandbox: return "confine D-Bus proxy";
     }
     return "initialize helper";
 }
@@ -662,8 +665,66 @@ void stop_child(pid_t pid) {
     cleanup_broker(pid);
 }
 
+bool confine_dbus_proxy_filesystem(int private_directory) {
+    struct stat directory_stat {};
+    if (fstat(private_directory, &directory_stat) < 0)
+        fail("inspect private D-Bus proxy directory");
+    if (!S_ISDIR(directory_stat.st_mode) || directory_stat.st_uid != geteuid() ||
+        (directory_stat.st_mode & 07777) != 0700)
+        throw std::runtime_error("D-Bus proxy socket parent must be owned by this user and mode 0700");
+    // ABI 3 handles TRUNCATE. Earlier ABIs cannot deny truncation through a
+    // newly opened file, so they are treated as unavailable for this profile.
+    const int abi = detail::landlock_abi();
+    if (abi < 3) return false;
+    const std::uint64_t handled = detail::fs_rights_for_abi(abi);
+    detail::LandlockRuleset rules(handled);
+    const std::uint64_t read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    const auto add = [&](const char* name, std::uint64_t rights, bool optional) {
+        try {
+            rules.add_path(name, rights);
+        } catch (const std::system_error& error) {
+            if (optional && error.code() == std::errc::no_such_file_or_directory) return;
+            throw std::system_error(error.code(), std::string("D-Bus Landlock path ") + name);
+        }
+    };
+    add("/usr", read, false);
+    add("/lib", read, true);
+    add("/lib64", read, true);
+    add("/usr/bin/xdg-dbus-proxy", LANDLOCK_ACCESS_FS_EXECUTE, false);
+    // The kernel also checks EXECUTE on the ELF interpreter named by PT_INTERP.
+    // Keep this to known loader files for the supported x86_64 and aarch64 hosts.
+    for (const char* loader : {
+             "/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-x86-64.so.2",
+             "/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-aarch64.so.1"})
+        add(loader, LANDLOCK_ACCESS_FS_EXECUTE, true);
+    for (const char* name : {
+             "/etc/ld.so.cache", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group",
+             "/etc/hosts", "/etc/host.conf", "/etc/gai.conf", "/etc/resolv.conf",
+             "/etc/services", "/etc/protocols", "/etc/machine-id", "/etc/localtime"})
+        add(name, LANDLOCK_ACCESS_FS_READ_FILE, true);
+    add("/dev/null", LANDLOCK_ACCESS_FS_READ_FILE, false);
+    add("/dev/urandom", LANDLOCK_ACCESS_FS_READ_FILE, true);
+    rules.add_fd(private_directory, LANDLOCK_ACCESS_FS_READ_DIR |
+                                    LANDLOCK_ACCESS_FS_MAKE_SOCK |
+                                    LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    rules.enforce();
+    return true;
+}
+
 NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path) {
     socket_address(path);
+    // Landlock rules apply to every entry beneath the directory. The trusted
+    // caller must supply a dedicated parent (the CLI creates a fresh one per
+    // proxy); here we additionally verify its owner and private permissions.
+    const std::string directory = std::filesystem::path(path).parent_path().string();
+    Fd proxy_directory(open(directory.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (proxy_directory.get() < 0) fail("open private D-Bus proxy directory");
+    move_above_stdio(proxy_directory);
+    struct stat directory_stat {};
+    if (fstat(proxy_directory.get(), &directory_stat) < 0)
+        fail("inspect private D-Bus proxy directory");
+    if (directory_stat.st_uid != geteuid() || (directory_stat.st_mode & 07777) != 0700)
+        throw std::runtime_error("D-Bus proxy socket parent must be owned by this user and mode 0700");
     int pair[2];
     if (pipe2(pair, O_CLOEXEC) < 0) fail("create D-Bus readiness pipe");
     Fd ready_read(pair[0]), ready_write(pair[1]);
@@ -684,11 +745,21 @@ NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path) {
         if (!reset_signals() || !ignore_terminal_signals()) child_fail(status_write.get(), Stage::Signals);
         if (setpgid(0, 0) < 0) child_fail(status_write.get(), Stage::ProcessGroup);
         if (!parent_death(parent, SIGKILL)) child_fail(status_write.get(), Stage::ParentDeath);
-        if (!close_except({ready_write.get(), status_write.get()})) child_fail(status_write.get(), Stage::Descriptors);
+        if (!close_except({ready_write.get(), status_write.get(), proxy_directory.get()}))
+            child_fail(status_write.get(), Stage::Descriptors);
         if (!null_stream(STDIN_FILENO, O_RDONLY)) child_fail(status_write.get(), Stage::Stdin);
         // Keep --log diagnostics off workload stdout.
         if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) child_fail(status_write.get(), Stage::Output);
         if (!drop_privileges()) child_fail(status_write.get(), Stage::Privileges);
+        try {
+            if (!confine_dbus_proxy_filesystem(proxy_directory.get())) {
+                constexpr char warning[] = "agent-vm: warning: Landlock ABI 3 unavailable; D-Bus proxy filesystem is not confined\n";
+                (void)write(STDERR_FILENO, warning, sizeof(warning) - 1);
+            }
+        } catch (const std::exception& error) {
+            child_fail(status_write.get(), Stage::DbusSandbox, error.what());
+        }
+        proxy_directory.reset();
         if (fcntl(ready_write.get(), F_SETFD, 0) < 0) child_fail(status_write.get(), Stage::Descriptors);
         char path_env[] = "PATH=/usr/bin:/bin", locale[] = "LC_ALL=C";
         char* environment[] = {path_env, locale, nullptr};

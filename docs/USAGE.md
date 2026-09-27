@@ -160,6 +160,8 @@ Optional `address` is a literal D-Bus address, without shell or tilde expansion.
 
 Guest addresses are `unix:path=/run/user/<uid>/dbus-user.socket` and `unix:path=/run/user/<uid>/dbus-system.socket`, assigned to their respective environment variables. Conflicting explicit variables or socket targets are errors. `plan` displays filters without starting proxies; unexpected proxy exit terminates the VM. Proxies authenticate upstream as the caller, with filtering constrained by that user's bus permissions. Unix FD passing is unsupported, so methods requiring FDs, including many portal APIs, are unavailable.
 
+With Landlock ABI 3, proxies automatically use a built-in file allowlist, with no extra path configuration: read-only runtime dependencies and socket creation/removal only in each bus's private directory, without granting home or all of `/etc`. Upstream addresses keep their meaning, but authentication requiring home files such as `.dbus-keyrings` is outside these grants. Missing support produces a warning; policy setup errors on supported kernels fail startup.
+
 ## Exit and diagnostics
 
 The workload's exit status is returned; runner errors generally use 125. SIGINT, SIGTERM, SIGHUP, and SIGQUIT are forwarded to the guest process group; SIGWINCH updates terminal size. Unresponsive shutdown is forcibly terminated after five seconds. Normal exit and handled signals restore the terminal; use `stty sane` if SIGKILL leaves it in raw mode.

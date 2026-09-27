@@ -29,7 +29,17 @@ The VMM jail retains the exact `/dev/kvm` node and a private PID-namespace proc,
 
 The host is trusted. Host-side renaming, replacement, or recreation of masked paths during a run is outside the guarantee. Masks protect shared entry points, without hiding hardlinks, copies elsewhere, or already-granted FDs. Writable shares authorize direct modification of their host sources.
 
-Reachable host Unix sockets inside shares are also service capabilities, even when the directory is read-only. Explicit guest relays carry only bytes. A compromised VMM that can connect directly to a reachable service can use capabilities granted by that service, including FDs it sends voluntarily. Thus `--network none`, read-only binds, and path masks do not restrict permissions separately granted by services over authorized connections.
+With Landlock ABI 9, the VMM may connect only to the fixed readiness/broker pathname Unix sockets; other host sockets reachable through shares, including read-only shares and export aliases, are denied. Sockets created inside the confined domain, including the control listener, remain usable. Below ABI 9, a warning reports the original boundary: reachable host sockets inside shares remain service capabilities. Explicit guest relays carry only bytes. Authorized services and inherited FDs can still grant capabilities; Landlock does not revoke them.
+
+## Landlock confinement
+
+The kernel ABI is probed at runtime. Supervisor and D-Bus proxy filesystem profiles require ABI 3, including truncate restrictions; the VMM pathname Unix socket allowlist requires ABI 9. Missing ABI support or disabled Landlock produces an explicit warning and retains the existing isolation. On supported kernels, rule creation or enforcement errors fail startup. `doctor` reports both capabilities.
+
+The supervisor installs its filesystem policy only in the parent branch after the worker fork, so the worker can still mount and pivot. It retains runtime cleanup permissions. Removing runtime itself requires `REMOVE_DIR` on its parent, which also permits removal of other empty directories beneath that parent, without granting file reads, writes, or regular-file removal there. Existing terminal and communication FDs remain usable.
+
+Before exec, each D-Bus proxy gets a built-in file allowlist: read-only `/usr` and existing `/lib` and `/lib64`; execution of the proxy binary and known x86_64/aarch64 ELF loaders; individual `/etc` loader-cache, NSS, account, resolver, machine-id and timezone files; and read-only `/dev/null` and `/dev/urandom`. Each bus has a separate caller-owned 0700 private directory, with only enumeration, socket creation and entry removal allowed, without regular-file writes. The whole home, `/etc`, and host runtime directory are not granted. The upstream address remains a D-Bus configuration choice: this profile does not filter proxy socket connections, and addresses requiring home authentication files are outside its filesystem grants.
+
+The VMM socket policy is installed after mounts, pivot and FD cleanup, before libkrun creates threads. It does not further restrict ordinary file access and explicitly preserves cross-directory rename/link behavior. Landlock does not replace host read-only mounts, masks, FD cleanup or seccomp, and does not cover all metadata operations. Socket controller/data processes and passt receive no additional Landlock policy.
 
 ## UID/GID and privilege dropping
 
@@ -101,7 +111,7 @@ The controller has private user, mount, network, IPC, and UTS namespaces. Its ro
 
 Each data process is PID 1 in its own PID namespace, with an empty read-only root and no proc/dev, standard streams, host directory FDs, or listener FDs. It receives connected FD pairs through a private one-way channel and relays bytes. Its allowlist denies file opens, socket creation/connection, exec, fork, ptrace, and namespace changes. Both controller and data processes clear all capabilities, including the bounding set, and set `no_new_privs` before readiness. Data-process failure triggers cleanup of the whole broker.
 
-Internal FD handoff uses `SCM_RIGHTS`; this is not guest FD forwarding. There are no additional idle timeouts or aggregate host resource quotas. Broker confinement does not sandbox the separate `xdg-dbus-proxy` executable or change passt's own sandbox. Each enabled D-Bus uses an independent filtering proxy; its policy and upstream address are not serialized to the clean VMM worker, which receives resolved socket mappings only.
+Internal FD handoff uses `SCM_RIGHTS`; this is not guest FD forwarding. There are no additional idle timeouts or aggregate host resource quotas. Broker confinement does not change passt's own sandbox; the separate `xdg-dbus-proxy` uses the Landlock filesystem profile described above. Each enabled D-Bus uses an independent filtering proxy; its policy and upstream address are not serialized to the clean VMM worker, which receives resolved socket mappings only.
 
 ## Process observability
 

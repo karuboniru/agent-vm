@@ -1,6 +1,7 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/process_title.h"
 #include "agent_vm/protocol.h"
+#include "landlock.hpp"
 #include <libkrun.h>
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
@@ -64,6 +65,8 @@ struct RuntimeDirectory {
     fs::path path;
     explicit RuntimeDirectory(const avm::RunSpec& spec) {
         std::string socket_suffix = "/ipc/ready.sock";
+        if (spec.dbus_user.enabled || spec.dbus_system.enabled)
+            socket_suffix = "/dbus-system/bus";
         if (!spec.sockets.empty()) {
             auto broker_suffix = "/ipc/socket-" + std::to_string(spec.sockets.size() - 1) + ".sock";
             if (broker_suffix.size() > socket_suffix.size()) socket_suffix = std::move(broker_suffix);
@@ -98,9 +101,10 @@ struct RuntimeDirectory {
     }
     ~RuntimeDirectory() {
         if (!path.empty()) {
-            std::error_code ec;
-            fs::remove_all(path, ec);
-            if (ec) std::cerr << "agent-vm: cleanup " << path << ": " << ec.message() << '\n';
+            try { avm::cleanup_runtime_directory(path.string()); }
+            catch (const std::exception& error) {
+                std::cerr << "agent-vm: cleanup " << path << ": " << error.what() << '\n';
+            }
         }
     }
 };
@@ -276,6 +280,13 @@ int doctor() {
     } else std::cout << "OK unprivileged user/mount namespaces\n";
     std::cout << (!access("/usr/bin/xdg-dbus-proxy", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/xdg-dbus-proxy (required for D-Bus forwarding)\n";
     std::cout << (!access("/usr/bin/passt", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/passt (required for --network passt)\n";
+    try {
+        int abi = avm::detail::landlock_abi();
+        std::cout << (abi >= 3 ? "OK" : "OPTIONAL MISSING") << " Landlock filesystem confinement (ABI " << abi << ", requires 3)\n";
+        std::cout << (abi >= 9 ? "OK" : "OPTIONAL MISSING") << " Landlock VMM Unix socket allowlist (requires ABI 9)\n";
+    } catch (const std::exception& e) {
+        std::cout << "FAIL Landlock: " << e.what() << '\n'; good = false;
+    }
     return good ? 0 : 1;
 }
 [[noreturn]] void vmm(const avm::RunSpec& spec, const fs::path& runtime,
@@ -376,7 +387,10 @@ int run(avm::RunSpec spec) {
         for (bool system : {false, true}) {
             const auto& bus = system ? spec.dbus_system : spec.dbus_user;
             if (!bus.enabled) continue;
-            auto path = (runtime.path / (system ? "dbus-system.sock" : "dbus-user.sock")).string();
+            auto directory = runtime.path / (system ? "dbus-system" : "dbus-user");
+            if (mkdir(directory.c_str(), 0700)) system_error("create private D-Bus proxy directory");
+            if (chmod(directory.c_str(), 0700)) system_error("set private D-Bus proxy directory permissions");
+            auto path = (directory / "bus").string();
             proxies.push_back(avm::start_dbus_proxy(bus, path));
             auto target = "/run/user/" + std::to_string(spec.uid) + (system ? "/dbus-system.socket" : "/dbus-user.socket");
             for (auto& socket : spec.sockets) if (socket.target == target && socket.source.empty()) socket.source = path;
@@ -407,6 +421,8 @@ int run(avm::RunSpec spec) {
             perror("agent-vm: exec isolated worker"); _exit(125);
         }
         if (network.fd >= 0) { close(network.fd); network.fd = -1; }
+        if (!avm::confine_supervisor_filesystem(runtime.path.string()))
+            std::cerr << "agent-vm: warning: Landlock ABI 3 unavailable; supervisor filesystem confinement disabled\n";
         if (spec.debug) std::cerr << "agent-vm: runtime " << runtime.path << "; VM supervisor pid " << vm << '\n';
         auto deadline = std::chrono::steady_clock::time_point::max();
         int requested_signal = 0;

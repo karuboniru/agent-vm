@@ -32,9 +32,21 @@ bool send_control(int directory, const avm_control_message& message);
 // With control_directory, also creates a private mount namespace and tmpfs.
 // When requested, returns a CLOEXEC mount FD for a 64 KiB / 16 inode control tmpfs.
 int isolate_supervisor_network(bool control_directory = false);
+// Parent only, after the worker fork: file access is limited to runtime
+// directory enumeration and cleanup. Removing runtime itself also requires
+// REMOVE_DIR on its parent, permitting removal of empty sibling directories.
+// Returns false if Landlock ABI 3 is unavailable; other failures throw.
+bool confine_supervisor_filesystem(const std::string& runtime);
+// Remove children, then rmdir the runtime itself without first trying unlink.
+// This avoids needing REMOVE_FILE permission on the runtime's parent.
+void cleanup_runtime_directory(const std::string& runtime);
 
 struct NetworkProcess { int fd = -1; pid_t pid = -1; };
+// Internal helper profile, before exec: read-only system dependencies and
+// socket creation/removal in the pinned private directory. False below ABI 3.
+bool confine_dbus_proxy_filesystem(int private_directory);
 // Returned fd is the readiness/lifetime pipe and must remain open while in use.
+// The listening path's parent must be a dedicated caller-owned 0700 directory.
 NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path);
 NetworkProcess start_passt(const RunSpec& spec);
 struct SocketBrokerSpec {

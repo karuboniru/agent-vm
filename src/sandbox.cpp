@@ -2,6 +2,7 @@
 #include "agent_vm/runtime.hpp"
 #include "agent_vm/process_title.h"
 #include "agent_vm/protocol.h"
+#include "landlock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -746,6 +747,34 @@ void verify_identity_text(const std::string& text) {
 }
 } // namespace
 
+void cleanup_runtime_directory(const std::string& runtime) {
+    for (const auto& entry : std::filesystem::directory_iterator(runtime))
+        std::filesystem::remove_all(entry.path());
+    // std::filesystem::remove/remove_all may try unlink before rmdir. Landlock
+    // denies that unlink on the parent, even though the directory removal is
+    // authorized, so use the directory-specific syscall for this last step.
+    if (rmdir(runtime.c_str())) fail("remove runtime directory");
+}
+
+bool confine_supervisor_filesystem(const std::string& runtime) {
+    const int abi = detail::landlock_abi();
+    // Do not claim write protection on kernels that cannot restrict truncate.
+    if (abi < 3) return false;
+    const auto directory = std::filesystem::path(runtime);
+    if (!directory.is_absolute() || directory == directory.root_path() ||
+        directory != directory.lexically_normal())
+        throw std::invalid_argument("supervisor runtime must be a normalized absolute directory");
+    detail::LandlockRuleset rules(detail::fs_rights_for_abi(abi));
+    rules.add_path(runtime, LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+                            LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    // unlink/rmdir rights belong to the parent, not the object being removed.
+    // Grant only REMOVE_DIR here, never read/write or REMOVE_FILE on /tmp or
+    // XDG_RUNTIME_DIR. This also permits rmdir of empty sibling directories.
+    rules.add_path(directory.parent_path().string(), LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    rules.enforce();
+    return true;
+}
+
 int isolate_supervisor_network(bool control_directory) {
     const auto uid = getuid(), gid = getgid();
     if (geteuid() != uid || getegid() != gid)
@@ -885,6 +914,13 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     root = Fd();
     close_unlisted(keep_fds);
     drop_capabilities();
+    std::vector<std::string> ipc_sockets{AVM_READY_SOCKET};
+    for (size_t i = 0; i < spec.sockets.size(); ++i)
+        ipc_sockets.push_back(std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock");
+    // The control listener is created later inside this domain. External
+    // servers reachable through shared directories are deliberately not allowed.
+    if (!detail::enforce_unix_socket_allowlist(ipc_sockets))
+        dprintf(STDERR_FILENO, "agent-vm: warning: Landlock ABI 9 unavailable; VMM shared Unix sockets remain reachable\n");
     install_vmm_seccomp();
     return {{AVM_EXPORT_TAG, AVM_EXPORT_TAG}};
 }

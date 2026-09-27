@@ -17,6 +17,7 @@ CTest 不启动真实 VM，但 network/socket-sandbox 测试会创建 namespaces
 
 | CTest 名称 | 覆盖范围 |
 | --- | --- |
+| `landlock` | 缺失降级／异常失败、文件读写／truncate 拒绝、既有 FD、supervisor 清理和 ABI 9 Unix socket 白名单；ABI 3 缺失返回 77 |
 | `config` | CLI/TOML、profile、合并优先级、挂载/tmpfs/mask、环境变量、socket/D-Bus 策略 |
 | `process-title` | 短名称与完整 title、原 argv/environment 保留、fork 隔离、转义与截断 |
 | `dbus` | proxy readiness、lifetime FD、启动失败和回收；缺少 xdg-dbus-proxy 返回 77，CTest 记为跳过 |
