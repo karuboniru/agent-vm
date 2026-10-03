@@ -13,7 +13,7 @@ ctest --test-dir build --output-on-failure
 ./build/sandbox-test --integration
 ```
 
-CTest 不启动真实 VM，但 network/socket-sandbox 测试会创建 namespaces，不能仅凭不需要 VM 就认为受限沙盒可以运行。sandbox integration 还需要可访问的 `/dev/kvm`。在具有依赖与权限的环境执行；依赖位于 toolbox 时，可使用 `toolbox run ctest ...` 等前缀。
+CTest 不启动真实 VM，但部分 confinement 测试会创建 namespaces，不能仅凭不需要 VM 就认为受限沙盒可以运行。sandbox integration 还需要可访问的 `/dev/kvm`。在具有依赖与权限的环境执行；依赖位于 toolbox 时，可使用 `toolbox run ctest ...` 等前缀。
 
 | CTest 名称 | 覆盖范围 |
 | --- | --- |
@@ -22,13 +22,15 @@ CTest 不启动真实 VM，但 network/socket-sandbox 测试会创建 namespaces
 | `process-title` | 短名称与完整 title、原 argv/environment 保留、fork 隔离、转义与截断 |
 | `dbus` | proxy readiness、lifetime FD、启动失败和回收；缺少 xdg-dbus-proxy 返回 77，CTest 记为跳过 |
 | `wayland` | 宿主 waypipe 参数校验、transport readiness、隔离、GPU 模式选择和生命周期；缺少 waypipe 或 Landlock ABI 3 时返回 77 |
-| `network` | 并发 stream、背压、半关闭、帧校验、重连、共享 controller、data 进程复用及故障清理 |
-| `socket-sandbox` | controller/data 文件树与 syscall 边界、独立 PID namespace、锁定子挂载和 socket bind |
+| `network` | passt 参数校验和 helper 生命周期 |
+| `relay` | 使用 socketpair 测试原始字节 relay pump，包含半关闭 |
 | `control` | 控制端点 inode 固定、符号链接拒绝、父目录替换与 rename 竞态 |
 | `paths` | C/C++ 保留路径、规范化与包含关系对照 |
 | `sandbox-seccomp` | 危险 syscall 和宿主 socket 地址族拒绝、线程兼容性 |
 
-`sandbox-test --integration` 额外检查单 ID 映射、namespace、capabilities、只读与嵌套 ro/rw、mask/别名负测、tmpfs 覆盖、bootstrap 与 FD 清理。
+部分真实 VM socket 转发用例可能暴露 libkrun 1.x path mapping 的已知数据丢失问题；当前测试观察到 payload 尾部的 EOF sentinel 被截断。上游 PR 885 的修复计划 cherry-pick 到未来的 1.x 构建中；目前不指定修复版本。当前 Wayland 验证还曾在提交数个 surface 后因 virtiofs panic 以状态 125 退出。应记录这些失败，不应将受影响用例视为覆盖通过。
+
+`sandbox-test --integration` 额外检查单 ID 映射、namespace、capabilities、只读与嵌套 ro/rw、mask/别名负测、tmpfs 覆盖、bootstrap、FD 清理、固定 socket endpoint，以及 direct/Waypipe IPC allowlist。
 
 ## 真实 VM 测试
 
@@ -47,7 +49,7 @@ python3 tests/integration_gpu.py --gpu-flags 0x10b
 | 脚本 | 覆盖范围 |
 | --- | --- |
 | `integration_core.py` | argv/env、身份和文件 ownership、home、挂载/mask/tmpfs、只读策略、loopback、退出状态、pipe/PTY、信号、窗口变化、终端恢复、panic 设置 |
-| `integration_network.py` | TCP/UDP 出站、IPv6 出站、端口发布、SSH agent 别名、通用 socket、多路并发/重连、tmpfs 目标及已有目标拒绝 |
+| `integration_network.py` | TCP/UDP 出站、IPv6 出站、端口发布、SSH agent 别名、验证 inode 固定和多连接的通用 socket、tmpfs 目标及已有目标拒绝 |
 | `integration_dbus.py` | bus 过滤、user/system 独立开关、guest 地址、proxy 生命周期 |
 | `integration_wayland.py` | 临时 Weston headless compositor；经 waypipe 重复连接 Wayland registry，映射 `xdg_toplevel` 窗口并提交 256×256、依赖 FD 的 `wl_shm` buffer，等待 frame callback；验证退出状态和 SIGTERM。使用 `--xwayland-satellite` 时还检查 guest `DISPLAY`，并通过 Xwayland 三次连接 X11、创建和映射窗口。使用 `--gpu-flags 963` 时还检查硬件 Venus 和经 DMA-BUF 的 30 帧 Wayland `vkcube` 渲染 |
 | `integration_gpu.py` | guest virtio DRM render node 的所有权和 0666 mode、经 VirGL 的 GBM/EGL OpenGL 像素回读，并拒绝软件 renderer；可用 `--gpu-flags` 选择 GPU flag mask |

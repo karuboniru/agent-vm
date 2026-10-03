@@ -3,7 +3,6 @@
 #include "agent_vm/protocol.h"
 #include "agent_vm/process_title.h"
 
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -94,7 +93,7 @@ static int report_ready(int fd, int error)
 }
 
 struct stream_buffer {
-    unsigned char data[BUFFER_SIZE + sizeof(uint32_t)];
+    unsigned char data[BUFFER_SIZE];
     size_t begin, end;
 };
 
@@ -124,71 +123,17 @@ static int send_bytes(int fd, struct stream_buffer *buffer)
     return 0;
 }
 
-struct frame_reader {
-    unsigned char header[sizeof(uint32_t)];
-    size_t header_used;
-    uint32_t remaining;
-    bool eof, acknowledgement;
-};
-
-static int receive_frame(int fd, struct stream_buffer *output, struct frame_reader *reader)
+static int receive_bytes(int fd, struct stream_buffer *output, bool *eof)
 {
-    if (!reader->remaining) {
-        ssize_t count = read(fd, reader->header + reader->header_used,
-                             sizeof(reader->header) - reader->header_used);
-        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-            return 0;
-        if (count <= 0)
-            return -1;
-        reader->header_used += (size_t)count;
-        if (reader->header_used < sizeof(reader->header))
-            return 0;
-        uint32_t length;
-        memcpy(&length, reader->header, sizeof(length));
-        length = ntohl(length);
-        reader->header_used = 0;
-        if (length == AVM_STREAM_EOF && !reader->eof) {
-            reader->eof = true;
-            return 0;
-        }
-        if (length == AVM_STREAM_ACK && reader->eof && !reader->acknowledgement) {
-            reader->acknowledgement = true;
-            return 0;
-        }
-        if (reader->eof || !length || length > AVM_STREAM_MAX) {
-            errno = EPROTO;
-            return -1;
-        }
-        reader->remaining = length;
-    }
-    size_t space = sizeof(output->data) - output->end;
-    if (space > reader->remaining)
-        space = reader->remaining;
-    if (!space)
-        return 0;
-    ssize_t count = read(fd, output->data + output->end, space);
+    ssize_t count = read(fd, output->data + output->end,
+                         sizeof(output->data) - output->end);
     if (count > 0) {
         output->end += (size_t)count;
-        reader->remaining -= (uint32_t)count;
-    } else if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+    } else if (count == 0) {
+        *eof = true;
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         return -1;
     }
-    return 0;
-}
-
-static int receive_client(int client, struct stream_buffer *packet, bool *eof)
-{
-    ssize_t count = read(client, packet->data + sizeof(uint32_t), BUFFER_SIZE);
-    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-        return 0;
-    if (count < 0)
-        return -1;
-    uint32_t length = htonl((uint32_t)count);
-    memcpy(packet->data, &length, sizeof(length));
-    packet->begin = 0;
-    packet->end = sizeof(length) + (size_t)count;
-    if (!count)
-        *eof = true;
     return 0;
 }
 
@@ -196,31 +141,32 @@ static void pump_streams(int client, int remote)
 {
     struct stream_buffer to_remote = {0};
     struct stream_buffer to_client = {0};
-    struct frame_reader incoming = {0};
-    bool client_eof = false, eof_sent = false, client_shutdown = false;
+    bool client_eof = false, remote_eof = false;
+    bool client_shutdown = false, remote_shutdown = false;
     while (!worker_stopping) {
+        compact_buffer(&to_remote);
         compact_buffer(&to_client);
-        if (incoming.eof && to_client.begin == to_client.end && !client_shutdown) {
+        if (client_eof && to_remote.begin == to_remote.end && !remote_shutdown) {
+            if (shutdown(remote, SHUT_WR) < 0 && errno != ENOTCONN)
+                return;
+            remote_shutdown = true;
+        }
+        if (remote_eof && to_client.begin == to_client.end && !client_shutdown) {
             if (shutdown(client, SHUT_WR) < 0 && errno != ENOTCONN)
                 return;
             client_shutdown = true;
         }
-        /* libkrun 1.19 drops unread data on transport HUP. EOF is therefore a
-         * protocol frame, not shutdown(remote). The broker acknowledges that
-         * it consumed our final request and keeps its side open until we have
-         * consumed its response and close this connection. */
-        if (eof_sent && incoming.acknowledgement && client_shutdown)
+        if (client_shutdown && remote_shutdown)
             return;
 
         struct pollfd sockets[2] = {
             {.fd = client}, {.fd = remote}
         };
-        if (!client_eof && to_remote.begin == to_remote.end)
+        if (!client_eof && to_remote.end < sizeof(to_remote.data))
             sockets[0].events |= POLLIN;
         if (to_client.begin != to_client.end)
             sockets[0].events |= POLLOUT;
-        if (!incoming.acknowledgement &&
-            (!incoming.remaining || to_client.end < sizeof(to_client.data)))
+        if (!remote_eof && to_client.end < sizeof(to_client.data))
             sockets[1].events |= POLLIN;
         if (to_remote.begin != to_remote.end)
             sockets[1].events |= POLLOUT;
@@ -241,23 +187,15 @@ static void pump_streams(int client, int remote)
             return;
         if ((sockets[0].revents & POLLOUT) && send_bytes(client, &to_client) < 0)
             return;
-        if (sockets[1].revents & POLLOUT) {
-            if (send_bytes(remote, &to_remote) < 0)
-                return;
-            if (client_eof && to_remote.begin == to_remote.end)
-                eof_sent = true;
-        }
-        if (!client_eof && to_remote.begin == to_remote.end &&
-            (sockets[0].revents & (POLLIN | POLLHUP | POLLERR)) &&
-            receive_client(client, &to_remote, &client_eof) < 0)
+        if ((sockets[1].revents & POLLOUT) && send_bytes(remote, &to_remote) < 0)
+            return;
+        if ((sockets[0].revents & (POLLIN | POLLHUP | POLLERR)) &&
+            !client_eof && to_remote.end < sizeof(to_remote.data) &&
+            receive_bytes(client, &to_remote, &client_eof) < 0)
             return;
         if ((sockets[1].revents & (POLLIN | POLLHUP | POLLERR)) &&
-            receive_frame(remote, &to_client, &incoming) < 0)
-            return;
-        if (incoming.acknowledgement && !eof_sent)
-            return; /* An ACK before our EOF is a malformed broker response. */
-        if ((sockets[0].revents & (POLLHUP | POLLERR)) &&
-            to_client.begin != to_client.end && send_bytes(client, &to_client) < 0)
+            !remote_eof && to_client.end < sizeof(to_client.data) &&
+            receive_bytes(remote, &to_client, &remote_eof) < 0)
             return;
     }
 }

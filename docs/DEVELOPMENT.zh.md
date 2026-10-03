@@ -46,13 +46,12 @@ toolbox run cmake --install build --prefix "$HOME/.local"
 | `include/agent_vm/spec.hpp` | 配置和运行规格 |
 | `src/main.cpp` | doctor、worker re-exec、libkrun 配置、进程/TTY/信号生命周期 |
 | `src/sandbox.cpp` | namespaces、UID 映射、挂载、mask、VMM seccomp |
-| `src/network.cpp` | passt、D-Bus proxy、socket controller 与 stream 转发 |
-| `src/socket_sandbox.cpp` | socket controller/data 的 namespace 与 seccomp 隔离 |
+| `src/network.cpp` | passt、D-Bus proxy、socket endpoint 准备与 stream 转发 |
 | `src/process_title.c` | 宿主/guest 进程名称与 title |
 | `guest/main.c` | 启动协议、降权、命令监督与控制通道 |
 | `guest/filesystem.c` | 挂载描述、tmpfs、共享对象和 guest 切根 |
-| `guest/relay.c` | guest Unix stream listener 与 relay |
-| `include/agent_vm/protocol.h` | 宿主/guest 启动、挂载、控制与 stream 协议 |
+| `guest/relay.c` | guest Unix stream listener 与原始字节 relay |
+| `include/agent_vm/protocol.h` | 宿主/guest 启动、挂载与控制协议 |
 
 ## 开发约定
 

@@ -7,26 +7,20 @@
  * Each environment string is KEY=VALUE, followed by socket_count target strings.
  * Socket i connects to AVM_SOCKET_PORT_BASE + i. Maximum complete config: 1 MiB. */
 #define AVM_SPEC_MAGIC 0x41564d31u
-#define AVM_SPEC_VERSION 2u
+/* Version 3 uses raw socket streams; older helpers expect framed transport. */
+#define AVM_SPEC_VERSION 3u
 #define AVM_SPEC_MAX (1024u * 1024u)
 #define AVM_FLAG_NETWORK 1u
 #define AVM_FLAG_GPU 2u
 #define AVM_CONTROL_PORT 1024u
 #define AVM_SOCKET_PORT_BASE 1025u
 #define AVM_SOCKET_MAX 256u
-#define AVM_READY_PORT (AVM_SOCKET_PORT_BASE + AVM_SOCKET_MAX)
 /* A connection on this dedicated guest -> host port signals readiness.
  * No payload, paths, or commands are accepted; the host latches it once. */
+#define AVM_READY_PORT (AVM_SOCKET_PORT_BASE + AVM_SOCKET_MAX)
+/* Waypipe connects directly, without consuming a generic socket relay slot. */
+#define AVM_WAYPIPE_PORT (AVM_READY_PORT + 1u)
 
-/* Internal Unix stream relay transport over vsock: each frame starts with one
- * network-byte-order uint32_t. DATA has 1..MAX following bytes; EOF and ACK
- * carry no payload. Only host -> guest may send ACK, after both streams have
- * drained and both logical EOFs have been handled. The host keeps its vsock
- * backend socket open until the guest consumes ACK and closes the transport.
- * This avoids libkrun's Unix backend dropping unread bytes on host EPOLLHUP. */
-#define AVM_STREAM_MAX 65536u
-#define AVM_STREAM_EOF 0u
-#define AVM_STREAM_ACK UINT32_MAX
 #define AVM_GUEST_HELPER "/.agent-vm/guest"
 #define AVM_GUEST_SPEC "/.agent-vm/spec.bin"
 #define AVM_MOUNT_SPEC "/.agent-vm/mounts.bin"
@@ -52,6 +46,7 @@ struct avm_mount_header {
 };
 /* Host/VMM paths only: these are never exported to the guest. */
 #define AVM_READY_SOCKET "/.agent-vm/ipc/ready.sock"
+#define AVM_WAYPIPE_SOCKET "/.agent-vm/ipc/waypipe.sock"
 #define AVM_CONTROL_SOCKET "/.agent-vm/ipc/control/control.sock"
 #define AVM_SOCKET_PREFIX "/.agent-vm/ipc/socket-"
 

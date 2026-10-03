@@ -645,12 +645,10 @@ Options parse_options(int argc, char** argv) {
         auto canonical = fs::canonical(display_path, error);
         if (error) fail("cannot resolve Wayland display '" + display_path.string() + "': " + error.message());
         spec.wayland_display = normalize(canonical);
-        auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
         if (spec.environment.contains("WAYLAND_DISPLAY"))
             fail("WAYLAND_DISPLAY conflicts with Wayland forwarding");
         if (spec.environment.contains("WAYLAND_SOCKET"))
             fail("WAYLAND_SOCKET conflicts with Wayland forwarding");
-        spec.sockets.push_back({"", target}); // Filled after waypipe starts, before worker serialization.
     }
     for (bool system : {false, true}) {
         auto& bus = system ? spec.dbus_system : spec.dbus_user;
@@ -800,11 +798,10 @@ void validate_spec(const RunSpec& spec) {
     if (spec.sockets.size() > AVM_SOCKET_MAX) fail("too many forwarded sockets");
     std::vector<std::string> socket_targets;
     for (const auto& socket : spec.sockets) {
-        bool pending_broker = socket.source.empty() &&
+        bool pending_proxy = socket.source.empty() &&
             ((spec.dbus_user.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-user.socket") ||
-             (spec.dbus_system.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-system.socket") ||
-             (spec.wayland && socket.target == "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock"));
-        if (!pending_broker) {
+             (spec.dbus_system.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-system.socket"));
+        if (!pending_proxy) {
             check_socket_path(socket.source, "source");
             std::error_code error;
             auto canonical = fs::canonical(socket.source, error);
@@ -900,10 +897,6 @@ void validate_spec(const RunSpec& spec) {
             fail("Wayland display is missing or no longer canonical: " + spec.wayland_display);
         if (!fs::is_socket(spec.wayland_display, error) || error)
             fail("Wayland display is not an existing Unix socket: " + spec.wayland_display);
-        auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
-        if (std::none_of(spec.sockets.begin(), spec.sockets.end(), [&](const auto& socket) {
-                return socket.target == target;
-            })) fail("Wayland forwarding requires its socket mapping");
         for (const auto* key : {"WAYLAND_DISPLAY", "WAYLAND_SOCKET"})
             if (spec.environment.contains(key)) fail(std::string(key) + " conflicts with Wayland forwarding");
         if (spec.xwayland_satellite && spec.environment.contains("DISPLAY"))
@@ -939,7 +932,7 @@ void print_plan(const RunSpec& spec) {
               << spec.sockets.size() << " authorized socket channels\n";
     for (const auto& socket : spec.sockets)
         std::cout << "Socket: " << (socket.source.empty() ?
-            (spec.wayland && socket.target == "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock" ? "<waypipe transport>" : "<filtered D-Bus proxy>") : socket.source)
+            "<filtered D-Bus proxy>" : socket.source)
                   << " -> " << socket.target << '\n';
     for (const auto& port : spec.ports)
         std::cout << "Publish: " << port.address << ':' << port.host_port << ':' << port.guest_port << (port.udp ? "/udp\n" : "/tcp\n");

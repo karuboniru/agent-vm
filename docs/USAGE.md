@@ -146,7 +146,7 @@ Targets must reside on writable guest filesystems. The helper creates missing pa
 
 `--ssh-agent` forwards the host `SSH_AUTH_SOCK` to `/run/user/<uid>/ssh-agent.socket` and sets the guest variable. `--no-ssh-agent` disables only this alias, leaving explicit forwards active. Custom forwarding can use `-e SSH_AUTH_SOCK=...`. Agent forwarding grants signing operations even when `.ssh` is masked.
 
-Only byte streams are supported, without Unix datagrams, abstract sockets, or `SCM_RIGHTS` FD passing. Reconnection follows socket replacement inside the same host parent directory, but does not track replacement of that directory itself.
+Only byte streams are supported, without Unix datagrams, abstract sockets, or `SCM_RIGHTS` FD passing. The host socket inode is pinned during VMM setup; replacing its source pathname does not redirect the running VM or reconnect it to the replacement. The pinned listener itself can still accept later and concurrent connections.
 
 ## GPU
 
@@ -176,9 +176,9 @@ agent-vm run --no-config --wayland -- wayland-info
 
 The host `WAYLAND_DISPLAY` may be an absolute socket path or a name relative to `XDG_RUNTIME_DIR`. When unset, it defaults to `wayland-0` under `XDG_RUNTIME_DIR`; a relative name requires a valid host `XDG_RUNTIME_DIR`. The selected socket must be an existing Unix stream socket. `plan` validates the selected endpoint without launching waypipe.
 
-Without `--gpu`, the host runs a confined `waypipe --compress none --no-gpu client`, and agent-vm wraps the guest command as `/usr/bin/waypipe --compress none --no-gpu --socket /run/user/<uid>/waypipe.sock server -- COMMAND [ARG...]`. With `--gpu`, both waypipe processes omit `--no-gpu`; the host helper receives access to selected render nodes under Landlock for GPU buffer handling. The private socket between the two waypipe processes uses the existing framed byte-stream relay over libkrun vsock. This is waypipe's serialized transport, not a direct forward of the compositor socket: waypipe handles Wayland FD-backed resources such as shared-memory buffers before sending bytes through the relay. Plain `--socket` forwarding cannot do that. Wayland does not require `--network passt`, X11, or GPU access. The default `--no-gpu` mode limits applications that require GPU-backed Wayland buffers or rendering.
+Without `--gpu`, the host runs a confined `waypipe --compress none --no-gpu client`, and agent-vm wraps the guest command as `/usr/bin/waypipe --compress none --no-gpu --vsock --socket 2:<PORT> server -- COMMAND [ARG...]`. The host client listens at `<private-runtime>/wayland/pipe`, which is pinned into the VMM. With `--gpu`, both waypipe processes omit `--no-gpu`; the host helper receives access to selected render nodes under Landlock for GPU buffer handling. The guest waypipe connects directly to the host endpoint through a dedicated vsock port at `AVM_READY_PORT + 1`; there is no guest transport Unix listener or relay. This carries waypipe's serialized transport, not the compositor socket: waypipe handles Wayland FD-backed resources such as shared-memory buffers before sending bytes. Wayland does not require `--network passt`, X11, or GPU access. The default `--no-gpu` mode limits applications that require GPU-backed Wayland buffers or rendering.
 
-Enabling Wayland grants the guest command access to the selected host compositor and its protocol capabilities, including display output and input events. The waypipe helper remains under host confinement; the guest receives no direct compositor socket mount. The original command's arguments and exit status retain the normal `run` behavior.
+Enabling Wayland grants the guest command access to the selected host compositor and its protocol capabilities, including display output and input events. The host waypipe client endpoint is pinned into the VMM; the compositor socket itself is not mounted there. The original command's arguments and exit status retain the normal `run` behavior.
 
 ### X11 clients through guest Xwayland
 

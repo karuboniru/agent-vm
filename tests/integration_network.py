@@ -447,11 +447,11 @@ SOCKETS_GUEST = r"""
     Path('initial-complete').write_text('ready', encoding='ascii')
     deadline = time.monotonic() + 10
     while not Path('upstream-replaced').exists():
-        assert time.monotonic() < deadline, 'host did not replace upstream socket'
+        assert time.monotonic() < deadline, 'host did not replace upstream socket pathname'
         time.sleep(0.02)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as clients:
         list(clients.map(lambda index: round_trip(index, (
-            b'<REPLACED>', b'<SECOND>', b'<REPLACED>', b'<SECOND>', b'<REPLACED>')), range(10)))
+            b'<FIRST>', b'<SECOND>', b'<FIRST>', b'<SECOND>', b'<FIRST>')), range(10)))
     print('SOCKETS_OK', flush=True)
 """
 
@@ -468,11 +468,6 @@ def test_sockets(binary: Path, case: Path) -> None:
     readonly_cache.chmod(0o751)
     (readonly_cache / "host-only").write_text("host-data", encoding="ascii")
     readonly_before = readonly_cache.stat()
-    # A 74-byte runtime directory fits ready.sock but not socket-0.sock
-    # after the private directory suffix, so startup must select a fallback.
-    runtime = case / ("runtime-" + "x" * (74 - len(str(case.resolve())) - len("/runtime-")))
-    runtime.mkdir(mode=0o700)
-    require(len(str(runtime.resolve())) == 74, "runtime regression fixture path has unexpected length")
     upstreams = [str(private / "first.sock"), str(private / "second.sock")]
     endpoints = ["/run/agent-vm-sockets/first/nested/service.socket",
                  "/run/agent-vm-sockets/second/service.socket",
@@ -489,15 +484,30 @@ def test_sockets(binary: Path, case: Path) -> None:
     try:
         with EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[1], b"<SECOND>") as second:
             with VM(binary, case, SOCKETS_GUEST, options,
-                    [str(os.getuid()), str(os.getgid()), *endpoints],
-                    {"XDG_RUNTIME_DIR": str(runtime)}) as vm:
+                    [str(os.getuid()), str(os.getgid()), *endpoints]) as vm:
                 vm.wait_file("initial-complete")
                 require(not first.errors, f"first socket service errors: {first.errors}")
-                first.__exit__()
+                original_inode = os.stat(upstreams[0]).st_ino
                 os.unlink(upstreams[0])
-                first = EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[0], b"<REPLACED>")
-                (vm.work / "upstream-replaced").write_text("ready", encoding="ascii")
-                vm.finish("SOCKETS_OK")
+                with EchoService(socket.AF_UNIX, socket.SOCK_STREAM, upstreams[0], b"<REPLACED>") as replacement:
+                    require(os.stat(upstreams[0]).st_ino != original_inode,
+                            "replacement reused original listener inode")
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(vm.operation_timeout())
+                        probe.connect(upstreams[0])
+                        probe.sendall(b"host-probe")
+                        probe.shutdown(socket.SHUT_WR)
+                        require(receive_all(probe) == b"host-probe<REPLACED>",
+                                "replacement listener did not accept host connection")
+                    while not replacement.completed and time.monotonic() < vm.deadline:
+                        time.sleep(0.01)
+                    require(len(replacement.completed) == 1,
+                            "replacement listener did not finish host probe")
+                    (vm.work / "upstream-replaced").write_text("ready", encoding="ascii")
+                    vm.finish("SOCKETS_OK")
+                    require(len(replacement.completed) == 1,
+                            "guest connected to replacement listener instead of pinned inode")
+                    require(not replacement.errors, f"replacement socket service errors: {replacement.errors}")
             shared_after = shared_parent.stat()
             require((shared_after.st_ino, shared_after.st_uid, shared_after.st_gid, shared_after.st_mode) ==
                     (shared_before.st_ino, shared_before.st_uid, shared_before.st_gid, shared_before.st_mode),

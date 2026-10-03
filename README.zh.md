@@ -40,7 +40,7 @@ agent-vm run --wayland --gpu=963 -- app
 
 - 只读复用宿主 `/usr`，组合最小 `/etc`、显式共享目录和 guest 内存中的临时文件系统。默认共享当前目录，home 使用临时存储。
 - 将 guest 与 VMM 作为同一安全边界，尽可能限制 VMM：独立 namespaces、受限文件树、关闭多余 FD、清除 capabilities，并安装 seccomp 策略。只读和 mask 策略在宿主侧实施。
-- 通过 `passt` 提供可选网络；通过固定目标的 socket broker 提供可选 Unix socket、SSH agent、过滤后的 D-Bus 和 Wayland 转发。GPU 支持通过 libkrun flags 单独选择启用。
+- 通过 `passt` 提供可选网络；将授权的宿主 socket inode 固定并映射到 VMM，提供可选 Unix socket、SSH agent 和过滤后的 D-Bus 转发。Wayland 使用宿主 waypipe client 和专用 vsock 传输。X11 客户端可选择通过 waypipe 使用 guest Xwayland。GPU 支持通过 libkrun flags 单独选择启用。
 - 宿主 C++20 supervisor 管理进程、终端、信号和退出状态；C17 guest helper 装配文件系统、降权并启动命令。
 
 可写共享会修改宿主文件，转发 socket 会授予对应服务能力。宿主及其运行期间的文件修改属于信任边界；项目没有独立安全审计。详细授权范围和限制见[架构与安全边界](docs/ARCHITECTURE.zh.md)。

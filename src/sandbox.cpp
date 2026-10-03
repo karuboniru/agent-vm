@@ -443,15 +443,16 @@ PinnedSources pin_sources(const RunSpec& spec, const std::string& root_dir,
     if (control.fd < 0 || !S_ISDIR(info(control.fd).st_mode))
         throw std::runtime_error("missing pinned control directory");
 
-    auto pin_endpoint = [&](const std::string& name) {
-        auto source = ipc_dir + "/" + name;
+    auto pin_endpoint = [&](const std::string& source, const std::string& target) {
         Fd fd = open_source(source);
         if (!S_ISSOCK(info(fd.fd).st_mode)) throw std::runtime_error("IPC endpoint is not a socket: " + source);
-        endpoints.push_back({source, "/.agent-vm/ipc/" + name, std::move(fd)});
+        endpoints.push_back({source, target, std::move(fd)});
     };
-    pin_endpoint("ready.sock");
+    pin_endpoint(ipc_dir + "/ready.sock", AVM_READY_SOCKET);
     for (size_t i = 0; i < spec.sockets.size(); ++i)
-        pin_endpoint("socket-" + std::to_string(i) + ".sock");
+        pin_endpoint(spec.sockets[i].source, std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock");
+    if (spec.wayland)
+        pin_endpoint((std::filesystem::path(ipc_dir).parent_path() / "wayland/pipe").string(), AVM_WAYPIPE_SOCKET);
     configuration = open_source(spec_file, O_RDONLY | O_NONBLOCK);
     executable = open_source(helper, O_RDONLY | O_NONBLOCK);
 
@@ -1036,6 +1037,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     close_unlisted(keep_fds);
     drop_capabilities();
     std::vector<std::string> ipc_sockets{AVM_READY_SOCKET};
+    if (spec.wayland) ipc_sockets.push_back(AVM_WAYPIPE_SOCKET);
     for (size_t i = 0; i < spec.sockets.size(); ++i)
         ipc_sockets.push_back(std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock");
     // The control listener is created later inside this domain. External

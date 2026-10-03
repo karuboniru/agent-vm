@@ -409,9 +409,8 @@ int main() {
         auto wayland_target = "/run/user/" + std::to_string(getuid()) + "/waypipe.sock";
         options = parse({"plan", "--no-config", "--wayland"});
         check(options.spec.wayland && options.spec.wayland_display == wayland_socket &&
-              options.spec.sockets.size() == 1 && options.spec.sockets[0].source.empty() &&
-              options.spec.sockets[0].target == wayland_target,
-              "Wayland resolves host socket and reserves pending waypipe transport");
+              options.spec.sockets.empty(),
+              "Wayland resolves host socket without a generic socket mapping");
         check(!options.spec.environment.contains("WAYLAND_DISPLAY") && !options.spec.environment.contains("WAYLAND_SOCKET"),
               "waypipe server controls guest Wayland environment");
         std::ostringstream wayland_plan;
@@ -419,9 +418,10 @@ int main() {
         avm::print_plan(options.spec);
         std::cout.rdbuf(previous_plan);
         check(wayland_plan.str().find("Wayland: enabled via waypipe (no GPU forwarding)") != std::string::npos &&
-              wayland_plan.str().find("<waypipe transport> -> " + wayland_target) != std::string::npos &&
+              wayland_plan.str().find("0 authorized socket channels") != std::string::npos &&
+              wayland_plan.str().find("<waypipe transport>") == std::string::npos &&
               wayland_plan.str().find("Xwayland satellite: disabled") != std::string::npos,
-              "plan explains Wayland transport, GPU limitation and Xwayland default");
+              "plan explains Wayland without a generic socket mapping");
         auto xwayland = parse({"plan", "--no-config", "--wayland", "--xwayland-satellite"});
         check(xwayland.spec.wayland && xwayland.spec.xwayland_satellite &&
               !xwayland.spec.environment.contains("DISPLAY"),
@@ -467,12 +467,12 @@ int main() {
         check(wayland_plan.str().find("Wayland: enabled via waypipe (GPU forwarding enabled)") != std::string::npos,
               "Wayland plan reflects enabled GPU forwarding even with zero flags");
         auto wayland_invalid = options.spec;
-        wayland_invalid.sockets.clear();
-        reject_spec(wayland_invalid, "re-exec Wayland requires pending transport mapping");
-        wayland_invalid = options.spec;
-        wayland_invalid.sockets[0].source = host_socket;
-        avm::validate_spec(wayland_invalid);
-        check(true, "Wayland transport accepts a validated source after broker readiness");
+        wayland_invalid.sockets.push_back({"", wayland_target});
+        reject_spec(wayland_invalid, "Wayland socket target does not authorize an empty generic source");
+        options = parse({"--no-config", "--wayland", "--socket", "src=" + host_socket + ",dst=" + wayland_target});
+        check(options.spec.wayland && options.spec.sockets.size() == 1 &&
+              options.spec.sockets[0].source == host_socket && options.spec.sockets[0].target == wayland_target,
+              "Wayland socket target accepts an explicit generic mapping");
         wayland_invalid = options.spec;
         wayland_invalid.wayland_display = (root / "home/file").string();
         reject_spec(wayland_invalid, "re-exec Wayland display must be a socket");
@@ -483,10 +483,6 @@ int main() {
                "Wayland rejects guest display override");
         reject({"--no-config", "--wayland", "-e", "WAYLAND_SOCKET=3"},
                "Wayland rejects guest socket override");
-        reject({"--no-config", "--wayland", "--socket", "src=" + host_socket + ",dst=" + wayland_target},
-               "Wayland transport conflicts with explicit socket mapping");
-        reject({"--no-config", "--wayland", "--mask-target", wayland_target},
-               "Wayland transport cannot overlap masked target");
         setenv("WAYLAND_DISPLAY", (root / "home/file").c_str(), 1);
         reject({"--no-config", "--wayland"}, "Wayland display must be a Unix socket");
         fs::create_symlink(wayland_socket, root / "wayland-link.sock");

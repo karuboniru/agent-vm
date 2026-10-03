@@ -238,11 +238,14 @@ static void landlock_socket_test() {
     };
     fs::remove(fixture.ipc / "ready.sock");
     int ready = listen_at(fixture.ipc / "ready.sock");
-    int broker = listen_at(fixture.ipc / "socket-0.sock");
+    int upstream = listen_at(fixture.source / "upstream.sock");
+    fs::create_directory(fixture.ipc.parent_path() / "wayland");
+    int waypipe = listen_at(fixture.ipc.parent_path() / "wayland/pipe");
     int ambient = listen_at(fixture.source / "ambient.sock");
     auto spec = fixture.run_spec();
     spec.mounts[1].read_only = true;
-    spec.sockets.push_back({(fixture.source / "ambient.sock").string(), "/run/explicit.sock"});
+    spec.sockets.push_back({(fixture.source / "upstream.sock").string(), "/run/explicit.sock"});
+    spec.wayland = true;
     int status = child_status([&] {
         fixture.enter(spec);
         auto connect_to = [](const std::string& path) {
@@ -257,7 +260,17 @@ static void landlock_socket_test() {
             return error;
         };
         require(connect_to(AVM_READY_SOCKET) == 0, "Landlock blocked readiness IPC");
-        require(connect_to(std::string(AVM_SOCKET_PREFIX) + "0.sock") == 0, "Landlock blocked broker IPC");
+        require(connect_to(std::string(AVM_SOCKET_PREFIX) + "0.sock") == 0, "Landlock blocked pinned upstream socket");
+        require(connect_to(AVM_WAYPIPE_SOCKET) == 0, "Landlock blocked pinned waypipe transport");
+        require(!fs::exists(fixture.source / "upstream.sock"), "original host socket path remains visible");
+        // Replacing the source name in an authorized share must not redirect
+        // the private bind, even while the old listener remains open.
+        require(unlink("/work/upstream.sock") == 0, "remove source socket name");
+        write_file("/work/upstream.sock", "replacement");
+        require(connect_to(std::string(AVM_SOCKET_PREFIX) + "0.sock") == 0,
+                "source replacement redirected pinned upstream socket");
+        require(unlink((std::string(AVM_SOCKET_PREFIX) + "0.sock").c_str()) == -1,
+                "pinned upstream socket can be removed");
         require(connect_to("/work/ambient.sock") == EACCES, "writable share leaked ambient socket");
         require(connect_to("/copy/ambient.sock") == EACCES, "read-only share leaked ambient socket");
         for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
@@ -273,7 +286,7 @@ static void landlock_socket_test() {
         require(rename("/work/rename-source", "/work/rename-dest/rename-target") == 0,
                 "socket-only Landlock broke cross-directory rename");
     });
-    close(ready); close(broker); close(ambient);
+    close(ready); close(upstream); close(waypipe); close(ambient);
     require(status == 0, "VMM Landlock socket policy failed");
 }
 

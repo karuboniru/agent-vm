@@ -9,8 +9,6 @@ agent-vm supervisor
   ├─ passt                         可选，宿主网络
   ├─ xdg-dbus-proxy                 每个启用的 bus 一个
   ├─ waypipe client                 可选，访问宿主 compositor
-  ├─ socket controller             所有转发共用
-  │    └─ socket data processes     每个转发一个
   └─ clean re-exec → VMM worker     libkrun + namespaces + mount jail
        └─ guest init
             └─ agent-vm-guest
@@ -20,7 +18,7 @@ agent-vm supervisor
                       └─ workload   调用者 UID/GID
 ```
 
-supervisor 解析 TOML/CLI，形成 `RunSpec`，准备私有运行目录、启动配置和固定通信端点。D-Bus proxy 完成 readiness 后才建立 socket broker。启用 Wayland 时，受限的宿主 waypipe client 连接所选 compositor，并为 socket broker 在私有 Unix transport 上监听。passt 和 brokers 启动后，supervisor 进入仅映射调用者的 user namespace 和空 network namespace，清 capabilities、设置 `no_new_privs`，然后 fork/re-exec VMM worker。网络关闭时也隔离 supervisor。
+supervisor 解析 TOML/CLI，形成 `RunSpec`，准备私有运行目录、启动配置和固定通信端点。D-Bus proxy 完成 readiness 后，其 socket endpoint 会被固定并映射到 VMM。启用 Wayland 时，受限的宿主 waypipe client 连接所选 compositor，并在私有 Unix endpoint 上监听。VMM sandbox setup 阶段会用 `O_PATH` 打开各已配置宿主 Unix socket 的 inode，并将其只读 bind 到 `/.agent-vm/ipc/socket-N.sock`；bind 完成后可关闭临时 pin FD，因为 bind 会在运行期间保留该 inode。libkrun 1.x path mapping 直接连接这些 endpoint，不再使用宿主 socket controller 或 data worker。passt 和 helpers 启动后，supervisor 进入仅映射调用者的 user namespace 和空 network namespace，清 capabilities、设置 `no_new_privs`，然后 fork/re-exec VMM worker。网络关闭时也隔离 supervisor。
 
 worker 以精简环境重新 exec，隔离配置解析留下的地址空间与宿主原始环境。它先创建新 session，使 VMM 与 supervisor 既不共享进程组也不共享控制终端：进程组跨越 PID namespace，受限 VMM 内的 `kill(0, sig)` 否则能到达 supervisor。随后它建立 user、mount、PID、IPC、UTS、network namespaces，装配受限根，关闭非白名单 FD、清 capabilities 并安装 seccomp denylist，再启动 libkrun。supervisor 管理信号、TTY、退出状态和 helper 清理；helper 意外退出会结束 VM。终端信号只到达 supervisor，由它经控制通道转发；supervisor 忽略 SIGTTOU，以便在后台进程组中也能恢复终端设置。
 
@@ -32,7 +30,7 @@ VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后
 
 宿主是可信的；运行期间宿主重命名、替换或重建被 mask 的路径不在保证范围内。mask 保护共享入口，不隐藏其他位置已有的硬链接、副本或已授出的 FD。可写共享授予直接修改对应宿主源的权限。
 
-Landlock ABI 9 可用时，VMM 仅获准连接固定的 readiness/broker pathname Unix socket；通过共享目录（包括只读目录和 export 别名）可达的其他宿主 socket 默认拒绝。VMM 在 confinement 后创建的域内 socket（包括 control listener）仍可用。低于 ABI 9 时保留原有行为并告警：共享目录内可达的宿主 socket 仍属于服务能力边界。guest 的显式 relay 只传字节。Wayland 由 waypipe 先序列化协议流量，包括依赖 FD 的资源，再交给 relay。已经授权的服务或继承的 FD 仍可授予额外能力，Landlock 不撤销它们。
+Landlock ABI 9 可用时，VMM 仅获准连接固定的 IPC endpoint 和 control/readiness endpoint；通过共享目录（包括只读目录和 export 别名）可达的其他宿主 socket 默认拒绝。VMM 在 confinement 后创建的域内 socket（包括 control listener）仍可用。低于 ABI 9 时保留原有行为并告警：共享目录内可达的宿主 socket 仍属于服务能力边界。guest relay 原样复制字节并保留半关闭。已经授权的服务或继承的 FD 仍可授予额外能力，Landlock 不撤销它们。
 
 ## Landlock confinement
 
@@ -42,7 +40,7 @@ supervisor 只在 worker fork 后的父分支安装文件系统策略，避免 w
 
 D-Bus proxy 在 exec 前安装内置文件白名单：`/usr`、存在的 `/lib`、`/lib64` 只读；执行授权 proxy 本身及已知的 x86_64/aarch64 ELF 加载器；`/etc` 仅逐文件授权 loader cache、NSS、账户、解析器、machine-id 和时区依赖，另有只读 `/dev/null`、`/dev/urandom`。每个 bus 使用独立的 caller-owned 0700 私有目录，仅允许枚举、创建 socket 和删除目录内文件，不授予普通文件写入。不会授权整个 home、`/etc` 或宿主 runtime 目录。上游地址仍由 D-Bus 配置决定；此策略不限制 proxy 的 socket 连接，依赖 home 认证文件的地址不在该文件授权范围内。
 
-VMM socket 策略在挂载、切根和 FD 清理完成后、libkrun 创建线程前安装；它不额外收紧普通文件权限，并显式保留原有跨目录 rename/link 行为。VMM 通常拒绝 `execve`，始终拒绝 `execveat`。GPU flag 的第 9 位启用 render-server 模式时，VMM 只在额外的强制 Landlock 规则下允许 `execve`，并仅准许执行 `/usr/libexec/virgl_render_server` 及该 ELF 的 `PT_INTERP` loader；其他可执行目标仍被拒绝。缺少 Landlock 或 render server 缺失／无效时启动失败。此例外使 virglrenderer 能启动 Venus server，同时不开放 VMM 的一般执行能力。Landlock 不代替宿主只读挂载、mask、FD 清理或 seccomp，也不覆盖所有元数据操作。socket controller/data process 和 passt 本轮不添加 Landlock。
+VMM socket 策略在挂载、切根和 FD 清理完成后、libkrun 创建线程前安装；它不额外收紧普通文件权限，并显式保留原有跨目录 rename/link 行为。VMM 通常拒绝 `execve`，始终拒绝 `execveat`。GPU flag 的第 9 位启用 render-server 模式时，VMM 只在额外的强制 Landlock 规则下允许 `execve`，并仅准许执行 `/usr/libexec/virgl_render_server` 及该 ELF 的 `PT_INTERP` loader；其他可执行目标仍被拒绝。缺少 Landlock 或 render server 缺失／无效时启动失败。此例外使 virglrenderer 能启动 Venus server，同时不开放 VMM 的一般执行能力。Landlock 不代替宿主只读挂载、mask、FD 清理或 seccomp，也不覆盖所有元数据操作。passt 不添加额外 Landlock 策略。
 
 ## UID/GID 与降权
 
@@ -101,31 +99,28 @@ passt 留在宿主 network namespace，通过预连接 Unix stream FD 与 libkru
 | vsock 端口 | 用途 |
 | --- | --- |
 | 1024 | 固定信号与终端 resize 控制消息 |
-| 1025–1280 | 至多 256 个授权 socket 转发 |
-| 1281 | 一次性 guest readiness 连接 |
+| `AVM_SOCKET_PORT_BASE` 至 `AVM_SOCKET_PORT_BASE + AVM_SOCKET_MAX - 1` | 已配置 Unix socket 的原始字节流 |
+| `AVM_READY_PORT` | 一次性 guest readiness 连接 |
+| `AVM_READY_PORT + 1` | Waypipe 序列化传输（启用时） |
 
-IPC 不进入 bootstrap 或 export catalog。已监听的 broker/readiness socket 逐个按 inode 只读 bind，父目录只读；broker upstream socket 替换后的重连仍经过 broker。宿主 runtime IPC 目录不再挂入 VMM。libkrun 延迟创建的 control listener 位于 supervisor 创建的 detached tmpfs（64 KiB、16 个 inode），supervisor 保留 dirfd，VMM 挂载同一文件系统。它不占用宿主 runtime 文件系统路径，VM 和 supervisor 释放引用后自动回收。控制消息通过固定 dirfd，以 `O_PATH | O_NOFOLLOW` 打开 `control.sock`，`fstat` 确认 socket，并保持 inode FD 存活，通过 `/proc/self/fd/<fd>` 连接，避免路径替换竞态。受攻陷的 VMM 仍可破坏自身控制通道；supervisor 五秒后的强制终止机制保留。readiness 无 payload，不使用共享文件标记，只是生命周期提示，不是 guest 可信证明。控制协议不接收宿主路径或任意命令。
+IPC 不进入 bootstrap 或 export catalog。VMM 的私有 IPC 目录包含授权宿主 socket 的只读 inode bind，包括 D-Bus proxy endpoint；宿主 runtime IPC 目录本身不挂入 VMM。VMM setup 阶段以 `O_PATH` 打开各源 socket 并做只读 bind；之后关闭 pin FD，由 bind 在运行期间保持 inode。替换源路径不会重定向 VMM，也不能连接替换后的 inode；同一监听 socket 仍可按服务本身的行为接受后续和并发连接。Waypipe host client endpoint 也固定映射到 VMM，但其字节流使用上表中的专用 vsock 端口。libkrun 延迟创建的 control listener 位于 supervisor 创建的 detached tmpfs（64 KiB、16 个 inode），supervisor 保留 dirfd，VMM 挂载同一文件系统。它不占用宿主 runtime 文件系统路径，VM 和 supervisor 释放引用后自动回收。控制消息通过固定 dirfd，以 `O_PATH | O_NOFOLLOW` 打开 `control.sock`，`fstat` 确认 socket，并保持 inode FD 存活，通过 `/proc/self/fd/<fd>` 连接，避免路径替换竞态。受攻陷的 VMM 仍可破坏自身控制通道；supervisor 五秒后的强制终止机制保留。readiness 无 payload，不使用共享文件标记，只是生命周期提示，不是 guest 可信证明。控制协议不接收宿主路径或任意命令。
 
-`include/agent_vm/protocol.h` 定义协议：启动格式版本 2、挂载格式版本 3，使用本机字节序，要求同架构 host/guest；配置大小上限为 1 MiB，字符串带长度。stream relay 使用网络字节序的长度、DATA/EOF/ACK 帧，单帧数据最多 65536 字节。EOF 与确认保证半关闭及尾部数据排空后再关闭内部传输。
+`include/agent_vm/protocol.h` 定义启动规格版本 3、挂载格式版本 3，使用本机字节序，要求同架构 host/guest；配置大小上限为 1 MiB，字符串带长度。普通 socket relay 原样复制 stream 字节，并分别传递 shutdown 以保留半关闭，不使用 DATA/EOF/ACK 帧。当前 libkrun 1.x path mapping 存在已知数据丢失问题；上游 PR 885 的修复计划 cherry-pick 到未来的 1.x 构建中，但此处不指定修复版本。
 
-Wayland 转发占用一个授权 socket 转发槽位。宿主把 `WAYLAND_DISPLAY` 解析为绝对路径，或相对于 `XDG_RUNTIME_DIR` 的路径（默认 `wayland-0`），并校验所选 Unix socket。受限的宿主 `/usr/bin/waypipe client` 连接 compositor；该 helper 要求 Landlock ABI 3，缺少支持时启动失败。guest 命令由 `/usr/bin/waypipe --socket /run/user/<uid>/waypipe.sock server --` 包装。默认两端 waypipe 均使用 `--no-gpu`；启用 GPU 时省略该选项，宿主 helper 的 Landlock 策略仅准许选中的 render node 供解码使用。宿主 client 在私有 Unix transport 上监听，现有 broker 和分帧 vsock relay 将其连接至 guest server。compositor socket 本身不挂载或直接转发到 VM。waypipe 在字节传输两端处理包含 FD 的 Wayland 消息，包括共享内存 buffer。该路径不依赖 passt，GPU 仍是可选功能。启用后，workload 将获得所选 compositor 的协议能力。
+Wayland 转发将宿主位于 `<private-runtime>/wayland/pipe` 的 waypipe client listener 映射到 VMM，并使用 `AVM_READY_PORT + 1` 专用 vsock 端口。宿主把 `WAYLAND_DISPLAY` 解析为绝对路径，或相对于 `XDG_RUNTIME_DIR` 的路径（默认 `wayland-0`），并校验所选 Unix socket。受限的宿主 `/usr/bin/waypipe client` 连接 compositor；该 helper 要求 Landlock ABI 3，缺少支持时启动失败。guest 直接运行 `/usr/bin/waypipe --vsock --socket 2:<PORT> server -- COMMAND [ARG...]` 连接 vsock，不创建 guest transport Unix listener 或 relay。默认两端 waypipe 均使用 `--no-gpu`；启用 GPU 时省略该选项，宿主 helper 的 Landlock 策略仅准许选中的 render node 供解码使用。compositor socket 本身不挂载到 VM。waypipe 在序列化字节传输内处理包含 FD 的 Wayland 消息，包括共享内存 buffer。该路径不依赖 passt，GPU 仍是可选功能。启用后，workload 将获得所选 compositor 的协议能力。
 
 可选的 Xwayland satellite 模式要求启用 Wayland 转发，且默认关闭。开启时 guest waypipe 以 `--xwls` 运行，要求 waypipe 0.11 或更新版本；waypipe 按需启动 guest `/usr` 中的 `xwayland-satellite`，并由 waypipe 设置 guest `DISPLAY`。guest `/usr` 还必须提供 `Xwayland`。X11 客户端经 guest Xwayland/satellite 转换为 Wayland，再走同一 waypipe transport；宿主 X11 socket 和 Xauthority 不会被转发。配置冲突检查禁止用户同时显式设置 `DISPLAY`。
 
 启用网络时 guest helper 校验地址、路由和 DNS，再启动 workload。guest 内核参数为 `oops=panic panic=-1`，helper 在装配前预置失败状态 125，正常退出状态在 helper 完成退出后由 libkrun init 写入。该机制使 guest 内核异常及时结束，不修复固件内核本身的错误。
 
-## Socket broker 隔离
+## Socket 转发
 
-N 个转发共用一个 controller 和 N 个持久 data process，每个转发最多 64 个并发连接。controller 只按配置的 basename 连接预先授权的父目录，不提供任意路径 RPC。
+VMM sandbox setup 对每个已配置宿主 Unix socket 使用 `O_PATH` 打开源 inode，再将该 socket inode 以只读 bind 暴露在 VMM jail 的 `/.agent-vm/ipc/socket-N.sock`。bind 完成后关闭临时 pin FD；bind 会在运行期间保持 inode。libkrun 1.x path mapping 直接连接映射 endpoint，无需宿主 broker/controller 或 data worker。运行期间如果源路径被替换，VMM 仍访问固定 inode，不能连接替换后的 inode。监听中的源 socket 可按服务本身的行为接受后续和多个并发连接。
 
-controller 位于私有 user、mount、network、IPC、UTS namespaces。根中只读挂载授权 upstream 父目录，重复目录只挂一次，遮挡无关子挂载。保留父目录使同目录内的 socket 替换可重连；不追踪父目录替换。同目录兄弟 socket 位于 controller 的文件系统权限范围内，但正常运行只连接配置目标。seccomp allowlist 允许 accept、选择预打开目录、连接 Unix stream 和发送成对 FD，不允许读取 stream、打开文件或执行程序。
-
-每个 data process 是独立 PID namespace 的 PID 1，根为空且只读，无 proc/dev、标准流、宿主目录或 listener FD。它仅从私有单向通道接收已连接 FD 对并转发字节；allowlist 禁止文件打开、socket 创建/连接、exec、fork、ptrace 和 namespace 修改。controller 与 data process 均清空包括 bounding set 在内的 capabilities，设置 `no_new_privs` 后报告就绪。data process 失败会引发整个 broker 清理。
-
-内部 FD 交接使用 `SCM_RIGHTS`，不等于 guest FD 转发。没有额外 idle timeout 或宿主总资源配额。broker 隔离不改变 passt 自身沙盒；独立的 `xdg-dbus-proxy` 使用上文的 Landlock 文件系统策略。每个启用的 D-Bus 使用独立过滤 proxy；策略和 upstream 地址不序列化给 clean VMM worker，worker 只得到解析后的 socket 映射。waypipe 的私有 transport 是 broker 一个槽位的授权 upstream，宿主 waypipe 进程单独隔离。
+guest relay 在 guest endpoint 和映射的宿主 endpoint 间原样复制字节，双向传递 shutdown 以保留半关闭语义，不使用 DATA/EOF/ACK framing。宿主 D-Bus 过滤 proxy 保持不变，其 socket endpoint 和其他配置 endpoint 一样按 inode 固定。Waypipe 保留位于 `<private-runtime>/wayland/pipe` 的宿主 client listener，并使用上文专用 vsock 传输。已不再有 socket controller 或 data process namespace；passt 保留自身沙盒。
 
 ## 进程可观测性
 
-`ps -eo pid,ppid,comm,args` 可见 `avm-supervisor`、`avm-sock-ctl`、`avm-sock-N`、`avm-vmm-wait`，data title 包含宿主源和 guest 目标。VMM title 为 `agent-vm: virtual machine`，libkrun 自行设置主线程名。guest 使用 `avm-guest`、`avm-relay-N`、`avm-stream-N`；workload、passt 和 D-Bus proxy 保留自身程序名。
+`ps -eo pid,ppid,comm,args` 可见 `avm-supervisor` 和 `avm-vmm-wait`，以及 passt 和启用的 D-Bus/Waypipe helpers。VMM title 为 `agent-vm: virtual machine`，libkrun 自行设置主线程名。guest 使用 `avm-guest` 和 relay 进程；workload、passt 和 D-Bus proxy 保留自身程序名。
 
 title 在 confinement 前设置，转义控制字符，长度受原 argv/environment 存储限制。复用存储前分别保存原 argv/environment，极小启动环境可能使长 title 截断。实现分工和测试入口见[开发指南](DEVELOPMENT.zh.md)与[测试指南](TESTING.zh.md)。

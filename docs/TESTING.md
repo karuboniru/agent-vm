@@ -13,7 +13,7 @@ ctest --test-dir build --output-on-failure
 ./build/sandbox-test --integration
 ```
 
-CTest does not start real VMs, but network/socket-sandbox tests create namespaces, so a restricted sandbox may still prevent execution. Sandbox integration also needs access to `/dev/kvm`. Run in an environment with dependencies and permissions; use prefixes such as `toolbox run ctest ...` when dependencies reside there.
+CTest does not start real VMs, but some confinement tests create namespaces, so a restricted sandbox may still prevent execution. Sandbox integration also needs access to `/dev/kvm`. Run in an environment with dependencies and permissions; use prefixes such as `toolbox run ctest ...` when dependencies reside there.
 
 | CTest name | Coverage |
 | --- | --- |
@@ -22,13 +22,15 @@ CTest does not start real VMs, but network/socket-sandbox tests create namespace
 | `process-title` | Short names/full titles, preserved argv/environment, fork isolation, escaping, truncation |
 | `dbus` | Proxy readiness, lifetime FD, startup failure, reaping; missing xdg-dbus-proxy returns 77 and CTest marks it skipped |
 | `wayland` | Host waypipe input validation, transport readiness, confinement, GPU mode selection, and lifecycle; missing waypipe or Landlock ABI 3 returns 77 |
-| `network` | Concurrent streams, backpressure, half-close, frame validation, reconnection, shared controller, data-process reuse and failure cleanup |
-| `socket-sandbox` | Controller/data filesystem and syscall boundaries, independent PID namespace, locked submounts, socket binds |
+| `network` | Passt input validation and helper lifecycle |
+| `relay` | Raw-byte relay pump with socketpairs, including half-close |
 | `control` | Pinned control inode, symlink rejection, parent replacement and rename races |
 | `paths` | C/C++ reserved-path, normalization and containment parity |
 | `sandbox-seccomp` | Dangerous-syscall and host socket-family rejection; thread compatibility |
 
-`sandbox-test --integration` additionally checks single-ID mappings, namespaces, capabilities, read-only and nested ro/rw mounts, masks/alias rejection, tmpfs coverage, bootstrap contents, and FD cleanup.
+Some real VM socket-forwarding cases may expose a known data-loss issue in libkrun 1.x path mapping; current testing has observed truncation of a terminal EOF sentinel in the test payload. The fix in upstream PR 885 is planned for cherry-pick into a future 1.x build; no fixed release version is identified here. Current Wayland validation has also reached several surface commits before a virtiofs panic caused exit status 125. Record these failures rather than treating the affected cases as passing coverage.
+
+`sandbox-test --integration` additionally checks single-ID mappings, namespaces, capabilities, read-only and nested ro/rw mounts, masks/alias rejection, tmpfs coverage, bootstrap contents, FD cleanup, pinned socket endpoints, and the direct/Waypipe IPC allowlist.
 
 ## Real VM tests
 
@@ -47,7 +49,7 @@ python3 tests/integration_gpu.py --gpu-flags 0x10b
 | Script | Coverage |
 | --- | --- |
 | `integration_core.py` | Argv/env, identity/file ownership, home, mounts/masks/tmpfs, read-only policy, loopback, exit status, pipes/PTY, signals, resizing, terminal restoration, panic settings |
-| `integration_network.py` | TCP/UDP outbound, IPv6 outbound, publications, SSH agent alias, generic sockets, concurrent streams/reconnection, tmpfs targets, existing-target rejection |
+| `integration_network.py` | TCP/UDP outbound, IPv6 outbound, publications, SSH agent alias, generic sockets with pinned endpoint identity and multiple connections, tmpfs targets, existing-target rejection |
 | `integration_dbus.py` | Bus filtering, independent user/system switches, guest addresses, proxy lifecycle |
 | `integration_wayland.py` | Headless Weston compositor; repeated Wayland registry connections and mapped `xdg_toplevel` windows with 256×256 `wl_shm` FD-backed buffers and frame callbacks through waypipe; exit status and SIGTERM. With `--xwayland-satellite`, also checks guest `DISPLAY` and three X11 connections that create and map windows through Xwayland. With `--gpu-flags 963`, also checks hardware Venus and 30 Wayland `vkcube` frames through DMA-BUF |
 | `integration_gpu.py` | Guest virtio DRM render-node ownership and mode 0666, GBM/EGL OpenGL pixel readback through VirGL, rejecting software renderers; GPU flag mask can be selected with `--gpu-flags` |

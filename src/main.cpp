@@ -67,10 +67,6 @@ struct RuntimeDirectory {
         std::string socket_suffix = "/ipc/ready.sock";
         if (spec.dbus_user.enabled || spec.dbus_system.enabled)
             socket_suffix = "/dbus-system/bus";
-        if (!spec.sockets.empty()) {
-            auto broker_suffix = "/ipc/socket-" + std::to_string(spec.sockets.size() - 1) + ".sock";
-            if (broker_suffix.size() > socket_suffix.size()) socket_suffix = std::move(broker_suffix);
-        }
         std::vector<fs::path> candidates;
         if (const char* x = getenv("XDG_RUNTIME_DIR"); x && *x) candidates.emplace_back(x);
         candidates.emplace_back("/run/user/" + std::to_string(spec.uid));
@@ -120,13 +116,13 @@ void write_all(int fd, const void* data, size_t length) {
 void write_spec(const avm::RunSpec& spec, const fs::path& path) {
     auto command = spec.command;
     if (spec.wayland) {
-        // Only waypipe's serialized byte stream crosses the existing vsock
-        // relay. Wayland descriptors and shared memory stay local to each end.
+        // Waypipe connects directly to its dedicated vsock port. Wayland
+        // descriptors and shared memory stay local to each end.
         std::vector<std::string> wrapped{"/usr/bin/waypipe", "--compress", "none"};
         if (!spec.gpu_flags) wrapped.push_back("--no-gpu");
         if (spec.xwayland_satellite) wrapped.push_back("--xwls");
-        wrapped.insert(wrapped.end(), {"--socket",
-            "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock", "server", "--"});
+        wrapped.insert(wrapped.end(), {"--vsock", "--socket",
+            "2:" + std::to_string(AVM_WAYPIPE_PORT), "server", "--"});
         wrapped.insert(wrapped.end(), command.begin(), command.end());
         command = std::move(wrapped);
     }
@@ -335,6 +331,8 @@ int doctor() {
         check_krun(krun_add_vsock(context, 0), "explicit control vsock");
         check_krun(krun_add_vsock_port2(context, AVM_CONTROL_PORT, AVM_CONTROL_SOCKET, true), "control socket");
         check_krun(krun_add_vsock_port2(context, AVM_READY_PORT, AVM_READY_SOCKET, false), "readiness socket");
+        if (spec.wayland)
+            check_krun(krun_add_vsock_port2(context, AVM_WAYPIPE_PORT, AVM_WAYPIPE_SOCKET, false), "waypipe socket");
         for (size_t i = 0; i < spec.sockets.size(); ++i) {
             auto path = std::string(AVM_SOCKET_PREFIX) + std::to_string(i) + ".sock";
             check_krun(krun_add_vsock_port2(context, AVM_SOCKET_PORT_BASE + static_cast<uint32_t>(i),
@@ -403,13 +401,11 @@ int run(avm::RunSpec spec) {
     pid_t vm = -1;
     std::vector<avm::NetworkProcess> proxies;
     proxies.reserve(2);
-    pid_t broker = -1;
     pid_t waypipe = -1;
     auto cleanup = [&] {
         if (vm > 0) { avm::stop_child(vm); vm = -1; }
         if (network.fd >= 0) { close(network.fd); network.fd = -1; }
         if (network.pid > 0) { avm::stop_child(network.pid); network.pid = -1; }
-        if (broker > 0) { avm::stop_child(broker); broker = -1; }
         if (waypipe > 0) { avm::stop_child(waypipe); waypipe = -1; }
         for (auto& proxy : proxies) {
             avm::stop_child(proxy.pid); proxy.pid = -1;
@@ -423,9 +419,6 @@ int run(avm::RunSpec spec) {
                 system_error("create private waypipe directory");
             auto path = (directory / "pipe").string();
             waypipe = avm::start_waypipe(spec.wayland_display, path, spec.gpu_flags.has_value());
-            auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
-            for (auto& socket : spec.sockets)
-                if (socket.target == target && socket.source.empty()) socket.source = path;
         }
         for (bool system : {false, true}) {
             const auto& bus = system ? spec.dbus_system : spec.dbus_user;
@@ -442,12 +435,6 @@ int run(avm::RunSpec spec) {
         write_spec(spec, runtime.path / "spec.bin");
         write_worker_spec(spec, runtime.path / "worker.bin");
         if (spec.network) network = avm::start_passt(spec);
-        std::vector<avm::SocketBrokerSpec> forwards;
-        for (size_t i = 0; i < spec.sockets.size(); ++i) {
-            auto path = runtime.path / "ipc" / ("socket-" + std::to_string(i) + ".sock");
-            forwards.push_back({path.string(), spec.sockets[i].source, spec.sockets[i].target});
-        }
-        broker = avm::start_socket_brokers(forwards);
         Fd control_directory(avm::isolate_supervisor_network(true));
         pid_t parent = getpid();
         vm = fork(); if (vm < 0) system_error("fork VM");
@@ -479,7 +466,6 @@ int run(avm::RunSpec spec) {
             auto check_helper = [&](pid_t& pid, const std::string& name) {
                 if (pid > 0 && waitpid(pid, &status, WNOHANG) == pid) {
                     std::cerr << "agent-vm: " << name << " exited before the VM (status " << status_code(status) << ")\n";
-                    avm::stop_child(pid); // Reaped already; release any broker pathname ownership.
                     pid = -1; helper_failed = true; requested_signal = SIGTERM;
                     deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::seconds(3));
                 }
@@ -487,7 +473,6 @@ int run(avm::RunSpec spec) {
             check_helper(network.pid, "passt");
             check_helper(waypipe, "waypipe");
             for (auto& proxy : proxies) check_helper(proxy.pid, "xdg-dbus-proxy");
-            check_helper(broker, "socket controller");
             if (!guest_ready) {
                 Fd notification(accept4(readiness.value, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
                 if (notification.value >= 0) {

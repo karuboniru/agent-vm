@@ -46,13 +46,12 @@ Both `agent-vm` and `libexec/agent-vm-guest` must be installed. The executable c
 | `include/agent_vm/spec.hpp` | Configuration and runtime specifications |
 | `src/main.cpp` | Doctor, worker re-exec, libkrun setup, process/TTY/signal lifecycle |
 | `src/sandbox.cpp` | Namespaces, UID mapping, mounts, masks, VMM seccomp |
-| `src/network.cpp` | Passt, D-Bus proxies, socket controller, stream forwarding |
-| `src/socket_sandbox.cpp` | Socket controller/data namespace and seccomp confinement |
+| `src/network.cpp` | Passt, D-Bus proxies, socket endpoint setup and stream forwarding |
 | `src/process_title.c` | Host/guest process names and titles |
 | `guest/main.c` | Launch protocol, privilege dropping, command supervision, control channel |
 | `guest/filesystem.c` | Mount descriptions, tmpfs, shared objects, guest root switch |
-| `guest/relay.c` | Guest Unix stream listeners and relays |
-| `include/agent_vm/protocol.h` | Host/guest launch, mount, control, and stream protocols |
+| `guest/relay.c` | Guest Unix stream listeners and raw-byte relays |
+| `include/agent_vm/protocol.h` | Host/guest launch, mount, and control protocols |
 
 ## Conventions
 

@@ -40,7 +40,7 @@ The default configuration is `$XDG_CONFIG_HOME/agent-vm/config.toml`, or `~/.con
 
 - Reuse the host `/usr` read-only, alongside a minimal `/etc`, explicit shares, and temporary filesystems in guest memory. The default working directory is shared; home is temporary.
 - Treat the guest and VMM as one security boundary and confine the VMM as far as possible: separate namespaces, a restricted filesystem tree, removal of unnecessary FDs and capabilities, and a seccomp policy. Read-only and mask policies are enforced on the host.
-- Provide optional networking through `passt`, and optional Unix socket, SSH agent, filtered D-Bus, and Wayland forwarding through brokers with fixed upstream targets. X11 clients can opt into guest Xwayland through waypipe. GPU support is separately opt-in through libkrun flags.
+- Provide optional networking through `passt`, and optional Unix socket, SSH agent, and filtered D-Bus forwarding through pinned host endpoints. Wayland uses the host waypipe client and a dedicated vsock transport. X11 clients can opt into guest Xwayland through waypipe. GPU support is separately opt-in through libkrun flags.
 - A C++20 host supervisor manages processes, terminal state, signals, and exit status. A C17 guest helper assembles the filesystem, drops privileges, and starts the command.
 
 Writable shares modify host files; forwarded sockets grant the corresponding service capabilities. The host and its filesystem changes during a run are trusted. The project has no independent security audit. See [architecture and security boundaries](docs/ARCHITECTURE.md) for the detailed scope and limits.

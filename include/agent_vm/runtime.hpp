@@ -17,7 +17,7 @@ struct FilesystemExport {
 // clearing and seccomp installation.
 // Guest-private writable filesystems and the final guest root are assembled
 // by the guest helper.
-// root_dir is empty; ipc_dir contains already-listening broker/readiness sockets.
+// root_dir is empty; ipc_dir contains the already-listening readiness socket.
 // control_directory pins the supervisor's bounded detached tmpfs.
 // spec_file and helper are trusted regular files to copy before guest launch.
 // keep_fds is the complete explicit allowlist in addition to 0, 1, 2.
@@ -54,13 +54,6 @@ NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path);
 // The socket parent must be a dedicated caller-owned mode 0700 directory.
 pid_t start_waypipe(const std::string& display, const std::string& path, bool gpu = false);
 NetworkProcess start_passt(const RunSpec& spec);
-struct SocketBrokerSpec {
-    std::string listen_path, upstream_path, guest_path;
-};
-// One confined controller for all forwards, one empty-root data process each.
-// stop_child also removes the listener pathname, even after the caller reaps it.
-pid_t start_socket_brokers(const std::vector<SocketBrokerSpec>& sockets);
-pid_t start_socket_broker(const std::string& listen_path, const std::string& upstream_path);
 // Helpers must exit when their parent dies and close all unrelated FDs.
 void stop_child(pid_t pid);
 }

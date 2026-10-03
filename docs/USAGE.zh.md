@@ -146,7 +146,7 @@ agent-vm run --no-config --network passt --ssh-agent -- bash
 
 `--ssh-agent` 把宿主 `SSH_AUTH_SOCK` 转发到 `/run/user/<uid>/ssh-agent.socket` 并设置 guest 变量。`--no-ssh-agent` 仅关闭该别名，不关闭显式转发。自定义转发可以配合 `-e SSH_AUTH_SOCK=...`。SSH agent 转发授予签名能力，即使 `.ssh` 被 mask 也如此。
 
-只支持字节流，不支持 Unix datagram、abstract socket 或 `SCM_RIGHTS` FD 传递。宿主服务在同一父目录内替换 socket 后可重连；不追踪父目录本身的替换。
+只支持字节流，不支持 Unix datagram、abstract socket 或 `SCM_RIGHTS` FD 传递。VMM setup 阶段会固定宿主 socket inode；替换源路径不会重定向正在运行的 VM，也不会使 VM 重连到替换后的 socket。固定的监听 socket 本身仍可接受后续和并发连接。
 
 ## GPU
 
@@ -176,9 +176,9 @@ agent-vm run --no-config --wayland -- wayland-info
 
 宿主 `WAYLAND_DISPLAY` 可以是绝对 socket 路径，也可以是相对于 `XDG_RUNTIME_DIR` 的名称。未设置时默认取 `XDG_RUNTIME_DIR` 下的 `wayland-0`；相对名称要求宿主具有有效的 `XDG_RUNTIME_DIR`。选中的端点必须是已存在的 Unix stream socket。`plan` 校验所选端点，但不启动 waypipe。
 
-未指定 `--gpu` 时，宿主运行受限的 `waypipe --compress none --no-gpu client`，agent-vm 在 guest 中将原命令包装为 `/usr/bin/waypipe --compress none --no-gpu --socket /run/user/<uid>/waypipe.sock server -- COMMAND [ARG...]`。指定 `--gpu` 后两端 waypipe 均不使用 `--no-gpu`；宿主 helper 在 Landlock 下获准访问选中的 render node，以处理 GPU buffer。两个 waypipe 进程之间的私有 socket 经现有的 libkrun vsock 分帧字节流 relay 连接。传输的是 waypipe 序列化后的数据，不是直接转发 compositor socket：Wayland 共享内存 buffer 等依赖 FD 的资源由 waypipe 处理，然后才以字节形式通过 relay；普通 `--socket` 无法完成这一点。Wayland 不要求 `--network passt`、X11 或 GPU 访问。默认的 `--no-gpu` 模式会限制依赖 GPU buffer 或渲染的应用。
+未指定 `--gpu` 时，宿主运行受限的 `waypipe --compress none --no-gpu client`，agent-vm 在 guest 中将原命令包装为 `/usr/bin/waypipe --compress none --no-gpu --vsock --socket 2:<PORT> server -- COMMAND [ARG...]`。宿主 client 在 `<private-runtime>/wayland/pipe` 监听，该 endpoint 会固定并映射到 VMM。指定 `--gpu` 后两端 waypipe 均不使用 `--no-gpu`；宿主 helper 在 Landlock 下获准访问选中的 render node，以处理 GPU buffer。guest waypipe 通过 `AVM_READY_PORT + 1` 专用 vsock 端口直接连接宿主端点；guest 不创建 transport Unix listener 或 relay。传输的是 waypipe 序列化后的数据，不是 compositor socket：Wayland 共享内存 buffer 等依赖 FD 的资源由 waypipe 处理后以字节形式发送。Wayland 不要求 `--network passt`、X11 或 GPU 访问。默认的 `--no-gpu` 模式会限制依赖 GPU buffer 或渲染的应用。
 
-启用 Wayland 会授权 guest 命令访问所选宿主 compositor 及其协议能力，包括显示输出和输入事件。宿主 waypipe helper 仍受宿主隔离约束；guest 不会直接挂载 compositor socket。原命令的参数和退出状态仍遵循普通 `run` 语义。
+启用 Wayland 会授权 guest 命令访问所选宿主 compositor 及其协议能力，包括显示输出和输入事件。宿主 waypipe client endpoint 会固定并映射到 VMM；compositor socket 本身不会挂载到 VMM。原命令的参数和退出状态仍遵循普通 `run` 语义。
 
 可选的 Xwayland satellite 默认关闭。CLI 使用 `--xwayland-satellite` 启用，`--no-xwayland-satellite` 可覆盖 TOML 中的启用值；配置写作 `[wayland] xwayland_satellite = true`。此选项要求同时启用 `--wayland`，否则配置无效。示例：
 
