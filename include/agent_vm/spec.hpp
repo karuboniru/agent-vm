@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 #include <sys/types.h>
@@ -41,8 +42,12 @@ struct RunSpec {
     uint8_t cpus = 2;
     uint32_t memory_mib = 2048;
     uint32_t tmp_mib = 256;
+    std::optional<uint32_t> gpu_flags; // Absent disables GPU; zero explicitly enables it.
     bool network = false;
     bool ssh_agent = false;
+    bool wayland = false;
+    bool xwayland_satellite = false;
+    std::string wayland_display; // Absolute, canonical host Wayland socket path when enabled.
     bool debug = false;
     DbusSpec dbus_user, dbus_system;
     std::vector<MountSpec> mounts;

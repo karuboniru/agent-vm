@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -81,6 +82,9 @@ int main() {
         setenv("HOME", (root / "home").c_str(), 1);
         setenv("XDG_CONFIG_HOME", (root / "config").c_str(), 1);
         unsetenv("SSH_AUTH_SOCK");
+        unsetenv("WAYLAND_DISPLAY");
+        unsetenv("WAYLAND_SOCKET");
+        unsetenv("XDG_RUNTIME_DIR");
         unsetenv("AVM_UNSET_TEST_VARIABLE");
         fs::current_path(root / "home/work");
         const std::string cwd = fs::current_path();
@@ -89,9 +93,34 @@ int main() {
         check(options.spec.uid == getuid() && options.spec.gid == getgid(), "identity uses caller IDs");
         check(options.spec.home == home && options.spec.cwd == cwd, "default canonical home/cwd");
         check(options.spec.mounts.size() == 1 && !options.spec.mounts[0].read_only, "default only shares cwd rw");
-        check(!options.spec.network && !options.spec.ssh_agent, "network and SSH disabled by default");
+        check(!options.spec.network && !options.spec.ssh_agent && !options.spec.wayland &&
+              !options.spec.xwayland_satellite,
+              "network, SSH, Wayland and Xwayland satellite disabled by default");
         check(options.spec.command == std::vector<std::string>{"/bin/sh"}, "default shell");
         check(!options.spec.environment.contains("SSH_AUTH_SOCK"), "host SSH socket does not leak to environment");
+        check(!options.spec.gpu_flags, "GPU disabled by default");
+        options = parse({"--no-config", "--gpu=0"});
+        check(options.spec.gpu_flags && *options.spec.gpu_flags == 0,
+              "explicit zero enables GPU with raw zero flags");
+        std::ostringstream gpu_plan;
+        auto previous_gpu_plan = std::cout.rdbuf(gpu_plan.rdbuf());
+        avm::print_plan(options.spec);
+        std::cout.rdbuf(previous_gpu_plan);
+        check(gpu_plan.str().find("GPU: enabled (flags=0, 0x0)") != std::string::npos,
+              "plan distinguishes zero GPU flags from disabled GPU");
+        options = parse({"--no-config", "--gpu", "0xFFFFFFFF"});
+        check(options.spec.gpu_flags == UINT32_MAX, "GPU accepts full hexadecimal uint32 flag mask");
+        options = parse({"--no-config", "--gpu", "4294967295"});
+        check(options.spec.gpu_flags == UINT32_MAX, "GPU accepts full decimal uint32 flag mask");
+        options = parse({"--no-config", "--gpu=0X2a", "--no-gpu"});
+        check(!options.spec.gpu_flags, "later --no-gpu disables CLI GPU flags");
+        options = parse({"--no-config", "--no-gpu", "--gpu=0X2a"});
+        check(options.spec.gpu_flags == 42, "later --gpu enables GPU after --no-gpu");
+        for (const auto& invalid : {"", "-1", "+1", "4294967296", "0x100000000", "0x", "0xGG",
+                                    "1.5", "0x1g", "1tail", " 1", "1 "})
+            reject({"--no-config", "--gpu=" + std::string(invalid)},
+                   "invalid GPU flag value rejected: " + std::string(invalid));
+        reject({"--no-config", "--no-gpu=0"}, "--no-gpu does not accept a value");
         auto dbus_config = root / "dbus.toml";
         write(dbus_config, "[dbus.user]\nenabled = true\naddress = 'unix:path=/nonexistent/test-bus'\nargs = ['--talk=org.example.Service', '--call=org.example.Other=org.example.API.Read@/obj']\n[dbus.system]\nenabled = true\naddress = 'unix:path=/nonexistent/system-bus'\nargs = []\n");
         auto dbus = parse({"--config", dbus_config.string()}).spec;
@@ -368,6 +397,147 @@ int main() {
 
         const auto host_socket = (root / "agent.sock").string();
         SocketFixture socket_fixture(host_socket);
+        reject({"--no-config", "--wayland"}, "relative default Wayland display requires XDG_RUNTIME_DIR");
+        reject({"--no-config", "--xwayland-satellite"}, "Xwayland satellite requires Wayland");
+        reject({"--no-config", "--wayland", "--xwayland-satellite", "--no-wayland"},
+               "final Wayland disable rejects enabled Xwayland satellite");
+        auto runtime_dir = root / "runtime";
+        fs::create_directories(runtime_dir);
+        auto wayland_socket = (runtime_dir / "wayland-0").string();
+        SocketFixture wayland_fixture(wayland_socket);
+        setenv("XDG_RUNTIME_DIR", runtime_dir.c_str(), 1);
+        auto wayland_target = "/run/user/" + std::to_string(getuid()) + "/waypipe.sock";
+        options = parse({"plan", "--no-config", "--wayland"});
+        check(options.spec.wayland && options.spec.wayland_display == wayland_socket &&
+              options.spec.sockets.size() == 1 && options.spec.sockets[0].source.empty() &&
+              options.spec.sockets[0].target == wayland_target,
+              "Wayland resolves host socket and reserves pending waypipe transport");
+        check(!options.spec.environment.contains("WAYLAND_DISPLAY") && !options.spec.environment.contains("WAYLAND_SOCKET"),
+              "waypipe server controls guest Wayland environment");
+        std::ostringstream wayland_plan;
+        auto previous_plan = std::cout.rdbuf(wayland_plan.rdbuf());
+        avm::print_plan(options.spec);
+        std::cout.rdbuf(previous_plan);
+        check(wayland_plan.str().find("Wayland: enabled via waypipe (no GPU forwarding)") != std::string::npos &&
+              wayland_plan.str().find("<waypipe transport> -> " + wayland_target) != std::string::npos &&
+              wayland_plan.str().find("Xwayland satellite: disabled") != std::string::npos,
+              "plan explains Wayland transport, GPU limitation and Xwayland default");
+        auto xwayland = parse({"plan", "--no-config", "--wayland", "--xwayland-satellite"});
+        check(xwayland.spec.wayland && xwayland.spec.xwayland_satellite &&
+              !xwayland.spec.environment.contains("DISPLAY"),
+              "Xwayland satellite is opt-in and waypipe controls guest DISPLAY");
+        wayland_plan.str(""); wayland_plan.clear();
+        previous_plan = std::cout.rdbuf(wayland_plan.rdbuf());
+        avm::print_plan(xwayland.spec);
+        std::cout.rdbuf(previous_plan);
+        check(wayland_plan.str().find("Xwayland satellite: enabled (requires Wayland; waypipe sets guest DISPLAY)") != std::string::npos,
+              "plan reports enabled Xwayland satellite and requirement");
+        std::ostringstream wayland_help;
+        previous_plan = std::cout.rdbuf(wayland_help.rdbuf());
+        avm::print_help();
+        std::cout.rdbuf(previous_plan);
+        check(wayland_help.str().find("--xwayland-satellite") != std::string::npos &&
+              wayland_help.str().find("--no-xwayland-satellite") != std::string::npos &&
+              wayland_help.str().find("Xwayland satellite requires Wayland") != std::string::npos,
+              "help documents Xwayland controls and Wayland requirement");
+        options = parse({"--no-config", "--wayland", "--xwayland-satellite", "--no-xwayland-satellite"});
+        check(!options.spec.xwayland_satellite, "later CLI Xwayland satellite disable wins");
+        options = parse({"--no-config", "--wayland", "--no-xwayland-satellite", "--xwayland-satellite"});
+        check(options.spec.xwayland_satellite, "later CLI Xwayland satellite enable wins");
+        reject({"--no-config", "--xwayland-satellite=true", "--wayland"},
+               "Xwayland satellite flag does not accept a value");
+        reject({"--no-config", "--no-xwayland-satellite=false"},
+               "Xwayland satellite disable flag does not accept a value");
+        reject({"--no-config", "--wayland", "--xwayland-satellite", "-e", "DISPLAY=:1"},
+               "Xwayland satellite rejects guest DISPLAY override");
+        options = parse({"--no-config", "--wayland", "-e", "DISPLAY=:1"});
+        check(options.spec.environment.at("DISPLAY") == ":1", "manual DISPLAY remains allowed without Xwayland satellite");
+        auto xwayland_invalid = xwayland.spec;
+        xwayland_invalid.wayland = false;
+        xwayland_invalid.wayland_display.clear();
+        reject_spec(xwayland_invalid, "re-exec Xwayland satellite requires Wayland");
+        xwayland_invalid = xwayland.spec;
+        xwayland_invalid.environment["DISPLAY"] = ":2";
+        reject_spec(xwayland_invalid, "re-exec Xwayland satellite rejects guest DISPLAY override");
+        auto gpu_wayland = parse({"plan", "--no-config", "--wayland", "--gpu=0"});
+        wayland_plan.str(""); wayland_plan.clear();
+        previous_plan = std::cout.rdbuf(wayland_plan.rdbuf());
+        avm::print_plan(gpu_wayland.spec);
+        std::cout.rdbuf(previous_plan);
+        check(wayland_plan.str().find("Wayland: enabled via waypipe (GPU forwarding enabled)") != std::string::npos,
+              "Wayland plan reflects enabled GPU forwarding even with zero flags");
+        auto wayland_invalid = options.spec;
+        wayland_invalid.sockets.clear();
+        reject_spec(wayland_invalid, "re-exec Wayland requires pending transport mapping");
+        wayland_invalid = options.spec;
+        wayland_invalid.sockets[0].source = host_socket;
+        avm::validate_spec(wayland_invalid);
+        check(true, "Wayland transport accepts a validated source after broker readiness");
+        wayland_invalid = options.spec;
+        wayland_invalid.wayland_display = (root / "home/file").string();
+        reject_spec(wayland_invalid, "re-exec Wayland display must be a socket");
+        wayland_invalid = options.spec;
+        wayland_invalid.environment["WAYLAND_SOCKET"] = "3";
+        reject_spec(wayland_invalid, "re-exec Wayland rejects guest socket override");
+        reject({"--no-config", "--wayland", "-e", "WAYLAND_DISPLAY=wayland-9"},
+               "Wayland rejects guest display override");
+        reject({"--no-config", "--wayland", "-e", "WAYLAND_SOCKET=3"},
+               "Wayland rejects guest socket override");
+        reject({"--no-config", "--wayland", "--socket", "src=" + host_socket + ",dst=" + wayland_target},
+               "Wayland transport conflicts with explicit socket mapping");
+        reject({"--no-config", "--wayland", "--mask-target", wayland_target},
+               "Wayland transport cannot overlap masked target");
+        setenv("WAYLAND_DISPLAY", (root / "home/file").c_str(), 1);
+        reject({"--no-config", "--wayland"}, "Wayland display must be a Unix socket");
+        fs::create_symlink(wayland_socket, root / "wayland-link.sock");
+        setenv("WAYLAND_DISPLAY", (root / "wayland-link.sock").c_str(), 1);
+        options = parse({"--no-config", "--wayland"});
+        check(options.spec.wayland_display == wayland_socket, "absolute Wayland display is canonicalized");
+        setenv("WAYLAND_DISPLAY", "missing.sock", 1);
+        reject({"--no-config", "--wayland"}, "missing relative Wayland socket rejected");
+        unsetenv("WAYLAND_DISPLAY");
+        auto wayland_config = root / "wayland.toml";
+        write(wayland_config, "[wayland]\nenabled = true\n");
+        options = parse({"--config", wayland_config.string(), "--no-wayland"});
+        check(!options.spec.wayland && options.spec.sockets.empty(), "CLI disables configured Wayland");
+        write(wayland_config, "[wayland]\nenabled = true\nxwayland_satellite = true\n");
+        options = parse({"--config", wayland_config.string()});
+        check(options.spec.wayland && options.spec.xwayland_satellite, "TOML enables Xwayland satellite with Wayland");
+        options = parse({"--config", wayland_config.string(), "--no-xwayland-satellite"});
+        check(options.spec.wayland && !options.spec.xwayland_satellite,
+              "CLI disables configured Xwayland satellite");
+        options = parse({"--config", wayland_config.string(), "--no-xwayland-satellite", "--no-wayland"});
+        check(!options.spec.wayland && !options.spec.xwayland_satellite,
+              "CLI may disable both configured Wayland features");
+        reject({"--config", wayland_config.string(), "--no-wayland"},
+               "CLI Wayland disable conflicts with configured Xwayland satellite");
+        write(wayland_config, "[environment.set]\nDISPLAY = ':4'\n[wayland]\nenabled = true\nxwayland_satellite = true\n");
+        reject({"--config", wayland_config.string()},
+               "configured guest DISPLAY conflicts with Xwayland satellite");
+        write(wayland_config, "[wayland]\nenabled = false\nxwayland_satellite = true\n");
+        reject({"--config", wayland_config.string()}, "TOML Xwayland satellite requires Wayland");
+        options = parse({"--config", wayland_config.string(), "--wayland"});
+        check(options.spec.wayland && options.spec.xwayland_satellite,
+              "CLI Wayland enable satisfies configured Xwayland satellite");
+        write(wayland_config, "[wayland]\nenabled = false\n");
+        options = parse({"--config", wayland_config.string(), "--wayland"});
+        check(options.spec.wayland, "CLI enables disabled Wayland configuration");
+        write(wayland_config, "[wayland]\nenabled = false\nxwayland_satellite = false\n");
+        options = parse({"--config", wayland_config.string()});
+        check(!options.spec.wayland && !options.spec.xwayland_satellite,
+              "explicit TOML Xwayland satellite false works without Wayland");
+        options = parse({"--config", wayland_config.string(), "--wayland", "--xwayland-satellite"});
+        check(options.spec.xwayland_satellite, "CLI enables Xwayland satellite over TOML default");
+        write(wayland_config, "[wayland]\nenabled = true\nxwayland_satellite = 'true'\n");
+        reject({"--config", wayland_config.string()}, "non-boolean Xwayland satellite setting rejected");
+        write(wayland_config, "[wayland]\nenabled = true\nxwayland_satelite = true\n");
+        reject({"--config", wayland_config.string()}, "unknown Xwayland satellite setting rejected");
+        write(wayland_config, "[wayland]\nenabeld = true\n");
+        reject({"--config", wayland_config.string()}, "unknown Wayland field rejected");
+        write(wayland_config, "[wayland]\nenabled = 'true'\n");
+        reject({"--config", wayland_config.string()}, "non-boolean Wayland setting rejected");
+        options = parse({"--no-config", "--wayland", "--no-wayland"});
+        check(!options.spec.wayland && options.spec.sockets.empty(), "later CLI Wayland disable wins");
         fs::create_symlink(host_socket, root / "agent-link.sock");
         options = parse({"--no-config", "--socket", "source=../../agent-link.sock,destination=~/service/../sockets/api.sock"});
         check(options.spec.sockets.size() == 1 && options.spec.sockets[0].source == host_socket &&
@@ -490,12 +660,17 @@ int main() {
         reject({"--no-config", "--config", "anything"}, "conflicting config controls rejected");
 
         const fs::path config = root / "config/agent-vm/config.toml";
-        write(config, "version = 1\n[vm]\ncpus = 3\nmemory_mib = 1024\n[filesystem]\ncwd = 'ro'\n[environment.set]\nOVERRIDE = 'config'\n[network]\nmode = 'passt'\n");
+        write(config, "version = 1\n[vm]\ncpus = 3\nmemory_mib = 1024\ngpu_flags = 17\n[filesystem]\ncwd = 'ro'\n[environment.set]\nOVERRIDE = 'config'\n[network]\nmode = 'passt'\n");
         options = parse({"--cpus", "4", "-e", "OVERRIDE=cli"});
         check(options.spec.cpus == 4 && options.spec.memory_mib == 1024 && options.spec.network, "config loaded and CLI scalar precedence");
+        check(options.spec.gpu_flags == 17, "TOML vm.gpu_flags enables GPU");
         check(options.spec.environment.at("OVERRIDE") == "cli" && options.spec.mounts[0].read_only, "config env and cwd defaults");
+        options = parse({"--gpu=0"});
+        check(options.spec.gpu_flags == 0, "CLI zero overrides configured GPU flags");
+        options = parse({"--no-gpu"});
+        check(!options.spec.gpu_flags, "CLI --no-gpu overrides configured GPU flags");
         options = parse({"--no-config"});
-        check(options.spec.cpus == 2 && !options.spec.network, "no-config ignores user file");
+        check(options.spec.cpus == 2 && !options.spec.network && !options.spec.gpu_flags, "no-config ignores user file");
         write(root / "config/agent-vm/test.toml", "[vm]\ncpus = 5\n");
         write(root / "home/work/test.toml", "[vm]\ncpus = 9\n");
         options = parse({"--profile", "test"});
@@ -533,6 +708,17 @@ int main() {
         reject({}, "unknown nested config field rejected");
         write(config, "[vm]\ncpus = 1.5\n");
         reject({}, "wrong TOML scalar type rejected");
+        for (const auto& [value, expected] : std::vector<std::pair<std::string, uint32_t>>{
+                 {"0", 0}, {"4294967295", UINT32_MAX}, {"0xffffffff", UINT32_MAX}}) {
+            write(config, "[vm]\ngpu_flags = " + value + "\n");
+            check(parse({}).spec.gpu_flags == expected, "TOML GPU flags accept " + value);
+        }
+        for (const auto& value : {"-1", "4294967296", "'0'", "1.5"}) {
+            write(config, "[vm]\ngpu_flags = " + std::string(value) + "\n");
+            reject({}, "invalid TOML GPU flags rejected: " + std::string(value));
+        }
+        write(config, "[vm]\ngpu_flag = 1\n");
+        reject({}, "unknown GPU configuration key rejected");
         write(config, "[environment]\ninherit = [1]\n");
         reject({}, "wrong TOML array type rejected");
         write(config, "[environment]\ninherit = ['ASSIGNMENT=value']\n");

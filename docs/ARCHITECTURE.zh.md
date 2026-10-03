@@ -8,16 +8,19 @@
 agent-vm supervisor
   ├─ passt                         可选，宿主网络
   ├─ xdg-dbus-proxy                 每个启用的 bus 一个
+  ├─ waypipe client                 可选，访问宿主 compositor
   ├─ socket controller             所有转发共用
   │    └─ socket data processes     每个转发一个
   └─ clean re-exec → VMM worker     libkrun + namespaces + mount jail
        └─ guest init
             └─ agent-vm-guest
                  ├─ socket relays
-                 └─ workload       调用者 UID/GID
+                 └─ waypipe server  可选，包装 workload
+                      ├─ xwayland-satellite → Xwayland  可选，按需启动
+                      └─ workload   调用者 UID/GID
 ```
 
-supervisor 解析 TOML/CLI，形成 `RunSpec`，准备私有运行目录、启动配置和固定通信端点。D-Bus proxy 完成 readiness 后才建立 socket broker；passt 和 brokers 启动后，supervisor 进入仅映射调用者的 user namespace 和空 network namespace，清 capabilities、设置 `no_new_privs`，然后 fork/re-exec VMM worker。网络关闭时也隔离 supervisor。
+supervisor 解析 TOML/CLI，形成 `RunSpec`，准备私有运行目录、启动配置和固定通信端点。D-Bus proxy 完成 readiness 后才建立 socket broker。启用 Wayland 时，受限的宿主 waypipe client 连接所选 compositor，并为 socket broker 在私有 Unix transport 上监听。passt 和 brokers 启动后，supervisor 进入仅映射调用者的 user namespace 和空 network namespace，清 capabilities、设置 `no_new_privs`，然后 fork/re-exec VMM worker。网络关闭时也隔离 supervisor。
 
 worker 以精简环境重新 exec，隔离配置解析留下的地址空间与宿主原始环境。它先创建新 session，使 VMM 与 supervisor 既不共享进程组也不共享控制终端：进程组跨越 PID namespace，受限 VMM 内的 `kill(0, sig)` 否则能到达 supervisor。随后它建立 user、mount、PID、IPC、UTS、network namespaces，装配受限根，关闭非白名单 FD、清 capabilities 并安装 seccomp denylist，再启动 libkrun。supervisor 管理信号、TTY、退出状态和 helper 清理；helper 意外退出会结束 VM。终端信号只到达 supervisor，由它经控制通道转发；supervisor 忽略 SIGTTOU，以便在后台进程组中也能恢复终端设置。
 
@@ -25,21 +28,21 @@ worker 以精简环境重新 exec，隔离配置解析留下的地址空间与�
 
 安全边界是 **guest 与整个 VMM 能访问的宿主资源集合**。virtio-fs export path 不构成独立隔离边界；guest 内的 mount 权限也不承担宿主资源隔离。宿主只读属性、mask、切根和 FD 清理在创建文件共享后端之前完成。
 
-VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。VMM seccomp 使用 denylist，包含全部三个 io_uring syscall、userfaultfd、quotactl_fd 和 kcmp，以及对继承的控制台描述符注入终端输入的 ioctl TIOCSTI 和 TIOCLINUX（独立 session 已使 VMM 没有控制终端）；宿主 socket/socketpair 仅允许 AF_UNIX，guest AF_VSOCK 使用 libkrun 的 Unix backend，passt 使用继承的 Unix stream。socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
+VMM jail 保留精确的 `/dev/kvm` 节点和私有 PID namespace 的 proc，后者供 libkrun 使用 `/proc/self/fd`。这些属于 VMM 授权资源，不承诺对恶意 guest 的原始文件协议请求不可达。默认不共享外层宿主 proc 或整个宿主 `/dev`。启用 GPU 时，VMM 还获准访问选中的宿主 render node 及对应的只读 sysfs 条目；它们属于 VMM 能力，不直接挂载给 guest。VMM seccomp 使用 denylist，包含全部三个 io_uring syscall、userfaultfd、quotactl_fd 和 kcmp，以及对继承的控制台描述符注入终端输入的 ioctl TIOCSTI 和 TIOCLINUX（独立 session 已使 VMM 没有控制终端）；宿主 socket/socketpair 仅允许 AF_UNIX，guest AF_VSOCK 使用 libkrun 的 Unix backend，passt 使用继承的 Unix stream。socket helpers 使用 allowlist；没有独立安全审计，也没有对恶意 virtio-fs 原始协议的穷尽验证。
 
 宿主是可信的；运行期间宿主重命名、替换或重建被 mask 的路径不在保证范围内。mask 保护共享入口，不隐藏其他位置已有的硬链接、副本或已授出的 FD。可写共享授予直接修改对应宿主源的权限。
 
-Landlock ABI 9 可用时，VMM 仅获准连接固定的 readiness/broker pathname Unix socket；通过共享目录（包括只读目录和 export 别名）可达的其他宿主 socket 默认拒绝。VMM 在 confinement 后创建的域内 socket（包括 control listener）仍可用。低于 ABI 9 时保留原有行为并告警：共享目录内可达的宿主 socket 仍属于服务能力边界。guest 的显式 relay 只传字节；已经授权的服务或继承的 FD 仍可授予额外能力，Landlock 不撤销它们。
+Landlock ABI 9 可用时，VMM 仅获准连接固定的 readiness/broker pathname Unix socket；通过共享目录（包括只读目录和 export 别名）可达的其他宿主 socket 默认拒绝。VMM 在 confinement 后创建的域内 socket（包括 control listener）仍可用。低于 ABI 9 时保留原有行为并告警：共享目录内可达的宿主 socket 仍属于服务能力边界。guest 的显式 relay 只传字节。Wayland 由 waypipe 先序列化协议流量，包括依赖 FD 的资源，再交给 relay。已经授权的服务或继承的 FD 仍可授予额外能力，Landlock 不撤销它们。
 
 ## Landlock confinement
 
-运行时探测内核 ABI。supervisor 和 D-Bus proxy 文件系统策略要求 ABI 3（包含 truncate 限制）；VMM pathname Unix socket 白名单要求 ABI 9。缺少所需 ABI 或 Landlock 未启用时明确告警，保留原有隔离；支持时若创建规则或安装策略失败，则启动失败。`doctor` 报告这两项能力。
+运行时探测内核 ABI。supervisor 和 D-Bus proxy 文件系统策略要求 ABI 3（包含 truncate 限制）；VMM pathname Unix socket 白名单要求 ABI 9。这些策略缺少所需 ABI 或 Landlock 未启用时明确告警，保留原有隔离；Wayland 转发必须启用宿主 helper 的 ABI 3 隔离，缺少支持时启动失败。支持时若创建规则或安装策略失败，也会启动失败。`doctor` 报告这两项能力。
 
 supervisor 只在 worker fork 后的父分支安装文件系统策略，避免 worker 继承后无法挂载／切根。它保留 runtime 清理所需权限；删除 runtime 本身还需在其父目录授予 `REMOVE_DIR`，因此也能删除该父目录下其他空目录，但不会因此得到读取、写文件或删除普通文件的权限。现有终端和通信 FD 保留。
 
 D-Bus proxy 在 exec 前安装内置文件白名单：`/usr`、存在的 `/lib`、`/lib64` 只读；执行授权 proxy 本身及已知的 x86_64/aarch64 ELF 加载器；`/etc` 仅逐文件授权 loader cache、NSS、账户、解析器、machine-id 和时区依赖，另有只读 `/dev/null`、`/dev/urandom`。每个 bus 使用独立的 caller-owned 0700 私有目录，仅允许枚举、创建 socket 和删除目录内文件，不授予普通文件写入。不会授权整个 home、`/etc` 或宿主 runtime 目录。上游地址仍由 D-Bus 配置决定；此策略不限制 proxy 的 socket 连接，依赖 home 认证文件的地址不在该文件授权范围内。
 
-VMM socket 策略在挂载、切根和 FD 清理完成后、libkrun 创建线程前安装；它不额外收紧普通文件权限，并显式保留原有跨目录 rename/link 行为。Landlock 不代替宿主只读挂载、mask、FD 清理或 seccomp，也不覆盖所有元数据操作。socket controller/data process 和 passt 本轮不添加 Landlock。
+VMM socket 策略在挂载、切根和 FD 清理完成后、libkrun 创建线程前安装；它不额外收紧普通文件权限，并显式保留原有跨目录 rename/link 行为。VMM 通常拒绝 `execve`，始终拒绝 `execveat`。GPU flag 的第 9 位启用 render-server 模式时，VMM 只在额外的强制 Landlock 规则下允许 `execve`，并仅准许执行 `/usr/libexec/virgl_render_server` 及该 ELF 的 `PT_INTERP` loader；其他可执行目标仍被拒绝。缺少 Landlock 或 render server 缺失／无效时启动失败。此例外使 virglrenderer 能启动 Venus server，同时不开放 VMM 的一般执行能力。Landlock 不代替宿主只读挂载、mask、FD 清理或 seccomp，也不覆盖所有元数据操作。socket controller/data process 和 passt 本轮不添加 Landlock。
 
 ## UID/GID 与降权
 
@@ -80,12 +83,16 @@ host mount namespace 的传播设为 recursive private。源对象用 FD 固定�
 | CWD | 默认相同绝对路径的可写共享 |
 | `/tmp`, `/var/tmp`, `/run` | guest tmpfs；`/run/user/U` 归 U 所有、0700 |
 | 自定义 tmpfs | guest 本地临时存储，可含显式 bind/tmpfs 子挂载 |
-| `/proc`, `/sys`, `/dev` 及其内建挂载 | guest 内核/init 提供 |
+| `/proc`, `/sys`, `/dev` 及其内建挂载 | guest 内核/init 提供；启用的 GPU render node 是归 workload 用户所有、mode 为 0666 的本地 virtio 设备 |
 | 其他根目录 | 最小占位目录及显式挂载 |
 
 宿主 `/etc/ld.so.conf` 和 `ld.so.conf.d/`（存在时）复制到私有只读 `/etc`，指向普通配置文件的 symlink 复制为文件。不自动共享整个宿主 `/etc`。复用 `/usr` 不保证每个宿主命令都具备所需的外部配置、服务或 symlink 目标，也不提供运行期间一致的软件快照。
 
 自定义 tmpfs 在宿主侧对应私有 staging 骨架，用于隐藏被覆盖的源子树、准备子挂载并导出最终策略。骨架只读，显式可写子 bind 保持可写；实际 tmpfs 内容位于 guest RAM，不写入宿主 staging。`--tmp-size` 对每个 tmpfs 分别限容，VM 内存不构成宿主 cgroup 总限额或共享磁盘配额。
+
+## GPU
+
+GPU 是独立选择启用的功能。没有 flag mask 时关闭；`--gpu=0` 以原始 flags 零启用，但不保证成功启动。CLI 的十进制或十六进制无符号 32 位 mask 和 TOML 的 `[vm].gpu_flags` 原样传给 `krun_set_gpu_options`；runner 检查 libkrun GPU 功能，libkrun 及其 renderer 决定 mask 能否工作。VMM 的宿主访问仅限选中的 render node 与对应只读 sysfs 条目。guest GPU 设备节点由其内核创建，归 workload 用户所有；render node 的 mode 为 0666，`/dev/dri/card0` 为 0660；宿主设备权限不改变，宿主 `/dev/dri` 和 sysfs 整棵树不会直接 bind 到 guest。`963`（`0x3c3`）选择 EGL、线程同步、Venus、关闭 VirGL、异步 fence callback 和 render-server 模式。驱动和设备支持取决于宿主与 libkrun。在 libkrun 1.19 上，即使 VirGL 离屏渲染可用，未实现的 `TransferFromHost3d`/`transfer_read` 也可能使宿主 VMM GPU worker panic，并使 Wayland 加速 workload 停滞；因此不能据此保证所有 Wayland 加速场景可用。
 
 ## 网络、vsock 与协议
 
@@ -101,6 +108,10 @@ IPC 不进入 bootstrap 或 export catalog。已监听的 broker/readiness socke
 
 `include/agent_vm/protocol.h` 定义协议：启动格式版本 2、挂载格式版本 3，使用本机字节序，要求同架构 host/guest；配置大小上限为 1 MiB，字符串带长度。stream relay 使用网络字节序的长度、DATA/EOF/ACK 帧，单帧数据最多 65536 字节。EOF 与确认保证半关闭及尾部数据排空后再关闭内部传输。
 
+Wayland 转发占用一个授权 socket 转发槽位。宿主把 `WAYLAND_DISPLAY` 解析为绝对路径，或相对于 `XDG_RUNTIME_DIR` 的路径（默认 `wayland-0`），并校验所选 Unix socket。受限的宿主 `/usr/bin/waypipe client` 连接 compositor；该 helper 要求 Landlock ABI 3，缺少支持时启动失败。guest 命令由 `/usr/bin/waypipe --socket /run/user/<uid>/waypipe.sock server --` 包装。默认两端 waypipe 均使用 `--no-gpu`；启用 GPU 时省略该选项，宿主 helper 的 Landlock 策略仅准许选中的 render node 供解码使用。宿主 client 在私有 Unix transport 上监听，现有 broker 和分帧 vsock relay 将其连接至 guest server。compositor socket 本身不挂载或直接转发到 VM。waypipe 在字节传输两端处理包含 FD 的 Wayland 消息，包括共享内存 buffer。该路径不依赖 passt，GPU 仍是可选功能。启用后，workload 将获得所选 compositor 的协议能力。
+
+可选的 Xwayland satellite 模式要求启用 Wayland 转发，且默认关闭。开启时 guest waypipe 以 `--xwls` 运行，要求 waypipe 0.11 或更新版本；waypipe 按需启动 guest `/usr` 中的 `xwayland-satellite`，并由 waypipe 设置 guest `DISPLAY`。guest `/usr` 还必须提供 `Xwayland`。X11 客户端经 guest Xwayland/satellite 转换为 Wayland，再走同一 waypipe transport；宿主 X11 socket 和 Xauthority 不会被转发。配置冲突检查禁止用户同时显式设置 `DISPLAY`。
+
 启用网络时 guest helper 校验地址、路由和 DNS，再启动 workload。guest 内核参数为 `oops=panic panic=-1`，helper 在装配前预置失败状态 125，正常退出状态在 helper 完成退出后由 libkrun init 写入。该机制使 guest 内核异常及时结束，不修复固件内核本身的错误。
 
 ## Socket broker 隔离
@@ -111,7 +122,7 @@ controller 位于私有 user、mount、network、IPC、UTS namespaces。根中�
 
 每个 data process 是独立 PID namespace 的 PID 1，根为空且只读，无 proc/dev、标准流、宿主目录或 listener FD。它仅从私有单向通道接收已连接 FD 对并转发字节；allowlist 禁止文件打开、socket 创建/连接、exec、fork、ptrace 和 namespace 修改。controller 与 data process 均清空包括 bounding set 在内的 capabilities，设置 `no_new_privs` 后报告就绪。data process 失败会引发整个 broker 清理。
 
-内部 FD 交接使用 `SCM_RIGHTS`，不等于 guest FD 转发。没有额外 idle timeout 或宿主总资源配额。broker 隔离不改变 passt 自身沙盒；独立的 `xdg-dbus-proxy` 使用上文的 Landlock 文件系统策略。每个启用的 D-Bus 使用独立过滤 proxy；策略和 upstream 地址不序列化给 clean VMM worker，worker 只得到解析后的 socket 映射。
+内部 FD 交接使用 `SCM_RIGHTS`，不等于 guest FD 转发。没有额外 idle timeout 或宿主总资源配额。broker 隔离不改变 passt 自身沙盒；独立的 `xdg-dbus-proxy` 使用上文的 Landlock 文件系统策略。每个启用的 D-Bus 使用独立过滤 proxy；策略和 upstream 地址不序列化给 clean VMM worker，worker 只得到解析后的 socket 映射。waypipe 的私有 transport 是 broker 一个槽位的授权 upstream，宿主 waypipe 进程单独隔离。
 
 ## 进程可观测性
 

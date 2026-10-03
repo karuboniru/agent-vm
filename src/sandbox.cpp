@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <climits>
 #include <cstring>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <dirent.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <linux/capability.h>
 #include <linux/mount.h>
@@ -33,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -358,6 +361,56 @@ void reject_mount_alias_conflicts(const RunSpec& spec, const std::vector<std::st
 }
 
 struct Endpoint { std::string source, target; Fd fd; };
+struct GpuSources {
+    std::vector<Endpoint> nodes, devices;
+    std::vector<std::pair<std::string, std::string>> links;
+    std::set<std::string> directories;
+};
+GpuSources pin_gpu_sources() {
+    GpuSources gpu;
+    std::error_code ec;
+    std::filesystem::directory_iterator entries("/dev/dri", ec);
+    if (ec == std::errc::no_such_file_or_directory) return gpu;
+    if (ec) throw std::system_error(ec, "enumerate GPU render nodes");
+    for (const auto& entry : entries) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("renderD")) continue;
+        unsigned number = 0;
+        const auto parsed = std::from_chars(name.data() + 7, name.data() + name.size(), number);
+        if (parsed.ec != std::errc() || parsed.ptr != name.data() + name.size() || number < 128)
+            throw std::runtime_error("invalid DRM render node name: " + name);
+        Fd node = open_source(entry.path().string());
+        const auto st = info(node.fd);
+        if (!S_ISCHR(st.st_mode) || major(st.st_rdev) != 226 || minor(st.st_rdev) != number)
+            throw std::runtime_error("invalid DRM render device: " + entry.path().string());
+        const auto devlink = "/sys/dev/char/226:" + std::to_string(number);
+        const auto node_path = std::filesystem::canonical(devlink).string();
+        const auto device_path = std::filesystem::canonical(devlink + "/device").string();
+        // libdrm/Mesa discover the bus and vendor through this device's sysfs
+        // metadata. Bind only that device subtree, never all host sysfs. Keep
+        // the real hierarchy so relative kernel symlinks continue to work.
+        if (!within(device_path, "/sys/devices") || device_path == "/sys/devices" ||
+            !within(node_path, device_path) || node_path == device_path)
+            throw std::runtime_error("GPU metadata is outside its sysfs device subtree: " + devlink);
+        gpu.nodes.push_back({entry.path().string(), entry.path().string(), std::move(node)});
+        bool pinned = false;
+        for (const auto& device : gpu.devices) pinned |= device.source == device_path;
+        if (!pinned) gpu.devices.push_back({device_path, device_path, open_source(device_path)});
+        gpu.links.emplace_back(devlink, node_path);
+        gpu.links.emplace_back("/sys/class/drm/" + name, node_path);
+        // These empty targets support realpath/readlink of subsystem/driver
+        // links without exposing other devices or driver control attributes.
+        for (const char* link : {"subsystem", "driver"}) {
+            auto target = std::filesystem::canonical(device_path + "/" + link, ec);
+            if (ec == std::errc::no_such_file_or_directory) { ec.clear(); continue; }
+            if (ec) throw std::system_error(ec, "resolve GPU " + std::string(link));
+            if (!within(target.string(), "/sys/bus") || target == "/sys/bus")
+                throw std::runtime_error("GPU subsystem or driver points outside /sys/bus");
+            gpu.directories.insert(target.string());
+        }
+    }
+    return gpu;
+}
 struct Layer {
     std::string target;
     const PinnedMount* bind;
@@ -372,18 +425,20 @@ struct PinnedSources {
     std::vector<Layer> layers;
     std::vector<Mask> masks;
     std::vector<Fd> mask_pins;
+    GpuSources gpu;
 };
 PinnedSources pin_sources(const RunSpec& spec, const std::string& root_dir,
                          const std::string& ipc_dir, const std::string& spec_file,
                          const std::string& helper, int control_directory) {
     PinnedSources sources;
-    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins, gpu] = sources;
     usr = open_source("/usr");
 
     if (std::filesystem::is_directory("/etc/alternatives"))
         alternatives = open_source("/etc/alternatives");
     kvm = open_source("/dev/kvm");
     if (!S_ISCHR(info(kvm.fd).st_mode)) throw std::runtime_error("/dev/kvm is not a character device");
+    if (spec.gpu_flags.has_value()) gpu = pin_gpu_sources();
     control = Fd(dup(control_directory));
     if (control.fd < 0 || !S_ISDIR(info(control.fd).st_mode))
         throw std::runtime_error("missing pinned control directory");
@@ -467,7 +522,7 @@ PinnedSources pin_sources(const RunSpec& spec, const std::string& root_dir,
     return sources;
 }
 Fd build_policy_tree(const RunSpec& spec, const std::string& root_dir, PinnedSources& sources) {
-    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins, gpu] = sources;
     Fd root_mountpoint = open_source(root_dir);
     if (!S_ISDIR(info(root_mountpoint.fd).st_mode)) throw std::runtime_error("root source is not a directory");
     if (mount("tmpfs", fd_path(root_mountpoint.fd).c_str(), "tmpfs", MS_NOSUID | MS_NODEV,
@@ -578,6 +633,23 @@ Fd build_policy_tree(const RunSpec& spec, const std::string& root_dir, PinnedSou
     make_dirs(root.fd, "/.agent-vm/ipc/control");
     bind_fd(root.fd, control.fd, "/.agent-vm/ipc/control", false, false);
     bind_fd(root.fd, kvm.fd, "/dev/kvm", false, false, false);
+    // These are VMM-only backend resources. Guest /dev and /sys are created
+    // by its own kernel and are never sourced from this policy tree.
+    for (const auto& directory : gpu.directories) make_dirs(root.fd, directory);
+    for (const auto& device : gpu.devices) {
+        make_dirs(root.fd, device.target);
+        bind_fd(root.fd, device.fd.fd, device.target, false, true);
+    }
+    for (const auto& [path, destination] : gpu.links) {
+        const auto link = std::filesystem::path(path);
+        make_dirs(root.fd, link.parent_path().string());
+        Fd parent = target_fd(root.fd, link.parent_path().string());
+        if (symlinkat(destination.c_str(), parent.fd, link.filename().c_str())) fail("create GPU metadata link");
+    }
+    for (const auto& node : gpu.nodes) {
+        placeholder(root.fd, node.target, false);
+        bind_fd(root.fd, node.fd.fd, node.target, false, false, false);
+    }
     Fd proc = target_fd(root.fd, "/proc");
     if (mount("proc", fd_path(proc.fd).c_str(), "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr))
         fail("mount PID-namespace proc");
@@ -745,6 +817,52 @@ void verify_identity_text(const std::string& text) {
     if (text.empty() || text.find_first_of(":\n\r") != std::string::npos || text.find('\0') != std::string::npos)
         throw std::runtime_error("identity text contains passwd delimiters");
 }
+void allow_render_server_execution() {
+    const int abi = detail::landlock_abi();
+    if (abi < 1) throw std::runtime_error("GPU render-server execution requires Landlock");
+    const auto canonical = std::filesystem::canonical("/usr/libexec/virgl_render_server").string();
+    if (!within(canonical, "/usr")) throw std::runtime_error("GPU render server must reside in /usr");
+    Fd server = open_source(canonical, O_RDONLY);
+    const auto st = info(server.fd);
+    if (!S_ISREG(st.st_mode)) throw std::runtime_error("GPU render server is not a regular file");
+    // Landlock also checks the ELF interpreter. Grant precisely that file,
+    // rather than allowing executable access to an entire library directory.
+    Elf64_Ehdr header{};
+    if (pread(server.fd, &header, sizeof(header), 0) != sizeof(header) ||
+        std::memcmp(header.e_ident, ELFMAG, SELFMAG) || header.e_ident[EI_CLASS] != ELFCLASS64 ||
+        header.e_phentsize != sizeof(Elf64_Phdr) || header.e_phnum > 128 ||
+        header.e_phoff > static_cast<uint64_t>(st.st_size) ||
+        uint64_t(header.e_phnum) * sizeof(Elf64_Phdr) > static_cast<uint64_t>(st.st_size) - header.e_phoff)
+        throw std::runtime_error("invalid GPU render-server ELF header");
+    const uint64_t refer = abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0;
+    detail::LandlockRuleset rules(LANDLOCK_ACCESS_FS_EXECUTE | refer);
+    // Preserve existing cross-directory rename policy through this extra layer.
+    if (refer) rules.add_path("/", refer);
+    rules.add_fd(server.fd, LANDLOCK_ACCESS_FS_EXECUTE);
+    for (unsigned i = 0; i < header.e_phnum; ++i) {
+        Elf64_Phdr segment{};
+        if (pread(server.fd, &segment, sizeof(segment), header.e_phoff + i * sizeof(segment)) != sizeof(segment))
+            throw std::runtime_error("cannot read GPU render-server ELF segment");
+        if (segment.p_type != PT_INTERP) continue;
+        if (segment.p_filesz < 2 || segment.p_filesz > PATH_MAX ||
+            segment.p_offset > static_cast<uint64_t>(st.st_size) ||
+            segment.p_filesz > static_cast<uint64_t>(st.st_size) - segment.p_offset)
+            throw std::runtime_error("invalid GPU render-server ELF interpreter");
+        std::string interpreter(segment.p_filesz, '\0');
+        if (pread(server.fd, interpreter.data(), interpreter.size(), segment.p_offset) !=
+                static_cast<ssize_t>(interpreter.size()) || interpreter.back() != '\0' ||
+            interpreter.find('\0') != interpreter.size() - 1)
+            throw std::runtime_error("cannot read GPU render-server ELF interpreter");
+        interpreter.pop_back();
+        check_absolute(interpreter);
+        interpreter = std::filesystem::canonical(interpreter).string();
+        if (!within(interpreter, "/usr")) throw std::runtime_error("GPU ELF interpreter must reside in /usr");
+        Fd loader = open_source(interpreter);
+        if (!S_ISREG(info(loader.fd).st_mode)) throw std::runtime_error("GPU ELF interpreter is not a regular file");
+        rules.add_fd(loader.fd, LANDLOCK_ACCESS_FS_EXECUTE);
+    }
+    rules.enforce();
+}
 } // namespace
 
 void cleanup_runtime_directory(const std::string& runtime) {
@@ -826,7 +944,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     if (!spec.tmp_mib) throw std::runtime_error("private tmpfs size must be positive");
 
     auto sources = pin_sources(spec, root_dir, ipc_dir, spec_file, helper, control_directory);
-    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins] = sources;
+    auto& [usr, alternatives, kvm, control, endpoints, configuration, executable, mounts, tmpfs, layers, masks, mask_pins, gpu] = sources;
 
     // A parent-death signal is cleared by fork. Set it for both generations;
     // pidfds close the race even where getppid() is 0 across PID namespaces.
@@ -887,6 +1005,8 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     repin(usr, "/usr");
     if (alternatives.fd >= 0) repin(alternatives, "/etc/alternatives");
     repin(kvm, "/dev/kvm");
+    for (auto& node : gpu.nodes) repin(node.fd, node.source);
+    for (auto& device : gpu.devices) repin(device.fd, device.source);
     for (auto& endpoint : endpoints) repin(endpoint.fd, endpoint.source);
     for (auto& mount : mounts) repin(mount.fd, mount.spec.source);
     std::vector<std::string> private_paths{root_dir, ipc_dir, spec_file};
@@ -910,6 +1030,7 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     mounts.clear();
     mask_pins.clear();
     endpoints.clear(); control = Fd();
+    gpu = GpuSources();
     usr = Fd(); kvm = Fd(); configuration = Fd(); executable = Fd();
     root = Fd();
     close_unlisted(keep_fds);
@@ -921,17 +1042,25 @@ std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::stri
     // servers reachable through shared directories are deliberately not allowed.
     if (!detail::enforce_unix_socket_allowlist(ipc_sockets))
         dprintf(STDERR_FILENO, "agent-vm: warning: Landlock ABI 9 unavailable; VMM shared Unix sockets remain reachable\n");
-    install_vmm_seccomp();
+    install_vmm_seccomp(spec.gpu_flags.has_value() && (*spec.gpu_flags & (1u << 9)));
     return {{AVM_EXPORT_TAG, AVM_EXPORT_TAG}};
 }
 
-void install_vmm_seccomp() {
+void install_vmm_seccomp(bool render_server) {
+    // virglrenderer starts its Venus server with execv after VM activation.
+    // Keep the blanket exec ban normally; opt-in server mode uses a mandatory
+    // inode-based Landlock allowlist and inherits every other VMM restriction.
+    if (render_server) allow_render_server_execution();
     scmp_filter_ctx filter = seccomp_init(SCMP_ACT_ALLOW);
     if (!filter) throw std::runtime_error("cannot allocate VMM seccomp filter");
     try {
         int rc = seccomp_attr_set(filter, SCMP_FLTATR_CTL_TSYNC, 1);
         if (rc < 0) throw std::system_error(-rc, std::generic_category(), "enable VMM seccomp thread synchronization");
-        for (const char* name : {"mount", "umount", "umount2", "pivot_root", "chroot", "setns", "unshare", "execve", "execveat",
+        if (!render_server) {
+            rc = seccomp_rule_add(filter, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(execve), 0);
+            if (rc < 0) throw std::system_error(-rc, std::generic_category(), "seccomp execve");
+        }
+        for (const char* name : {"mount", "umount", "umount2", "pivot_root", "chroot", "setns", "unshare", "execveat",
                                  "ptrace", "process_vm_readv", "process_vm_writev", "open_by_handle_at", "name_to_handle_at",
                                  "bpf", "perf_event_open", "init_module", "finit_module", "delete_module", "reboot",
                                  "kexec_load", "kexec_file_load", "swapon", "swapoff", "syslog", "iopl", "ioperm",

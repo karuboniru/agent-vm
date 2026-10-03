@@ -5,6 +5,7 @@
 #include "filesystem.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -28,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -186,7 +188,7 @@ static struct run_spec read_spec(void)
     memcpy(&spec.header, data, sizeof(spec.header));
     const struct avm_spec_header *header = &spec.header;
     if (header->magic != AVM_SPEC_MAGIC || header->version != AVM_SPEC_VERSION ||
-        (header->flags & ~AVM_FLAG_NETWORK))
+        (header->flags & ~(AVM_FLAG_NETWORK | AVM_FLAG_GPU)))
         invalid_spec("unsupported header");
     if (header->uid == UINT32_MAX || header->gid == UINT32_MAX)
         invalid_spec("invalid user or group ID");
@@ -293,6 +295,80 @@ static void check_temporary_directories(void)
             exit(125);
         }
     }
+}
+
+/* libkrun's init owns /dev; filesystem assembly bind-mounts it into the final
+ * root. This is a guest-private device, not a host /dev bind. Grant standard
+ * permissions only to verified DRM render nodes and the primary card0. */
+static bool grant_gpu_nodes(uid_t uid, gid_t gid)
+{
+    int directory = open("/dev/dri", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) {
+        if (errno == ENOENT)
+            return false;
+        fail("open guest DRM device directory");
+    }
+    DIR *entries = fdopendir(directory);
+    if (!entries) {
+        close(directory);
+        fail("read guest DRM device directory");
+    }
+    bool found = false;
+    struct dirent *entry;
+    while (true) {
+        errno = 0;
+        entry = readdir(entries);
+        if (!entry)
+            break;
+        const char *name = entry->d_name;
+        bool primary = strcmp(name, "card0") == 0;
+        if (!primary) {
+            if (strncmp(name, "renderD", 7))
+                continue;
+            const char *digit = name + 7;
+            if (!*digit)
+                continue;
+            for (; *digit >= '0' && *digit <= '9'; ++digit) {}
+            if (*digit)
+                continue;
+        }
+        int node = openat(directory, name, O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (node < 0) {
+            if (errno == ELOOP || errno == ENOENT)
+                continue;
+            fail("open guest DRM node");
+        }
+        struct stat status;
+        if (fstat(node, &status) < 0)
+            fail("stat guest DRM node");
+        if (S_ISCHR(status.st_mode) && major(status.st_rdev) == 226 &&
+            (primary ? minor(status.st_rdev) == 0 : minor(status.st_rdev) >= 128)) {
+            if (fchown(node, uid, gid) < 0 || fchmod(node, primary ? 0660 : 0666) < 0)
+                fail("grant guest DRM node access");
+            if (!primary) found = true;
+        }
+        close(node);
+    }
+    if (errno)
+        fail("list guest DRM render nodes");
+    if (closedir(entries) < 0)
+        fail("close guest DRM device directory");
+    return found;
+}
+
+static void prepare_gpu(uid_t uid, gid_t gid)
+{
+    int64_t deadline = monotonic_ms() + 5000;
+    do {
+        if (grant_gpu_nodes(uid, gid))
+            return;
+        if (monotonic_ms() >= deadline)
+            break;
+        struct timespec pause = {.tv_nsec = 100000000};
+        while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
+    } while (true);
+    fprintf(stderr, "agent-vm guest: GPU requested but no DRM render node appeared in /dev/dri\n");
+    exit(125);
 }
 
 static void drop_privileges(uid_t uid, gid_t gid)
@@ -684,6 +760,8 @@ int main(int argc, char **argv)
         return 125;
     }
     avm_mount_filesystems((uid_t)spec.header.uid, (gid_t)spec.header.gid);
+    if (spec.header.flags & AVM_FLAG_GPU)
+        prepare_gpu((uid_t)spec.header.uid, (gid_t)spec.header.gid);
     if (spec.header.flags & AVM_FLAG_NETWORK)
         check_network();
     check_temporary_directories();

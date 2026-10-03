@@ -24,7 +24,10 @@ These defaults apply without a configuration file or explicit overrides:
 | `--home ephemeral|shared` | `ephemeral`, an empty temporary home |
 | `--workdir PATH` | CWD, or home when CWD sharing is disabled |
 | `--network none|passt` | `none`, no external networking |
+| `--gpu FLAGS` / `--no-gpu` | GPU disabled unless a flag mask is supplied |
 | `--ssh-agent` / `--no-ssh-agent` | SSH agent forwarding is disabled |
+| `--wayland` / `--no-wayland` | Wayland forwarding is disabled |
+| `--xwayland-satellite` / `--no-xwayland-satellite` | Guest X11 support is disabled; requires Wayland forwarding |
 | `--debug` | Runtime diagnostics are disabled |
 
 `--tmp-size` is a per-filesystem capacity limit, not a reservation or aggregate quota. Tmpfs and processes compete for guest RAM. vCPU/RAM settings do not limit total host resource use or disk consumption in writable shares.
@@ -46,6 +49,7 @@ version = 1
 cpus = 2
 memory_mib = 2048
 tmp_mib = 256
+# gpu_flags = 0x10b  # Optional raw libkrun GPU mask.
 
 [filesystem]
 cwd = "rw"
@@ -65,6 +69,10 @@ EDITOR = "vi"
 
 [network]
 mode = "none"
+
+[wayland]
+enabled = false
+xwayland_satellite = false
 ```
 
 ## File sharing and temporary storage
@@ -139,6 +147,48 @@ Targets must reside on writable guest filesystems. The helper creates missing pa
 `--ssh-agent` forwards the host `SSH_AUTH_SOCK` to `/run/user/<uid>/ssh-agent.socket` and sets the guest variable. `--no-ssh-agent` disables only this alias, leaving explicit forwards active. Custom forwarding can use `-e SSH_AUTH_SOCK=...`. Agent forwarding grants signing operations even when `.ssh` is masked.
 
 Only byte streams are supported, without Unix datagrams, abstract sockets, or `SCM_RIGHTS` FD passing. Reconnection follows socket replacement inside the same host parent directory, but does not track replacement of that directory itself.
+
+## GPU
+
+GPU support is disabled by default and can be enabled independently of Wayland. `--gpu=FLAGS` accepts an unsigned 32-bit mask in decimal or `0x` hexadecimal form and passes it unchanged to `krun_set_gpu_options`. The presence of the option enables GPU support, so `--gpu=0` differs from omitting it. In TOML, set the integer `[vm].gpu_flags`; `--gpu` overrides that value and `--no-gpu` disables it. `plan` shows the effective decimal and hexadecimal mask, and `doctor` reports whether the installed libkrun has its optional GPU feature.
+
+```sh
+agent-vm plan --no-config --gpu=0x10b
+```
+
+`0x10b` combines libkrun's EGL, thread synchronization, surfaceless, and asynchronous fence callback flags. It is an example mask, not a portable setting: libkrun and its renderer determine whether a requested mask works with the host hardware, drivers, and sandbox. `--gpu=0` is a valid enable request but does not guarantee a usable renderer or successful VM startup. The VMM receives only selected host render nodes and their corresponding read-only sysfs entries; the guest sees its own virtio GPU render nodes, owned by the workload user with mode 0666. Guest `/dev/dri/card0` is also owned by the workload user with mode 0660. Host device permissions do not change. GPU support does not require `--wayland`; applications still need an appropriate display or offscreen path for their renderer.
+
+For a Venus/Vulkan Wayland client, `963` (`0x3c3`) combines EGL, thread synchronization, Venus, no VirGL, asynchronous fence callbacks, and render-server mode:
+
+```sh
+agent-vm run --wayland --gpu=963 -- app
+```
+
+Replace `app` with a graphical client. Venus provides Vulkan; for an OpenGL application that needs a Vulkan-backed driver, try `-e MESA_LOADER_DRIVER_OVERRIDE=zink` before `--`. [Mesa documents Zink](https://docs.mesa3d.org/drivers/zink.html) as its OpenGL-on-Vulkan driver. Render-server mode requires `/usr/libexec/virgl_render_server` and a host kernel with Landlock; unavailable dependencies fail startup. A successful offscreen VirGL test with `0x10b` does not establish accelerated Wayland support: with libkrun 1.19, the unimplemented `TransferFromHost3d`/`transfer_read` path may panic the host VMM GPU worker and stall that workload. Venus and Wayland behavior also depends on the host stack; validate the intended application.
+
+## Wayland
+
+Wayland forwarding is opt-in. Use `--wayland` to enable it or `--no-wayland` to disable a `[wayland] enabled = true` configuration. The CLI switch overrides the TOML value. A host compositor must already be running, and `/usr/bin/waypipe` must be installed on the host; the guest runs the same binary from the shared read-only `/usr`. The confined host helper requires Landlock ABI 3; enabling Wayland fails if that support is unavailable.
+
+```sh
+agent-vm run --no-config --wayland -- wayland-info
+```
+
+The host `WAYLAND_DISPLAY` may be an absolute socket path or a name relative to `XDG_RUNTIME_DIR`. When unset, it defaults to `wayland-0` under `XDG_RUNTIME_DIR`; a relative name requires a valid host `XDG_RUNTIME_DIR`. The selected socket must be an existing Unix stream socket. `plan` validates the selected endpoint without launching waypipe.
+
+Without `--gpu`, the host runs a confined `waypipe --compress none --no-gpu client`, and agent-vm wraps the guest command as `/usr/bin/waypipe --compress none --no-gpu --socket /run/user/<uid>/waypipe.sock server -- COMMAND [ARG...]`. With `--gpu`, both waypipe processes omit `--no-gpu`; the host helper receives access to selected render nodes under Landlock for GPU buffer handling. The private socket between the two waypipe processes uses the existing framed byte-stream relay over libkrun vsock. This is waypipe's serialized transport, not a direct forward of the compositor socket: waypipe handles Wayland FD-backed resources such as shared-memory buffers before sending bytes through the relay. Plain `--socket` forwarding cannot do that. Wayland does not require `--network passt`, X11, or GPU access. The default `--no-gpu` mode limits applications that require GPU-backed Wayland buffers or rendering.
+
+Enabling Wayland grants the guest command access to the selected host compositor and its protocol capabilities, including display output and input events. The waypipe helper remains under host confinement; the guest receives no direct compositor socket mount. The original command's arguments and exit status retain the normal `run` behavior.
+
+### X11 clients through guest Xwayland
+
+`--xwayland-satellite` enables X11 clients inside the guest and requires `--wayland` (or `[wayland] enabled = true`). It is disabled by default. TOML uses `[wayland] xwayland_satellite = true`; `--no-xwayland-satellite` overrides that setting. Disabling Wayland while the satellite remains enabled is a configuration error.
+
+```sh
+agent-vm run --no-config --wayland --xwayland-satellite -- xterm
+```
+
+This path needs waypipe 0.11 or newer with `--xwls`, plus `xwayland-satellite` and `Xwayland` available in the guest's shared `/usr`; the example also needs `xterm`. Guest waypipe's `--xwls` mode sets `DISPLAY` and starts the satellite on demand. Do not set guest `DISPLAY` explicitly with `-e` or `[environment.set]` while this option is enabled: the runner rejects the conflict. X11 requests are handled by guest Xwayland and carried through the already authorized Wayland/waypipe path. No host X11 socket or Xauthority file is mounted or forwarded. This option does not require host Xwayland or an X11 session.
 
 ## D-Bus
 

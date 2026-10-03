@@ -24,7 +24,10 @@ agent-vm --version
 | `--home ephemeral|shared` | `ephemeral`，空的临时 home |
 | `--workdir PATH` | 默认当前目录；禁用 CWD 共享时默认 home |
 | `--network none|passt` | `none`，无外部网络 |
+| `--gpu FLAGS` / `--no-gpu` | 默认关闭 GPU，指定 flag mask 后启用 |
 | `--ssh-agent` / `--no-ssh-agent` | 默认关闭 SSH agent 转发 |
+| `--wayland` / `--no-wayland` | 默认关闭 Wayland 转发 |
+| `--xwayland-satellite` / `--no-xwayland-satellite` | 默认关闭；启用时要求 Wayland 转发 |
 | `--debug` | 默认关闭运行诊断输出 |
 
 `--tmp-size` 是每个文件系统的容量上限，不是预留内存或总配额；tmpfs 与进程共同使用 guest RAM。vCPU/RAM 设置不限制宿主总资源或可写共享目录的磁盘占用。
@@ -46,6 +49,7 @@ version = 1
 cpus = 2
 memory_mib = 2048
 tmp_mib = 256
+# gpu_flags = 0x10b  # 可选的 libkrun 原始 GPU flag mask。
 
 [filesystem]
 cwd = "rw"
@@ -65,6 +69,10 @@ EDITOR = "vi"
 
 [network]
 mode = "none"
+
+[wayland]
+enabled = false
+xwayland_satellite = false
 ```
 
 ## 文件共享与临时存储
@@ -139,6 +147,46 @@ agent-vm run --no-config --network passt --ssh-agent -- bash
 `--ssh-agent` 把宿主 `SSH_AUTH_SOCK` 转发到 `/run/user/<uid>/ssh-agent.socket` 并设置 guest 变量。`--no-ssh-agent` 仅关闭该别名，不关闭显式转发。自定义转发可以配合 `-e SSH_AUTH_SOCK=...`。SSH agent 转发授予签名能力，即使 `.ssh` 被 mask 也如此。
 
 只支持字节流，不支持 Unix datagram、abstract socket 或 `SCM_RIGHTS` FD 传递。宿主服务在同一父目录内替换 socket 后可重连；不追踪父目录本身的替换。
+
+## GPU
+
+GPU 支持默认关闭，可独立于 Wayland 启用。`--gpu=FLAGS` 接受十进制或 `0x` 十六进制的无符号 32 位 mask，并原样传给 `krun_set_gpu_options`。只要指定该选项就会启用 GPU，因此 `--gpu=0` 与省略选项不同。TOML 使用整数 `[vm].gpu_flags`；`--gpu` 覆盖文件值，`--no-gpu` 关闭 GPU。`plan` 同时显示最终 mask 的十进制和十六进制形式，`doctor` 报告当前 libkrun 是否具备可选 GPU 功能。
+
+```sh
+agent-vm plan --no-config --gpu=0x10b
+```
+
+`0x10b` 组合了 libkrun 的 EGL、线程同步、surfaceless 和异步 fence callback flags。它只是示例，并非适合所有机器：libkrun 及其 renderer 最终决定请求的 mask 能否配合宿主硬件、驱动和沙盒工作。`--gpu=0` 是有效的启用请求，但不保证 renderer 可用或 VM 能成功启动。VMM 仅获准访问选中的宿主 render node 及对应的只读 sysfs 条目；guest 使用归 workload 用户所有、mode 为 0666 的本地 virtio GPU render node。guest `/dev/dri/card0` 同样归 workload 用户所有，mode 为 0660。宿主设备权限不改变。GPU 支持不要求 `--wayland`；应用仍需为渲染选择适当的显示或离屏路径。
+
+Venus/Vulkan Wayland 客户端可以使用 `963`（`0x3c3`），组合 EGL、线程同步、Venus、关闭 VirGL、异步 fence callback 和 render-server 模式：
+
+```sh
+agent-vm run --wayland --gpu=963 -- app
+```
+
+将 `app` 换成图形客户端。Venus 提供 Vulkan；如果 OpenGL 应用需要基于 Vulkan 的驱动，可在 `--` 前尝试 `-e MESA_LOADER_DRIVER_OVERRIDE=zink`。[Mesa 文档](https://docs.mesa3d.org/drivers/zink.html)说明 Zink 是它的 OpenGL-on-Vulkan 驱动。render-server 模式要求 `/usr/libexec/virgl_render_server` 和具备 Landlock 的宿主内核，缺少依赖时启动失败。`0x10b` 的 VirGL 离屏测试通过不代表 Wayland 加速可用：在 libkrun 1.19 上，未实现的 `TransferFromHost3d`/`transfer_read` 路径可能使宿主 VMM GPU worker panic，并使该 workload 停滞。Venus/Wayland 的行为也取决于宿主环境，应针对目标应用验证。
+
+## Wayland
+
+Wayland 转发默认关闭。使用 `--wayland` 启用，或用 `--no-wayland` 覆盖配置文件中的 `[wayland] enabled = true`；CLI 开关优先于 TOML。宿主必须已有运行中的 compositor，并安装 `/usr/bin/waypipe`；guest 从共享的只读 `/usr` 运行同一程序。受限宿主 helper 要求 Landlock ABI 3，缺少支持时无法启用 Wayland。
+
+```sh
+agent-vm run --no-config --wayland -- wayland-info
+```
+
+宿主 `WAYLAND_DISPLAY` 可以是绝对 socket 路径，也可以是相对于 `XDG_RUNTIME_DIR` 的名称。未设置时默认取 `XDG_RUNTIME_DIR` 下的 `wayland-0`；相对名称要求宿主具有有效的 `XDG_RUNTIME_DIR`。选中的端点必须是已存在的 Unix stream socket。`plan` 校验所选端点，但不启动 waypipe。
+
+未指定 `--gpu` 时，宿主运行受限的 `waypipe --compress none --no-gpu client`，agent-vm 在 guest 中将原命令包装为 `/usr/bin/waypipe --compress none --no-gpu --socket /run/user/<uid>/waypipe.sock server -- COMMAND [ARG...]`。指定 `--gpu` 后两端 waypipe 均不使用 `--no-gpu`；宿主 helper 在 Landlock 下获准访问选中的 render node，以处理 GPU buffer。两个 waypipe 进程之间的私有 socket 经现有的 libkrun vsock 分帧字节流 relay 连接。传输的是 waypipe 序列化后的数据，不是直接转发 compositor socket：Wayland 共享内存 buffer 等依赖 FD 的资源由 waypipe 处理，然后才以字节形式通过 relay；普通 `--socket` 无法完成这一点。Wayland 不要求 `--network passt`、X11 或 GPU 访问。默认的 `--no-gpu` 模式会限制依赖 GPU buffer 或渲染的应用。
+
+启用 Wayland 会授权 guest 命令访问所选宿主 compositor 及其协议能力，包括显示输出和输入事件。宿主 waypipe helper 仍受宿主隔离约束；guest 不会直接挂载 compositor socket。原命令的参数和退出状态仍遵循普通 `run` 语义。
+
+可选的 Xwayland satellite 默认关闭。CLI 使用 `--xwayland-satellite` 启用，`--no-xwayland-satellite` 可覆盖 TOML 中的启用值；配置写作 `[wayland] xwayland_satellite = true`。此选项要求同时启用 `--wayland`，否则配置无效。示例：
+
+```sh
+agent-vm run --no-config --wayland --xwayland-satellite -- xterm
+```
+
+此功能要求 waypipe 0.11 或更新版本支持 `--xwls`，并要求 guest 共享的 `/usr` 中安装 `xwayland-satellite` 和 `Xwayland`；示例还需安装 `xterm`。guest 命令仍由 waypipe 启动；启用该选项时，waypipe 使用 `--xwls` 并按需启动 `xwayland-satellite`，由 waypipe 设置 guest 的 `DISPLAY`。此时显式设置 guest `DISPLAY`（`-e` 或 `[environment.set]`）会产生配置冲突并被拒绝。agent-vm 不转发宿主 X11 socket 或 Xauthority。X11 客户端的图形流量经 satellite 转成 Wayland，再由 waypipe 传输到宿主 compositor。
 
 ## D-Bus
 

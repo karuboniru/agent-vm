@@ -26,6 +26,10 @@ BuildRequires:  cmake(tomlplusplus)
 # Launched with execve, so RPM's ELF dependency generator cannot detect it.
 Requires:       passt
 Recommends:     xdg-dbus-proxy
+Recommends:     waypipe
+# Guest X11 compatibility is optional; --xwls also needs waypipe >= 0.11.
+Recommends:     xwayland-satellite
+Recommends:     xorg-x11-server-Xwayland
 
 %description
 agent-vm runs commands in rootless Linux microVMs using libkrun. It shares

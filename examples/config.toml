@@ -6,6 +6,12 @@ memory_mib = 2048
 # Per guest-native tmpfs capacity limit, including [[tmpfs]] below.
 # Actual use consumes VM RAM; this is not an aggregate limit or reservation.
 tmp_mib = 256
+# Optional raw uint32 libkrun GPU mask. Presence enables GPU even when zero.
+# Omit to disable; CLI --gpu=FLAGS overrides, --no-gpu disables.
+# Example: 0x10b = EGL | THREAD_SYNC | SURFACELESS | ASYNC_FENCE_CB.
+# For a Venus/Vulkan Wayland client, 963 (0x3c3) selects EGL, THREAD_SYNC,
+# VENUS, NO_VIRGL, ASYNC_FENCE_CB and RENDER_SERVER. Hardware support varies.
+# gpu_flags = 0x10b
 
 [filesystem]
 cwd = "rw"
@@ -79,6 +85,19 @@ publish = []
 # --no-ssh-agent disables this alias only, not explicit [[sockets]] entries.
 # When disabled, environment.set may specify SSH_AUTH_SOCK for a custom forward.
 enabled = false
+
+# Optional Wayland forwarding uses /usr/bin/waypipe on the host and the shared
+# read-only /usr in the guest. It connects to the invoking user's compositor.
+# It works independently of GPU; when vm.gpu_flags is set, waypipe also enables
+# GPU buffer handling instead of its default --no-gpu mode.
+# CLI --wayland and --no-wayland override this setting.
+[wayland]
+enabled = false
+# Optional X11 clients use guest waypipe --xwls with xwayland-satellite and
+# Xwayland from the shared /usr. Requires enabled = true and waypipe >= 0.11.
+# CLI --xwayland-satellite / --no-xwayland-satellite override this setting.
+# No host X11 socket or Xauthority file is forwarded.
+xwayland_satellite = false
 
 # Optional filtered D-Bus forwarding; each bus is independently disabled by default.
 # Arguments are literal xdg-dbus-proxy per-bus options; --filter is always added.

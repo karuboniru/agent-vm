@@ -24,7 +24,9 @@ struct FilesystemExport {
 std::vector<FilesystemExport> enter_sandbox(const RunSpec& spec, const std::string& root_dir,
                    const std::string& ipc_dir, const std::string& spec_file,
                    const std::string& helper, const std::vector<int>& keep_fds, int control_directory);
-void install_vmm_seccomp();
+// Render-server mode permits execve only under an exact ELF/loader Landlock
+// execute allowlist. All other profiles continue to deny execution outright.
+void install_vmm_seccomp(bool render_server = false);
 // Resolve only a socket inode relative to a pinned directory; never follow symlinks.
 bool send_control(int directory, const avm_control_message& message);
 // Call after starting host helpers, before forking the VMM. Preserves UID/GID
@@ -48,6 +50,9 @@ bool confine_dbus_proxy_filesystem(int private_directory);
 // Returned fd is the readiness/lifetime pipe and must remain open while in use.
 // The listening path's parent must be a dedicated caller-owned 0700 directory.
 NetworkProcess start_dbus_proxy(const DbusSpec& spec, const std::string& path);
+// display is the host compositor socket; path carries serialized waypipe bytes.
+// The socket parent must be a dedicated caller-owned mode 0700 directory.
+pid_t start_waypipe(const std::string& display, const std::string& path, bool gpu = false);
 NetworkProcess start_passt(const RunSpec& spec);
 struct SocketBrokerSpec {
     std::string listen_path, upstream_path, guest_path;

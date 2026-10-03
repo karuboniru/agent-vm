@@ -24,6 +24,7 @@
 #include <sys/un.h>
 #include <seccomp.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -116,6 +117,35 @@ static void seccomp_test() {
             require(namespace_changes_denied(), "fork child did not inherit VMM filter");
         }) == 0, "seccomp fork inheritance failed");
     }) == 0, "seccomp regression failed");
+}
+static void render_server_seccomp_test() {
+    if (avm::detail::landlock_abi() < 1 || !fs::exists("/usr/libexec/virgl_render_server")) {
+        std::cout << "SKIP render-server execution policy: Landlock or server unavailable\n";
+        return;
+    }
+    const auto execute_server = [] {
+        const char* path = "/usr/libexec/virgl_render_server";
+        const char* argv[] = {path, "--invalid-test-option", nullptr};
+        execve(path, const_cast<char* const*>(argv), nullptr);
+        _exit(123);
+    };
+    const int parser_status = child_status(execute_server);
+    require(parser_status == 1 || parser_status == 255, "unexpected render-server parser status");
+    require(child_status([&] {
+        avm::install_vmm_seccomp(true);
+        require(namespace_changes_denied(), "render-server mode weakened namespace confinement");
+        for (const char* path : {"/usr/bin/true", "/usr/bin/sh", "/proc/self/exe"}) {
+            const char* argv[] = {path, nullptr};
+            errno = 0;
+            require(execve(path, const_cast<char* const*>(argv), nullptr) == -1 && errno == EACCES,
+                    "render-server mode permits an unrelated executable");
+        }
+        errno = 0;
+        require(syscall(SYS_execveat, -1, "", nullptr, nullptr, AT_EMPTY_PATH) == -1 && errno == EPERM,
+                "render-server mode permits execveat");
+        require(child_status(execute_server) == parser_status,
+                "trusted render server cannot execute under inherited VMM restrictions");
+    }) == 0, "render-server execution policy failed");
 }
 static void supervisor_network_test() {
     require(child_status([] {
@@ -470,6 +500,95 @@ static void session_isolation_test() {
     require(pgrp != getpgrp() && session != getsid(0), "VMM shares the supervisor's process group or session");
     std::cout << "session isolation passed\n";
 }
+static void gpu_isolation_test() {
+    struct Node { std::string path, metadata, device, uevent; dev_t number; bool accessible; };
+    std::vector<Node> nodes;
+    if (fs::is_directory("/dev/dri")) {
+        for (const auto& entry : fs::directory_iterator("/dev/dri")) {
+            if (!entry.path().filename().string().starts_with("renderD")) continue;
+            struct stat st{};
+            require(lstat(entry.path().c_str(), &st) == 0 && S_ISCHR(st.st_mode), "invalid host render node");
+            const auto metadata = "/sys/dev/char/" + std::to_string(major(st.st_rdev)) + ":" +
+                                  std::to_string(minor(st.st_rdev));
+            const auto device = fs::canonical(metadata + "/device").string();
+            const int fd = open(entry.path().c_str(), O_RDWR | O_CLOEXEC);
+            nodes.push_back({entry.path().string(), metadata, device,
+                             read_file((device + "/uevent").c_str()), st.st_rdev, fd >= 0});
+            if (fd >= 0) close(fd);
+        }
+    }
+    // Explicit zero still opts into a GPU backend; absence opts out entirely.
+    for (const auto flags : {std::optional<uint32_t>{}, std::optional<uint32_t>{0}, std::optional<uint32_t>{1}}) {
+        Fixture fixture;
+        auto spec = fixture.run_spec();
+        spec.gpu_flags = flags;
+        require(child_status([&] {
+            fixture.enter(spec);
+            require(!fs::exists(AVM_BOOTSTRAP "/dev/dri"), "bootstrap exports host GPU nodes");
+            require(fs::is_empty(AVM_BOOTSTRAP "/sys"), "bootstrap exports host GPU sysfs");
+            const auto manifest = read_file(AVM_BOOTSTRAP AVM_MOUNT_SPEC);
+            require(manifest.find("/dev/dri") == std::string::npos && manifest.find("/sys/") == std::string::npos,
+                    "guest mount manifest includes host GPU resources");
+            for (const auto& object : fs::directory_iterator(AVM_EXPORT_TAG)) {
+                require(!fs::exists(object.path() / "root/dev/dri"), "catalog exports host GPU nodes");
+                require(!fs::exists(object.path() / "root/sys/devices"), "catalog exports host GPU metadata");
+            }
+            require(!fs::exists("/sys/kernel") && !fs::exists("/sys/dev/block") && !fs::exists("/sys/devices/system"),
+                    "unrelated host sysfs exposed to GPU backend");
+            if (!flags.has_value()) {
+                require(!fs::exists("/dev/dri") && fs::is_empty("/sys"), "GPU resources exposed without opt-in");
+                return;
+            }
+            if (nodes.empty()) {
+                require(!fs::exists("/dev/dri"), "GPU setup invented host device nodes");
+                return;
+            }
+            size_t count = 0;
+            for (const auto& entry : fs::directory_iterator("/dev/dri")) {
+                require(entry.path().filename().string().starts_with("renderD"), "non-render DRM node exposed");
+                ++count;
+            }
+            require(count == nodes.size(), "GPU render node set changed");
+            for (const auto& node : nodes) {
+                struct stat st{};
+                require(stat(node.path.c_str(), &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == node.number,
+                        "GPU render bind changed device identity");
+                if (node.accessible) {
+                    int fd = open(node.path.c_str(), O_RDWR | O_CLOEXEC);
+                    require(fd >= 0, "authorized GPU render node cannot be opened");
+                    close(fd);
+                }
+                require(read_file((node.metadata + "/device/uevent").c_str()) == node.uevent,
+                        "libdrm device discovery metadata unavailable");
+                const auto class_path = "/sys/class/drm/" + fs::path(node.path).filename().string();
+                require(fs::canonical(class_path + "/device") == node.device, "DRM class lookup lost sysfs topology");
+                struct statvfs mount{};
+                require(statvfs(node.device.c_str(), &mount) == 0 && (mount.f_flag & ST_RDONLY),
+                        "GPU metadata is writable");
+            }
+        }) == 0, "GPU backend isolation failed");
+    }
+    if (fs::is_directory("/dev/dri")) {
+        for (bool symlink : {false, true}) {
+            Fixture fixture;
+            if (symlink) fs::create_symlink("/dev/kvm", fixture.source / "renderD128");
+            else write_file(fixture.source / "renderD128", "not a device");
+            require(child_status([&] {
+                outer_mount_namespace();
+                require(mount(fixture.source.c_str(), "/dev/dri", nullptr, MS_BIND, nullptr) == 0,
+                        "bind fake DRM directory failed");
+                auto spec = fixture.run_spec();
+                spec.gpu_flags = 0;
+                bool rejected = false;
+                try { fixture.enter(spec); }
+                catch (const std::exception&) { rejected = true; }
+                require(rejected, "GPU source accepted a symlink or non-device render node");
+            }) == 0, "GPU render source validation failed");
+        }
+    }
+    if (nodes.empty()) std::cout << "SKIP GPU hardware binds: no host render nodes\n";
+    std::cout << "GPU backend isolation passed\n";
+}
 static void integration_test() {
     Fixture fixture;
     auto s = fixture.run_spec();
@@ -647,10 +766,12 @@ static void integration_test() {
 int main(int argc, char** argv) {
     try {
         seccomp_test();
+        render_server_seccomp_test();
         if (argc == 2 && std::string(argv[1]) == "--integration") {
             supervisor_network_test();
             session_isolation_test();
             integration_test();
+            gpu_isolation_test();
             landlock_socket_test();
             masked_child_test();
             masked_descendant_test();

@@ -92,6 +92,18 @@ uint32_t unsigned_number(std::string_view value, uint32_t maximum, const std::st
         fail(label + " must be " + (base == 8 ? "an octal" : "a decimal") + " integer between 0 and " + std::to_string(maximum));
     return n;
 }
+uint32_t gpu_flags(std::string_view value) {
+    int base = 10;
+    if (value.starts_with("0x") || value.starts_with("0X")) {
+        value.remove_prefix(2);
+        base = 16;
+    }
+    uint32_t flags = 0;
+    auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), flags, base);
+    if (value.empty() || ec != std::errc() || end != value.data() + value.size())
+        fail("gpu flags must be an unsigned 32-bit decimal or 0x hexadecimal integer");
+    return flags;
+}
 std::vector<std::string> split(const std::string& value, char delimiter) {
     std::vector<std::string> result;
     size_t begin = 0;
@@ -266,15 +278,16 @@ void load_config(const fs::path& file, const fs::path& host_cwd, RunSpec& spec, 
     toml::table root;
     try { root = toml::parse_file(file.string()); }
     catch (const toml::parse_error& e) { fail("configuration '" + file.string() + "': " + std::string(e.description())); }
-    keys(root, {"version", "vm", "filesystem", "mounts", "tmpfs", "sockets", "environment", "network", "ssh_agent", "dbus"}, "");
+    keys(root, {"version", "vm", "filesystem", "mounts", "tmpfs", "sockets", "environment", "network", "ssh_agent", "wayland", "dbus"}, "");
     if (auto n = root.get("version")) {
         if (!n->is_integer() || n->value<int64_t>() != 1) fail("configuration version must be 1");
     }
     if (auto t = table_at(root, "vm")) {
-        keys(*t, {"cpus", "memory_mib", "tmp_mib"}, "vm.");
+        keys(*t, {"cpus", "memory_mib", "tmp_mib", "gpu_flags"}, "vm.");
         if (auto v = int_at(*t, "cpus", 255)) spec.cpus = static_cast<uint8_t>(*v);
         if (auto v = int_at(*t, "memory_mib", UINT32_MAX)) spec.memory_mib = *v;
         if (auto v = int_at(*t, "tmp_mib", UINT32_MAX)) spec.tmp_mib = *v;
+        if (auto v = unsigned_int_at(*t, "gpu_flags", UINT32_MAX)) spec.gpu_flags = *v;
     }
     if (auto t = table_at(root, "filesystem")) {
         keys(*t, {"cwd", "home", "workdir", "mask_sources", "mask_try_sources", "mask_targets"}, "filesystem.");
@@ -364,6 +377,11 @@ void load_config(const fs::path& file, const fs::path& host_cwd, RunSpec& spec, 
     if (auto t = table_at(root, "ssh_agent")) {
         keys(*t, {"enabled"}, "ssh_agent.");
         if (auto v = bool_at(*t, "enabled")) spec.ssh_agent = *v;
+    }
+    if (auto t = table_at(root, "wayland")) {
+        keys(*t, {"enabled", "xwayland_satellite"}, "wayland.");
+        if (auto v = bool_at(*t, "enabled")) spec.wayland = *v;
+        if (auto v = bool_at(*t, "xwayland_satellite")) spec.xwayland_satellite = *v;
     }
 }
 void check_target(const std::string& target, const char* kind, bool custom_mount = false) {
@@ -560,6 +578,8 @@ Options parse_options(int argc, char** argv) {
         if (option == "--cpus") spec.cpus = static_cast<uint8_t>(number(value(), 255, "cpus"));
         else if (option == "--memory") spec.memory_mib = number(value(), UINT32_MAX, "memory (MiB)");
         else if (option == "--tmp-size") spec.tmp_mib = number(value(), UINT32_MAX, "tmp size (MiB)");
+        else if (option == "--gpu") spec.gpu_flags = gpu_flags(value());
+        else if (option == "--no-gpu") { flag(); spec.gpu_flags.reset(); }
         else if (option == "--network") network_mode(spec, value());
         else if (option == "--home") home_mode(home_setting, value());
         else if (option == "--cwd-mode") cwd_mode(cwd_setting, value());
@@ -574,6 +594,10 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--publish" || option == "-p") spec.ports.push_back(port_spec(value()));
         else if (option == "--ssh-agent") { flag(); spec.ssh_agent = true; }
         else if (option == "--no-ssh-agent") { flag(); spec.ssh_agent = false; }
+        else if (option == "--wayland") { flag(); spec.wayland = true; }
+        else if (option == "--no-wayland") { flag(); spec.wayland = false; }
+        else if (option == "--xwayland-satellite") { flag(); spec.xwayland_satellite = true; }
+        else if (option == "--no-xwayland-satellite") { flag(); spec.xwayland_satellite = false; }
         else if (option == "--debug") { flag(); spec.debug = true; }
         else fail("unknown argument '" + token + "' (place workload arguments after --)");
     }
@@ -603,6 +627,30 @@ Options parse_options(int argc, char** argv) {
             fail("SSH_AUTH_SOCK conflicts with the --ssh-agent target: " + target);
         spec.sockets.push_back({source_path(socket, host_cwd, spec.home, true), target});
         spec.environment["SSH_AUTH_SOCK"] = target;
+    }
+    if (spec.xwayland_satellite && !spec.wayland)
+        fail("xwayland-satellite requires Wayland forwarding (--wayland)");
+    if (spec.wayland) {
+        auto display = env("WAYLAND_DISPLAY");
+        if (display.empty()) display = "wayland-0";
+        if (display.find('\0') != std::string::npos) fail("WAYLAND_DISPLAY cannot contain NUL bytes");
+        fs::path display_path(display);
+        if (display_path.is_relative()) {
+            auto value = env("XDG_RUNTIME_DIR");
+            if (value.empty() || !fs::path(value).is_absolute())
+                fail("Wayland requires an absolute XDG_RUNTIME_DIR for a relative WAYLAND_DISPLAY");
+            display_path = fs::path(value) / display_path;
+        }
+        std::error_code error;
+        auto canonical = fs::canonical(display_path, error);
+        if (error) fail("cannot resolve Wayland display '" + display_path.string() + "': " + error.message());
+        spec.wayland_display = normalize(canonical);
+        auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
+        if (spec.environment.contains("WAYLAND_DISPLAY"))
+            fail("WAYLAND_DISPLAY conflicts with Wayland forwarding");
+        if (spec.environment.contains("WAYLAND_SOCKET"))
+            fail("WAYLAND_SOCKET conflicts with Wayland forwarding");
+        spec.sockets.push_back({"", target}); // Filled after waypipe starts, before worker serialization.
     }
     for (bool system : {false, true}) {
         auto& bus = system ? spec.dbus_system : spec.dbus_user;
@@ -637,6 +685,8 @@ Options parse_options(int argc, char** argv) {
 }
 
 void validate_spec(const RunSpec& spec) {
+    if (spec.xwayland_satellite && !spec.wayland)
+        fail("xwayland-satellite requires Wayland forwarding (--wayland)");
     for (const auto* bus : {&spec.dbus_user, &spec.dbus_system}) {
         if (bus->address.find('\0') != std::string::npos || (!bus->address.empty() && bus->address.front() == '-'))
             fail("invalid D-Bus address");
@@ -750,10 +800,11 @@ void validate_spec(const RunSpec& spec) {
     if (spec.sockets.size() > AVM_SOCKET_MAX) fail("too many forwarded sockets");
     std::vector<std::string> socket_targets;
     for (const auto& socket : spec.sockets) {
-        bool pending_bus = socket.source.empty() &&
+        bool pending_broker = socket.source.empty() &&
             ((spec.dbus_user.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-user.socket") ||
-             (spec.dbus_system.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-system.socket"));
-        if (!pending_bus) {
+             (spec.dbus_system.enabled && socket.target == "/run/user/" + std::to_string(spec.uid) + "/dbus-system.socket") ||
+             (spec.wayland && socket.target == "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock"));
+        if (!pending_broker) {
             check_socket_path(socket.source, "source");
             std::error_code error;
             auto canonical = fs::canonical(socket.source, error);
@@ -841,6 +892,25 @@ void validate_spec(const RunSpec& spec) {
         if (value == spec.environment.end() || value->second != target)
             fail("SSH_AUTH_SOCK must match the SSH agent forwarding target");
     }
+    if (spec.wayland) {
+        check_socket_path(spec.wayland_display, "Wayland display");
+        std::error_code error;
+        auto canonical = fs::canonical(spec.wayland_display, error);
+        if (error || normalize(canonical) != spec.wayland_display)
+            fail("Wayland display is missing or no longer canonical: " + spec.wayland_display);
+        if (!fs::is_socket(spec.wayland_display, error) || error)
+            fail("Wayland display is not an existing Unix socket: " + spec.wayland_display);
+        auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
+        if (std::none_of(spec.sockets.begin(), spec.sockets.end(), [&](const auto& socket) {
+                return socket.target == target;
+            })) fail("Wayland forwarding requires its socket mapping");
+        for (const auto* key : {"WAYLAND_DISPLAY", "WAYLAND_SOCKET"})
+            if (spec.environment.contains(key)) fail(std::string(key) + " conflicts with Wayland forwarding");
+        if (spec.xwayland_satellite && spec.environment.contains("DISPLAY"))
+            fail("DISPLAY conflicts with xwayland-satellite forwarding");
+    } else if (!spec.wayland_display.empty()) {
+        fail("Wayland display requires Wayland forwarding");
+    }
     for (const auto& [key, value] : spec.environment) {
         check_env_key(key);
         if (value.find('\0') != std::string::npos) fail("environment values cannot contain NUL bytes");
@@ -861,11 +931,16 @@ void print_plan(const RunSpec& spec) {
                   << ", mode=0o" << std::oct << tmpfs.mode << std::dec << ")\n";
     for (const auto& mask : spec.mask_sources) std::cout << "Source mask: " << mask << '\n';
     for (const auto& mask : spec.mask_targets) std::cout << "Target mask: " << mask << '\n';
+    if (spec.gpu_flags)
+        std::cout << "GPU: enabled (flags=" << *spec.gpu_flags << ", 0x" << std::hex << *spec.gpu_flags << std::dec << ")\n";
+    else std::cout << "GPU: disabled\n";
     std::cout << "Network: " << (spec.network ? "passt (IPv4/IPv6)" : "none") << '\n'
               << "Vsock: fixed control channel enabled; implicit vsock/TSI disabled; "
               << spec.sockets.size() << " authorized socket channels\n";
     for (const auto& socket : spec.sockets)
-        std::cout << "Socket: " << (socket.source.empty() ? "<filtered D-Bus proxy>" : socket.source) << " -> " << socket.target << '\n';
+        std::cout << "Socket: " << (socket.source.empty() ?
+            (spec.wayland && socket.target == "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock" ? "<waypipe transport>" : "<filtered D-Bus proxy>") : socket.source)
+                  << " -> " << socket.target << '\n';
     for (const auto& port : spec.ports)
         std::cout << "Publish: " << port.address << ':' << port.host_port << ':' << port.guest_port << (port.udp ? "/udp\n" : "/tcp\n");
     for (bool system : {false, true}) {
@@ -873,7 +948,12 @@ void print_plan(const RunSpec& spec) {
         std::cout << "D-Bus " << (system ? "system" : "user") << ": " << (bus.enabled ? "filtered" : "disabled") << '\n';
         if (bus.enabled) for (const auto& arg : bus.args) std::cout << "  " << arg << '\n';
     }
-    std::cout << "SSH agent: " << (spec.ssh_agent ? "enabled (socket alias)" : "disabled") << "\nEnvironment names:";
+    std::cout << "SSH agent: " << (spec.ssh_agent ? "enabled (socket alias)" : "disabled")
+              << "\nWayland: " << (spec.wayland ?
+                  "enabled via waypipe (" + std::string(spec.gpu_flags ? "GPU forwarding enabled" : "no GPU forwarding") +
+                  "); host display " + spec.wayland_display : "disabled")
+              << "\nXwayland satellite: " << (spec.xwayland_satellite ? "enabled (requires Wayland; waypipe sets guest DISPLAY)" : "disabled")
+              << "\nEnvironment names:";
     for (const auto& [key, value] : spec.environment) { (void)value; std::cout << ' ' << key; }
     std::cout << "\nCommand arguments: " << spec.command.size() << " (values omitted)\n";
 }
@@ -888,6 +968,8 @@ void print_help() {
   --cpus N               Virtual CPUs (default 2)
   --memory MiB           Guest RAM (default 2048)
   --tmp-size MiB         Private temporary filesystem capacity (default 256)
+  --gpu FLAGS            Enable GPU with raw libkrun flags (decimal or 0xHEX; 0 valid)
+  --no-gpu               Disable configured GPU
   --network none|passt   Network policy (default none)
   --home ephemeral|shared  Home policy (default ephemeral)
   --cwd-mode ro|rw|none  Share the invoking directory (default rw)
@@ -902,6 +984,10 @@ void print_help() {
   -p, --publish SPEC     [IPv4:]HOST:GUEST[/tcp|udp] (default 127.0.0.1, TCP)
   --ssh-agent            Forward SSH_AUTH_SOCK to /run/user/UID/ssh-agent.socket
   --no-ssh-agent         Disable configured SSH agent forwarding
+  --wayland              Forward the host Wayland display through waypipe
+  --no-wayland           Disable configured Wayland forwarding
+  --xwayland-satellite   Forward X11 through waypipe and xwayland-satellite (requires --wayland)
+  --no-xwayland-satellite  Disable configured Xwayland satellite forwarding
   --debug               Enable runtime diagnostic output
 
 Default configuration: $XDG_CONFIG_HOME/agent-vm/config.toml, otherwise
@@ -910,6 +996,10 @@ $HOME/.config/agent-vm/config.toml. Project configuration is never read.
 --config, --profile and --no-config are mutually exclusive.
 CLI scalars and environment keys override configuration; mounts, tmpfs, sockets
 and masks are combined. Conflicting filesystem targets are errors.
+Wayland uses WAYLAND_DISPLAY (default wayland-0) under XDG_RUNTIME_DIR on the host.
+The guest command runs through waypipe, which sets its own Wayland display.
+Xwayland satellite requires Wayland; waypipe sets guest DISPLAY when enabled.
+Waypipe GPU forwarding follows --gpu; GPU can also be enabled without Wayland.
 Relative filesystem paths in configuration and CLI options use the invoking CWD.
 Disable default mounts with --cwd-mode none
 or --home ephemeral when replacing them. All values are literal, without shell

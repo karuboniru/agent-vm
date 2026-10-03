@@ -118,6 +118,18 @@ void write_all(int fd, const void* data, size_t length) {
     }
 }
 void write_spec(const avm::RunSpec& spec, const fs::path& path) {
+    auto command = spec.command;
+    if (spec.wayland) {
+        // Only waypipe's serialized byte stream crosses the existing vsock
+        // relay. Wayland descriptors and shared memory stay local to each end.
+        std::vector<std::string> wrapped{"/usr/bin/waypipe", "--compress", "none"};
+        if (!spec.gpu_flags) wrapped.push_back("--no-gpu");
+        if (spec.xwayland_satellite) wrapped.push_back("--xwls");
+        wrapped.insert(wrapped.end(), {"--socket",
+            "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock", "server", "--"});
+        wrapped.insert(wrapped.end(), command.begin(), command.end());
+        command = std::move(wrapped);
+    }
     std::vector<unsigned char> bytes;
     auto append = [&](const void* p, size_t n) {
         if (bytes.size() + n > AVM_SPEC_MAX) throw std::runtime_error("command and environment exceed 1 MiB");
@@ -130,12 +142,12 @@ void write_spec(const avm::RunSpec& spec, const fs::path& path) {
         uint32_t n = static_cast<uint32_t>(s.size()); append(&n, sizeof(n)); append(s.data(), s.size());
     };
     avm_spec_header header{AVM_SPEC_MAGIC, AVM_SPEC_VERSION, spec.uid, spec.gid,
-        spec.network ? AVM_FLAG_NETWORK : 0u,
-        static_cast<uint32_t>(spec.command.size()), static_cast<uint32_t>(spec.environment.size()),
+        (spec.network ? AVM_FLAG_NETWORK : 0u) | (spec.gpu_flags ? AVM_FLAG_GPU : 0u),
+        static_cast<uint32_t>(command.size()), static_cast<uint32_t>(spec.environment.size()),
         static_cast<uint32_t>(spec.sockets.size())};
     static_assert(sizeof(header) == 32);
     append(&header, sizeof(header)); string(spec.home); string(spec.cwd);
-    for (const auto& arg : spec.command) string(arg);
+    for (const auto& arg : command) string(arg);
     for (const auto& [key, value] : spec.environment) string(key + "=" + value);
     for (const auto& socket : spec.sockets) string(socket.target);
     Fd fd(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
@@ -155,6 +167,8 @@ void write_worker_spec(const avm::RunSpec& s, const fs::path& path) {
     auto strings = [&](const auto& list) { number(static_cast<uint32_t>(list.size())); for (const auto& v : list) string(v); };
     number(AVM_SPEC_MAGIC); number(s.uid); number(s.gid); number(s.cpus); number(s.memory_mib); number(s.tmp_mib);
     number(s.network); number(s.ssh_agent); number(s.debug);
+    number(s.wayland); string(s.wayland_display); number(s.xwayland_satellite);
+    number(s.gpu_flags.has_value()); number(s.gpu_flags.value_or(0));
     string(s.username); string(s.home); string(s.cwd);
     number(static_cast<uint32_t>(s.mounts.size()));
     for (const auto& m : s.mounts) { string(m.source); string(m.target); number(m.read_only); }
@@ -194,6 +208,14 @@ avm::RunSpec read_worker_spec(const fs::path& path) {
     if (cpus == 0 || cpus > 255 || s.uid != getuid() || s.gid != getgid()) throw std::runtime_error("invalid worker identity or CPU count");
     s.cpus = static_cast<uint8_t>(cpus); s.memory_mib = number(); s.tmp_mib = number();
     s.network = number(); s.ssh_agent = number(); s.debug = number();
+    s.wayland = number(); s.wayland_display = string();
+    const uint32_t xwayland_satellite = number();
+    if (xwayland_satellite > 1) throw std::runtime_error("invalid worker Xwayland satellite setting");
+    s.xwayland_satellite = xwayland_satellite;
+    const uint32_t gpu_enabled = number(), gpu_flags = number();
+    if (gpu_enabled > 1 || (!gpu_enabled && gpu_flags))
+        throw std::runtime_error("invalid worker GPU configuration");
+    if (gpu_enabled) s.gpu_flags = gpu_flags;
     s.username = string(); s.home = string(); s.cwd = string();
     for (uint32_t n = count(); n; --n) { avm::MountSpec m; m.source = string(); m.target = string(); m.read_only = number(); s.mounts.push_back(std::move(m)); }
     uint32_t sockets = count();
@@ -260,6 +282,8 @@ int doctor() {
         std::cout << (result == 1 ? "OK " : "FAIL ") << "libkrun " << name << '\n';
         if (result != 1) good = false;
     }
+    std::cout << (krun_has_feature(KRUN_FEATURE_GPU) == 1 ? "OK" : "OPTIONAL MISSING")
+              << " libkrun GPU (required for --gpu)\n";
     try { std::cout << "OK guest helper: " << find_guest_helper() << '\n'; }
     catch (const std::exception& e) { std::cout << "FAIL " << e.what() << '\n'; good = false; }
     int pipefd[2];
@@ -279,6 +303,9 @@ int doctor() {
         std::cout << "FAIL user/mount namespace: " << (error ? std::strerror(error) : "probe failed") << "; check sandbox, LSM and container restrictions\n"; good = false;
     } else std::cout << "OK unprivileged user/mount namespaces\n";
     std::cout << (!access("/usr/bin/xdg-dbus-proxy", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/xdg-dbus-proxy (required for D-Bus forwarding)\n";
+    std::cout << (!access("/usr/bin/waypipe", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/waypipe (required for Wayland forwarding)\n";
+    std::cout << (!access("/usr/bin/xwayland-satellite", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/xwayland-satellite (required in guest for --xwayland-satellite)\n";
+    std::cout << (!access("/usr/bin/Xwayland", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/Xwayland (required in guest for --xwayland-satellite)\n";
     std::cout << (!access("/usr/bin/passt", X_OK) ? "OK" : "OPTIONAL MISSING") << " /usr/bin/passt (required for --network passt)\n";
     try {
         int abi = avm::detail::landlock_abi();
@@ -302,6 +329,8 @@ int doctor() {
         check_krun(krun_set_log_level(spec.debug ? 4 : 1), "libkrun log");
         int context = krun_create_ctx(); check_krun(context, "libkrun context");
         check_krun(krun_set_vm_config(context, spec.cpus, spec.memory_mib), "VM resources");
+        if (spec.gpu_flags)
+            check_krun(krun_set_gpu_options(context, *spec.gpu_flags), "configure libkrun GPU flags");
         check_krun(krun_disable_implicit_vsock(context), "disable implicit vsock");
         check_krun(krun_add_vsock(context, 0), "explicit control vsock");
         check_krun(krun_add_vsock_port2(context, AVM_CONTROL_PORT, AVM_CONTROL_SOCKET, true), "control socket");
@@ -336,6 +365,8 @@ int run(avm::RunSpec spec) {
     if (avm_process_title("avm-supervisor", "agent-vm: host supervisor")) system_error("name supervisor");
     maximize_nofile();
     avm::validate_spec(spec);
+    if (spec.gpu_flags && krun_has_feature(KRUN_FEATURE_GPU) != 1)
+        throw std::runtime_error("--gpu requires a libkrun build with GPU support");
     if (access("/dev/kvm", R_OK | W_OK)) system_error("/dev/kvm unavailable in this execution environment; run agent-vm doctor");
     const auto helper = find_guest_helper();
     sigset_t blocked, previous;
@@ -373,17 +404,29 @@ int run(avm::RunSpec spec) {
     std::vector<avm::NetworkProcess> proxies;
     proxies.reserve(2);
     pid_t broker = -1;
+    pid_t waypipe = -1;
     auto cleanup = [&] {
         if (vm > 0) { avm::stop_child(vm); vm = -1; }
         if (network.fd >= 0) { close(network.fd); network.fd = -1; }
         if (network.pid > 0) { avm::stop_child(network.pid); network.pid = -1; }
         if (broker > 0) { avm::stop_child(broker); broker = -1; }
+        if (waypipe > 0) { avm::stop_child(waypipe); waypipe = -1; }
         for (auto& proxy : proxies) {
             avm::stop_child(proxy.pid); proxy.pid = -1;
             if (proxy.fd >= 0) { close(proxy.fd); proxy.fd = -1; }
         }
     };
     try {
+        if (spec.wayland) {
+            auto directory = runtime.path / "wayland";
+            if (mkdir(directory.c_str(), 0700) || chmod(directory.c_str(), 0700))
+                system_error("create private waypipe directory");
+            auto path = (directory / "pipe").string();
+            waypipe = avm::start_waypipe(spec.wayland_display, path, spec.gpu_flags.has_value());
+            auto target = "/run/user/" + std::to_string(spec.uid) + "/waypipe.sock";
+            for (auto& socket : spec.sockets)
+                if (socket.target == target && socket.source.empty()) socket.source = path;
+        }
         for (bool system : {false, true}) {
             const auto& bus = system ? spec.dbus_system : spec.dbus_user;
             if (!bus.enabled) continue;
@@ -442,6 +485,7 @@ int run(avm::RunSpec spec) {
                 }
             };
             check_helper(network.pid, "passt");
+            check_helper(waypipe, "waypipe");
             for (auto& proxy : proxies) check_helper(proxy.pid, "xdg-dbus-proxy");
             check_helper(broker, "socket controller");
             if (!guest_ready) {
